@@ -2,6 +2,9 @@
 
 KubeDAL bridges the gap between Kubernetes workloads and any storage backend through a powerful CSI driver built with Rust and Apache OpenDAL.
 
+> [!WARNING]  
+> KubeDAL is currently in an early experimental development phase and nowhere near production ready, expect bugs and breaking changes.
+
 ## What is KubeDAL?
 
 KubeDAL is a Kubernetes CSI driver that enables you to declare storage "Resources" as first-class Kubernetes objects. These Resources can point to virtually any storage backend supported by Apache OpenDAL, including AWS S3, Google Cloud Storage, Azure Blob Storage, local filesystems, HDFS, and many more.

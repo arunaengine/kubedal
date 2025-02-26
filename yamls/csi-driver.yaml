@@ -1,0 +1,312 @@
+# CSI Driver Registration
+apiVersion: storage.k8s.io/v1
+kind: CSIDriver
+metadata:
+  name: kubedal.arunaengine.org
+spec:
+  attachRequired: false
+  podInfoOnMount: true
+  volumeLifecycleModes:
+    - Persistent
+  fsGroupPolicy: File
+---
+# Resource CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: resources.kubedal.arunaengine.org
+spec:
+  group: kubedal.arunaengine.org
+  names:
+    kind: Resource
+    listKind: ResourceList
+    plural: resources
+    singular: resource
+    shortNames:
+      - res
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - backend
+              properties:
+                backend:
+                  type: string
+                  description: "Storage backend type (s3, azblob, gcs, etc.)"
+                endpoint:
+                  type: string
+                  description: "Endpoint for the backend"
+                region:
+                  type: string
+                  description: "Region for the backend"
+                bucket:
+                  type: string
+                  description: "Bucket or container name"
+                path:
+                  type: string
+                  description: "Path/prefix within the bucket"
+                secretRef:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    accessKey:
+                      type: string
+                      default: "access_key"
+                    secretKey:
+                      type: string
+                      default: "secret_key"
+                  required:
+                    - name
+                    - namespace
+                accessMode:
+                  type: string
+                  enum:
+                    - Cached
+                    - Direct
+                  default: "Cached"
+                options:
+                  type: object
+                  additionalProperties:
+                    type: string
+            status:
+              type: object
+              properties:
+                lastAccessed:
+                  type: string
+                  format: date-time
+                state:
+                  type: string
+                  enum:
+                    - Pending
+                    - Ready
+                    - Error
+                  default: Pending
+                error:
+                  type: string
+      subresources:
+        status: {}
+---
+# Storage Class example
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: kubedal
+provisioner: kubedal.arunaengine.org
+parameters:
+  resourceNamespace: default
+  # This indicates where to look for resource references in PVC annotations
+  resourceAnnotation: kubedal.arunaengine.org/resource
+reclaimPolicy: Delete
+volumeBindingMode: Immediate
+---
+# Controller Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubedal-csi-controller
+  namespace: kube-system
+---
+# Node Service Account
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: kubedal-csi-node
+  namespace: kube-system
+---
+# RBAC
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kubedal-csi-provisioner-role
+rules:
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    verbs: ["get", "list", "watch", "update"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["kubedal.arunaengine.org"]
+    resources: ["resources"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kubedal-csi-provisioner-binding
+subjects:
+  - kind: ServiceAccount
+    name: kubedal-csi-controller
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: kubedal-csi-provisioner-role
+  apiGroup: rbac.authorization.k8s.io
+---
+kind: ClusterRole
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kubedal-csi-node-role
+rules:
+  - apiGroups: [""]
+    resources: ["events"]
+    verbs: ["list", "watch", "create", "update", "patch"]
+  - apiGroups: ["kubedal.arunaengine.org"]
+    resources: ["resources"]
+    verbs: ["get"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+---
+kind: ClusterRoleBinding
+apiVersion: rbac.authorization.k8s.io/v1
+metadata:
+  name: kubedal-csi-node-binding
+subjects:
+  - kind: ServiceAccount
+    name: kubedal-csi-node
+    namespace: kube-system
+roleRef:
+  kind: ClusterRole
+  name: kubedal-csi-node-role
+  apiGroup: rbac.authorization.k8s.io
+---
+# Controller Deployment
+kind: Deployment
+apiVersion: apps/v1
+metadata:
+  name: kubedal-csi-controller
+  namespace: kube-system
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: kubedal-csi-controller
+  template:
+    metadata:
+      labels:
+        app: kubedal-csi-controller
+    spec:
+      serviceAccountName: kubedal-csi-controller
+      containers:
+        - name: csi-provisioner
+          image: k8s.gcr.io/sig-storage/csi-provisioner:v3.1.0
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--v=5"
+          env:
+            - name: ADDRESS
+              value: /var/lib/csi/sockets/pluginproxy/csi.sock
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+        - name: kubedal-csi
+          image: your-registry/kubedal-csi:latest  # Replace with your actual image
+          args:
+            - "--endpoint=unix:///var/lib/csi/sockets/pluginproxy/csi.sock"
+            - "--node-id=controller"
+          env:
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: socket-dir
+              mountPath: /var/lib/csi/sockets/pluginproxy/
+      volumes:
+        - name: socket-dir
+          emptyDir: {}
+---
+# Node DaemonSet
+kind: DaemonSet
+apiVersion: apps/v1
+metadata:
+  name: kubedal-csi-node
+  namespace: kube-system
+spec:
+  selector:
+    matchLabels:
+      app: kubedal-csi-node
+  template:
+    metadata:
+      labels:
+        app: kubedal-csi-node
+    spec:
+      serviceAccountName: kubedal-csi-node
+      containers:
+        - name: csi-node-driver-registrar
+          image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.5.1
+          args:
+            - "--csi-address=$(ADDRESS)"
+            - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
+            - "--v=5"
+          env:
+            - name: ADDRESS
+              value: /csi/csi.sock
+            - name: DRIVER_REG_SOCK_PATH
+              value: /var/lib/kubelet/plugins/kubedal.arunaengine.org/csi.sock
+            - name: KUBE_NODE_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+        - name: kubedal-csi
+          image: your-registry/kubedal-csi:latest  # Replace with your actual image
+          securityContext:
+            privileged: true
+          args:
+            - "--endpoint=unix:///csi/csi.sock"
+            - "--node-id=$(NODE_ID)"
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RUST_LOG
+              value: info
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: pods-mount-dir
+              mountPath: /var/lib/kubelet/pods
+              mountPropagation: "Bidirectional"
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins/kubedal.arunaengine.org
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: /var/lib/kubelet/plugins_registry/
+            type: Directory
+        - name: pods-mount-dir
+          hostPath:
+            path: /var/lib/kubelet/pods
+            type: Directory

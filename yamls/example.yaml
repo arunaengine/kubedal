@@ -1,0 +1,62 @@
+# Example Resource for S3
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: Resource
+metadata:
+  name: example-s3-dataset
+  namespace: default
+spec:
+  backend: s3
+  bucket: my-data-bucket
+  path: datasets/example
+  region: us-west-2
+  secretRef:
+    name: s3-credentials
+    namespace: default
+  accessMode: Cached  # Can be Cached or Direct
+---
+# Example Secret with credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: default
+type: Kubedal
+stringData:
+  access_key: "YOUR_ACCESS_KEY"
+  secret_key: "YOUR_SECRET_KEY"
+---
+# Example PVC that references the resource
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: example-dataset-pvc
+  namespace: default
+  annotations:
+    kubedal.arunaengine.org/resource: example-s3-dataset
+spec:
+  accessModes:
+    - ReadOnlyMany
+  storageClassName: kubedal
+  resources:
+    requests:
+      storage: 10Gi
+---
+# Example Pod that uses the PVC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-consumer
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: alpine
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: dataset
+          mountPath: /data
+          readOnly: true
+  volumes:
+    - name: dataset
+      persistentVolumeClaim:
+        claimName: example-dataset-pvc

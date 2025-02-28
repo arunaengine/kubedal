@@ -56,7 +56,7 @@ metadata:
   name: quarterly-data
   annotations:
     kubedal.arunaengine.org/resource: quarterly-reports
-    kubedal.arunaengine.org/access-mode: cached  # or "direct-mount"
+    kubedal.arunaengine.org/access-mode: cached  # or "fuse"
 spec:
   storageClassName: kubedal
   accessModes:

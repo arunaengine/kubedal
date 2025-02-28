@@ -1,9 +1,5 @@
-mod csi;
-mod resource;
-mod services;
-
 use clap::{Arg, Command};
-use csi::{
+use kubedal::csi::{
     controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
 };
 use std::path::PathBuf;
@@ -13,7 +9,7 @@ use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
 use tracing_subscriber::EnvFilter;
 
-use services::{ControllerService, IdentityService, NodeService};
+use kubedal::services::{ControllerService, IdentityService, NodeService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = "kubedal.arunaengine.org";

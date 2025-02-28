@@ -4,7 +4,14 @@ use tonic::{Request, Response, Status};
 
 use crate::csi::controller_server::Controller;
 use crate::csi::{
-    ControllerExpandVolumeRequest, ControllerExpandVolumeResponse, ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse, ControllerModifyVolumeRequest, ControllerModifyVolumeResponse, ControllerPublishVolumeRequest, ControllerPublishVolumeResponse, ControllerServiceCapability, ControllerUnpublishVolumeRequest, ControllerUnpublishVolumeResponse, CreateVolumeRequest, CreateVolumeResponse, DeleteVolumeRequest, DeleteVolumeResponse, GetCapacityRequest, GetCapacityResponse, ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest, ValidateVolumeCapabilitiesResponse, Volume
+    ControllerExpandVolumeRequest, ControllerExpandVolumeResponse,
+    ControllerGetCapabilitiesRequest, ControllerGetCapabilitiesResponse,
+    ControllerModifyVolumeRequest, ControllerModifyVolumeResponse, ControllerPublishVolumeRequest,
+    ControllerPublishVolumeResponse, ControllerServiceCapability, ControllerUnpublishVolumeRequest,
+    ControllerUnpublishVolumeResponse, CreateVolumeRequest, CreateVolumeResponse,
+    DeleteVolumeRequest, DeleteVolumeResponse, GetCapacityRequest, GetCapacityResponse,
+    ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
+    ValidateVolumeCapabilitiesResponse, Volume,
 };
 
 #[derive(Debug)]
@@ -23,45 +30,37 @@ impl ControllerService {
 
 #[tonic::async_trait]
 impl Controller for ControllerService {
+    #[tracing::instrument(skip(self))]
     async fn controller_get_capabilities(
         &self,
         _request: Request<ControllerGetCapabilitiesRequest>,
     ) -> Result<Response<ControllerGetCapabilitiesResponse>, Status> {
         // Advertise our dummy driver capabilities
         let create_delete = ControllerServiceCapability {
-            r#type: Some(
-                crate::csi::controller_service_capability::Type::Rpc(
-                    crate::csi::controller_service_capability::Rpc {
-                        r#type: crate::csi::controller_service_capability::rpc::Type::CreateDeleteVolume.into(),
-                    }
-                )
-            ),
-        };
-
-        let expand_volume = ControllerServiceCapability {
-            r#type: Some(
-                crate::csi::controller_service_capability::Type::Rpc(
-                    crate::csi::controller_service_capability::Rpc {
-                        r#type: crate::csi::controller_service_capability::rpc::Type::ExpandVolume.into(),
-                    }
-                )
-            ),
+            r#type: Some(crate::csi::controller_service_capability::Type::Rpc(
+                crate::csi::controller_service_capability::Rpc {
+                    r#type:
+                        crate::csi::controller_service_capability::rpc::Type::CreateDeleteVolume
+                            .into(),
+                },
+            )),
         };
 
         let response = ControllerGetCapabilitiesResponse {
-            capabilities: vec![create_delete, expand_volume],
+            capabilities: vec![create_delete],
         };
 
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn create_volume(
         &self,
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let request = request.into_inner();
         let volume_name = request.name;
-        
+
         if volume_name.is_empty() {
             return Err(Status::invalid_argument("Volume name cannot be empty"));
         }
@@ -69,14 +68,18 @@ impl Controller for ControllerService {
         // Check for resource annotation in parameters
         let parameters = request.parameters;
         let resource_name = parameters.get("resource").cloned().unwrap_or_default();
-        
-        log::info!("Creating volume '{}' with resource '{}'", volume_name, resource_name);
+
+        tracing::info!(
+            "Creating volume '{}' with resource '{}'",
+            volume_name,
+            resource_name
+        );
 
         // In a real driver, we would validate and process the resource reference here
         // For our dummy driver, we'll just create a simple volume record
-        
+
         let mut volumes = self.volumes.lock().unwrap();
-        
+
         // Check if volume already exists
         if volumes.contains_key(&volume_name) {
             let existing_volume = volumes.get(&volume_name).unwrap().clone();
@@ -87,8 +90,10 @@ impl Controller for ControllerService {
 
         // Create a new volume entry
         let volume_id = format!("kubedal-{}", uuid::Uuid::new_v4());
-        let capacity_bytes = request.capacity_range.map_or(5 * 1024 * 1024 * 1024, |range| range.required_bytes);
-        
+        let capacity_bytes = request
+            .capacity_range
+            .map_or(5 * 1024 * 1024 * 1024, |range| range.required_bytes);
+
         let mut context = HashMap::new();
         context.insert("resource".to_string(), resource_name);
 
@@ -101,60 +106,67 @@ impl Controller for ControllerService {
         };
 
         volumes.insert(volume_name, volume.clone());
-        
+
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
         }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_volume(
         &self,
         request: Request<DeleteVolumeRequest>,
     ) -> Result<Response<DeleteVolumeResponse>, Status> {
         let request = request.into_inner();
         let volume_id = request.volume_id;
-        
+
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
         }
 
-        log::info!("Deleting volume with ID '{}'", volume_id);
-        
+        tracing::info!("Deleting volume with ID '{}'", volume_id);
+
         // In a real driver, we would clean up any resources associated with this volume
         // For our dummy driver, we'll just remove it from our in-memory map
-        
+
         let mut volumes = self.volumes.lock().unwrap();
-        
+
         // Find and remove the volume by ID
-        let volume_key = volumes.iter()
+        let volume_key = volumes
+            .iter()
             .find(|(_, v)| v.volume_id == volume_id)
             .map(|(k, _)| k.clone());
-            
+
         if let Some(key) = volume_key {
             volumes.remove(&key);
         }
-        
+
         Ok(Response::new(DeleteVolumeResponse {}))
     }
 
-    // Implement additional required controller methods with minimal functionality
-    
+    #[tracing::instrument(skip(self))]
     async fn controller_publish_volume(
         &self,
         _request: Request<ControllerPublishVolumeRequest>,
     ) -> Result<Response<ControllerPublishVolumeResponse>, Status> {
         // Our dummy driver doesn't need to do anything for publish
-        Err(Status::unimplemented("ControllerPublishVolume is not implemented"))
+        Err(Status::unimplemented(
+            "ControllerPublishVolume is not implemented",
+        ))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn controller_unpublish_volume(
         &self,
         _request: Request<ControllerUnpublishVolumeRequest>,
     ) -> Result<Response<ControllerUnpublishVolumeResponse>, Status> {
         // Our dummy driver doesn't need to do anything for unpublish
-        Err(Status::unimplemented("ControllerUnpublishVolume is not implemented"))
+        Err(Status::unimplemented(
+            "ControllerUnpublishVolume is not implemented",
+        ))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn validate_volume_capabilities(
         &self,
         _request: Request<ValidateVolumeCapabilitiesRequest>,
@@ -166,18 +178,20 @@ impl Controller for ControllerService {
         }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_volumes(
         &self,
         _request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         // List all volumes in our in-memory storage
         let volumes = self.volumes.lock().unwrap();
-        let entries = volumes.values().map(|v| {
-            crate::csi::list_volumes_response::Entry {
+        let entries = volumes
+            .values()
+            .map(|v| crate::csi::list_volumes_response::Entry {
                 volume: Some(v.clone()),
                 status: None,
-            }
-        }).collect();
+            })
+            .collect();
 
         Ok(Response::new(ListVolumesResponse {
             entries,
@@ -185,6 +199,7 @@ impl Controller for ControllerService {
         }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_capacity(
         &self,
         _request: Request<GetCapacityRequest>,
@@ -196,33 +211,17 @@ impl Controller for ControllerService {
         }))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn controller_expand_volume(
         &self,
-        request: Request<ControllerExpandVolumeRequest>,
+        _request: Request<ControllerExpandVolumeRequest>,
     ) -> Result<Response<ControllerExpandVolumeResponse>, Status> {
-        let request = request.into_inner();
-        let volume_id = request.volume_id;
-        let capacity_bytes = request.capacity_range.map_or(0, |range| range.required_bytes);
-        
-        // Update volume capacity in our in-memory map
-        let mut volumes = self.volumes.lock().unwrap();
-        
-        // Find the volume by ID
-        let volume_found = volumes.values_mut().find(|v| v.volume_id == volume_id);
-            
-        if let Some(volume) = volume_found {
-            volume.capacity_bytes = capacity_bytes;
-            
-            Ok(Response::new(ControllerExpandVolumeResponse {
-                capacity_bytes,
-                node_expansion_required: true,
-            }))
-        } else {
-            Err(Status::not_found(format!("Volume with ID '{}' not found", volume_id)))
-        }
+        Err(Status::unimplemented(
+            "ControllerExpandVolume is not implemented",
+        ))
     }
 
-    // All other required controller methods
+    #[tracing::instrument(skip(self))]
     async fn create_snapshot(
         &self,
         _request: Request<crate::csi::CreateSnapshotRequest>,
@@ -230,6 +229,7 @@ impl Controller for ControllerService {
         Err(Status::unimplemented("CreateSnapshot is not implemented"))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn delete_snapshot(
         &self,
         _request: Request<crate::csi::DeleteSnapshotRequest>,
@@ -237,6 +237,7 @@ impl Controller for ControllerService {
         Err(Status::unimplemented("DeleteSnapshot is not implemented"))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn list_snapshots(
         &self,
         _request: Request<crate::csi::ListSnapshotsRequest>,
@@ -244,20 +245,23 @@ impl Controller for ControllerService {
         Err(Status::unimplemented("ListSnapshots is not implemented"))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn controller_get_volume(
         &self,
         _request: Request<crate::csi::ControllerGetVolumeRequest>,
     ) -> Result<Response<crate::csi::ControllerGetVolumeResponse>, Status> {
-        Err(Status::unimplemented("ControllerGetVolume is not implemented"))
+        Err(Status::unimplemented(
+            "ControllerGetVolume is not implemented",
+        ))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn controller_modify_volume(
         &self,
         _request: tonic::Request<ControllerModifyVolumeRequest>,
-    ) -> std::result::Result<
-        tonic::Response<ControllerModifyVolumeResponse>,
-        tonic::Status,
-    >{
-        Err(Status::unimplemented("ControllerModifyVolume is not implemented"))
+    ) -> std::result::Result<tonic::Response<ControllerModifyVolumeResponse>, tonic::Status> {
+        Err(Status::unimplemented(
+            "ControllerModifyVolume is not implemented",
+        ))
     }
 }

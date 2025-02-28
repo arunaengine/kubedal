@@ -1,23 +1,34 @@
 mod csi;
-mod services;
 mod resource;
+mod services;
 
-use std::path::PathBuf;
 use clap::{Arg, Command};
-use csi::{controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer};
+use csi::{
+    controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
+};
+use std::path::PathBuf;
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio_stream::wrappers::UnixListenerStream;
 use tonic::transport::Server;
+use tracing_subscriber::EnvFilter;
 
-use services::{IdentityService, ControllerService, NodeService};
+use services::{ControllerService, IdentityService, NodeService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const NAME: &str = "kubedal.arunaengine.org";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or("none".into())
+        .add_directive("kubedal=trace".parse().unwrap());
+
+    tracing_subscriber::fmt()
+        .with_file(true)
+        .with_line_number(true)
+        .with_env_filter(filter)
+        .init();
 
     // Parse command line arguments
     let matches = Command::new("kubedal-csi")
@@ -44,9 +55,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let endpoint = matches.get_one::<String>("endpoint").unwrap();
     let node_id = matches.get_one::<String>("node-id").unwrap();
 
-    log::info!("Starting KubeDAL CSI Driver v{}", VERSION);
-    log::info!("Endpoint: {}", endpoint);
-    log::info!("Node ID: {}", node_id);
+    tracing::info!("Starting KubeDAL CSI Driver v{}", VERSION);
+    tracing::info!("Endpoint: {}", endpoint);
+    tracing::info!("Node ID: {}", node_id);
 
     // Create service instances
     let identity_service = IdentityService::new(NAME, VERSION);
@@ -58,9 +69,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Err("Only unix domain sockets are supported".into());
     }
 
-    let socket_path = endpoint
-        .trim_start_matches("unix://")
-        .to_string();
+    let socket_path = endpoint.trim_start_matches("unix://").to_string();
 
     // Remove existing socket file if it exists
     let socket_path_obj = PathBuf::from(&socket_path);
@@ -79,7 +88,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let uds = UnixListener::bind(&socket_path_obj)?;
     let uds_stream = UnixListenerStream::new(uds);
 
-    log::info!("CSI server listening on {}", socket_path);
+    tracing::info!("CSI server listening on {}", socket_path);
 
     // Build and start the gRPC server
     Server::builder()
@@ -87,8 +96,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .add_service(ControllerServer::new(controller_service))
         .add_service(NodeServer::new(node_service))
         .serve_with_incoming_shutdown(uds_stream, async {
-            signal::ctrl_c().await.expect("Failed to listen for ctrl+c signal");
-            log::info!("Received shutdown signal, stopping CSI server...");
+            signal::ctrl_c()
+                .await
+                .expect("Failed to listen for ctrl+c signal");
+            tracing::info!("Received shutdown signal, stopping CSI server...");
         })
         .await?;
 
@@ -97,6 +108,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         std::fs::remove_file(&socket_path_obj)?;
     }
 
-    log::info!("CSI server stopped successfully");
+    tracing::info!("CSI server stopped successfully");
     Ok(())
 }

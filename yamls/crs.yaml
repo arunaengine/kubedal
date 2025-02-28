@@ -1,0 +1,86 @@
+# Resource CRD
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: resources.kubedal.arunaengine.org
+spec:
+  group: kubedal.arunaengine.org
+  names:
+    kind: Resource
+    listKind: ResourceList
+    plural: resources
+    singular: resource
+    shortNames:
+      - res
+  scope: Namespaced
+  versions:
+    - name: v1alpha1
+      served: true
+      storage: true
+      schema:
+        openAPIV3Schema:
+          type: object
+          properties:
+            spec:
+              type: object
+              required:
+                - backend
+              properties:
+                backend:
+                  type: string
+                  description: "Storage backend type (s3, azblob, gcs, etc.)"
+                endpoint:
+                  type: string
+                  description: "Endpoint for the backend"
+                region:
+                  type: string
+                  description: "Region for the backend"
+                bucket:
+                  type: string
+                  description: "Bucket or container name"
+                path:
+                  type: string
+                  description: "Path/prefix within the bucket"
+                secretRef:
+                  type: object
+                  properties:
+                    name:
+                      type: string
+                    namespace:
+                      type: string
+                    accessKey:
+                      type: string
+                      default: "access_key"
+                    secretKey:
+                      type: string
+                      default: "secret_key"
+                  required:
+                    - name
+                    - namespace
+                accessMode:
+                  type: string
+                  enum:
+                    - Cached
+                    - Direct
+                  default: "Cached"
+                options:
+                  type: object
+                  additionalProperties:
+                    type: string
+            status:
+              type: object
+              properties:
+                lastAccessed:
+                  type: string
+                  format: date-time
+                state:
+                  type: string
+                  enum:
+                    - Pending
+                    - Ready
+                    - Error
+                  default: Pending
+                error:
+                  type: string
+      subresources:
+        status: {}

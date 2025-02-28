@@ -1,7 +1,9 @@
-use tonic::{Request, Response, Status};
 use crate::csi::{
-    identity_server::Identity, GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse, GetPluginInfoRequest, GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse
+    GetPluginCapabilitiesRequest, GetPluginCapabilitiesResponse, GetPluginInfoRequest,
+    GetPluginInfoResponse, PluginCapability, ProbeRequest, ProbeResponse,
+    identity_server::Identity,
 };
+use tonic::{Request, Response, Status};
 
 #[derive(Debug, Default)]
 pub struct IdentityService {
@@ -20,6 +22,7 @@ impl IdentityService {
 
 #[tonic::async_trait]
 impl Identity for IdentityService {
+    #[tracing::instrument(skip(self))]
     async fn get_plugin_info(
         &self,
         _request: Request<GetPluginInfoRequest>,
@@ -33,46 +36,34 @@ impl Identity for IdentityService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn get_plugin_capabilities(
         &self,
         _request: Request<GetPluginCapabilitiesRequest>,
     ) -> Result<Response<GetPluginCapabilitiesResponse>, Status> {
         // For our dummy driver, advertise controller service capability
         let controller_service = PluginCapability {
-            r#type: Some(
-                crate::csi::plugin_capability::Type::Service(
-                    crate::csi::plugin_capability::Service {
-                        r#type: crate::csi::plugin_capability::service::Type::ControllerService.into(),
-                    }
-                )
-            ),
-        };
-
-        let volume_expansion = PluginCapability {
-            r#type: Some(
-                crate::csi::plugin_capability::Type::VolumeExpansion(
-                    crate::csi::plugin_capability::VolumeExpansion {
-                        r#type: crate::csi::plugin_capability::volume_expansion::Type::Online.into(),
-                    }
-                )
-            ),
+            r#type: Some(crate::csi::plugin_capability::Type::Service(
+                crate::csi::plugin_capability::Service {
+                    r#type: crate::csi::plugin_capability::service::Type::ControllerService.into(),
+                },
+            )),
         };
 
         let response = GetPluginCapabilitiesResponse {
-            capabilities: vec![controller_service, volume_expansion],
+            capabilities: vec![controller_service],
         };
 
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip(self))]
     async fn probe(
         &self,
         _request: Request<ProbeRequest>,
     ) -> Result<Response<ProbeResponse>, Status> {
         // Our dummy driver is always healthy
-        let response = ProbeResponse {
-            ready: Some(true),
-        };
+        let response = ProbeResponse { ready: Some(true) };
 
         Ok(Response::new(response))
     }

@@ -7,7 +7,10 @@ use tonic::{Request, Response, Status};
 
 use crate::csi::node_server::Node;
 use crate::csi::{
-    NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest, NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse, NodePublishVolumeRequest, NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse
+    NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
+    NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse, NodePublishVolumeRequest,
+    NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
+    NodeUnpublishVolumeResponse,
 };
 
 #[derive(Debug)]
@@ -34,27 +37,16 @@ impl Node for NodeService {
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
         // Advertise stage_unstage_volume capability
         let stage_unstage = NodeServiceCapability {
-            r#type: Some(
-                crate::csi::node_service_capability::Type::Rpc(
-                    crate::csi::node_service_capability::Rpc {
-                        r#type: crate::csi::node_service_capability::rpc::Type::StageUnstageVolume.into(),
-                    }
-                )
-            ),
-        };
-
-        let expand_volume = NodeServiceCapability {
-            r#type: Some(
-                crate::csi::node_service_capability::Type::Rpc(
-                    crate::csi::node_service_capability::Rpc {
-                        r#type: crate::csi::node_service_capability::rpc::Type::ExpandVolume.into(),
-                    }
-                )
-            ),
+            r#type: Some(crate::csi::node_service_capability::Type::Rpc(
+                crate::csi::node_service_capability::Rpc {
+                    r#type: crate::csi::node_service_capability::rpc::Type::StageUnstageVolume
+                        .into(),
+                },
+            )),
         };
 
         let response = NodeGetCapabilitiesResponse {
-            capabilities: vec![stage_unstage, expand_volume],
+            capabilities: vec![stage_unstage],
         };
 
         Ok(Response::new(response))
@@ -91,21 +83,30 @@ impl Node for NodeService {
         }
 
         // Get the resource info from volume context
-        let resource_name = request.volume_context.get("resource")
+        let resource_name = request
+            .volume_context
+            .get("resource")
             .cloned()
             .unwrap_or_default();
 
-        log::info!(
+        tracing::info!(
             "Publishing volume '{}' with resource '{}' to '{}'",
-            volume_id, resource_name, target_path
+            volume_id,
+            resource_name,
+            target_path
         );
 
         // Create the target directory if it doesn't exist
         let target_path_obj = Path::new(&target_path);
         if !target_path_obj.exists() {
             let mut builder = fs::DirBuilder::new();
-            builder.mode(0o755).recursive(true).create(target_path_obj)
-                .map_err(|e| Status::internal(format!("Failed to create target directory: {}", e)))?;
+            builder
+                .mode(0o755)
+                .recursive(true)
+                .create(target_path_obj)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to create target directory: {}", e))
+                })?;
         }
 
         // In a real driver, we would:
@@ -114,8 +115,11 @@ impl Node for NodeService {
 
         // For our dummy driver, we'll just create a dummy file
         let dummy_file_path = Path::new(&target_path).join("dummy_data.txt");
-        fs::write(&dummy_file_path, format!("Dummy content for resource: {}", resource_name))
-            .map_err(|e| Status::internal(format!("Failed to write dummy file: {}", e)))?;
+        fs::write(
+            &dummy_file_path,
+            format!("Dummy content for resource: {}", resource_name),
+        )
+        .map_err(|e| Status::internal(format!("Failed to write dummy file: {}", e)))?;
 
         // Track this mount in our in-memory state
         let mut mounts = self.mounts.lock().unwrap();
@@ -140,7 +144,7 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
 
-        log::info!("Unpublishing volume '{}' from '{}'", volume_id, target_path);
+        tracing::info!("Unpublishing volume '{}' from '{}'", volume_id, target_path);
 
         // In a real driver, we would:
         // 1. Unmount any FUSE mount
@@ -178,20 +182,10 @@ impl Node for NodeService {
 
     async fn node_expand_volume(
         &self,
-        request: Request<NodeExpandVolumeRequest>,
+        _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        let request = request.into_inner();
-        let volume_id = request.volume_id;
-        let volume_path = request.volume_path;
-        
-        log::info!("Expanding volume '{}' at '{}'", volume_id, volume_path);
-        
-        // In a real driver with size limits, we would update them here
-        // For our dummy driver, we'll just acknowledge the expansion
-
-        Ok(Response::new(NodeExpandVolumeResponse {
-            capacity_bytes: request.capacity_range.map_or(0, |range| range.required_bytes),
-        }))
+        // For our dummy driver, we don't support volume expansion
+        Err(Status::unimplemented("Volume expansion is not supported"))
     }
 
     // Additional required methods
@@ -202,12 +196,16 @@ impl Node for NodeService {
         let request = request.into_inner();
         let volume_id = request.volume_id;
         let volume_path = request.volume_path;
-        
-        log::info!("Getting stats for volume '{}' at '{}'", volume_id, volume_path);
-        
+
+        tracing::info!(
+            "Getting stats for volume '{}' at '{}'",
+            volume_id,
+            volume_path
+        );
+
         // For our dummy driver, return fixed values
         let available = 1024 * 1024 * 1024 * 10; // 10 GB
-        let total = 1024 * 1024 * 1024 * 20;     // 20 GB
+        let total = 1024 * 1024 * 1024 * 20; // 20 GB
         let used = total - available;
 
         let usage = vec![
@@ -227,7 +225,7 @@ impl Node for NodeService {
 
         Ok(Response::new(crate::csi::NodeGetVolumeStatsResponse {
             usage,
-            volume_condition: None
+            volume_condition: None,
         }))
     }
 }

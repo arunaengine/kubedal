@@ -128,7 +128,7 @@ spec:
       serviceAccountName: kubedal-csi-controller
       containers:
         - name: csi-provisioner
-          image: k8s.gcr.io/sig-storage/csi-provisioner:v3.1.0
+          image: registry.k8s.io/sig-storage/csi-provisioner:v3.6.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--v=5"
@@ -139,7 +139,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: kubedal-csi
-          image: stanni/kubedal-csi:latest  # Replace with your actual image
+          image: stanni/kubedal:latest 
           args:
             - "--endpoint=unix:///var/lib/csi/sockets/pluginproxy/csi.sock"
             - "--node-id=controller"
@@ -171,7 +171,7 @@ spec:
       serviceAccountName: kubedal-csi-node
       containers:
         - name: csi-node-driver-registrar
-          image: k8s.gcr.io/sig-storage/csi-node-driver-registrar:v2.5.1
+          image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.9.0
           args:
             - "--csi-address=$(ADDRESS)"
             - "--kubelet-registration-path=$(DRIVER_REG_SOCK_PATH)"
@@ -191,7 +191,7 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: kubedal-csi
-          image: stanni/kubedal-csi:latest  # Replace with your actual image
+          image: stanni/kubedal:latest
           securityContext:
             privileged: true
           args:

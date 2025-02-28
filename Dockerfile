@@ -1,4 +1,4 @@
-FROM rust:1.84-slim as builder
+FROM rust:1.85-slim as builder
 
 WORKDIR /workspace
 
@@ -27,7 +27,7 @@ RUN apt-get update && apt-get install -y \
     && rm -rf /var/lib/apt/lists/*
 
 # Copy binary from builder stage
-COPY --from=builder /workspace/target/release/k8s-kubedal-csi /usr/local/bin/k8s-kubedal-csi
+COPY --from=builder /workspace/target/release/kubedal /usr/local/bin/kubedal
 
 # Set the entrypoint
-ENTRYPOINT ["k8s-kubedal-csi"]
+ENTRYPOINT ["kubedal"]

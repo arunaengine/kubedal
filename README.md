@@ -3,7 +3,7 @@
 KubeDAL bridges the gap between Kubernetes workloads and any storage backend through a powerful CSI driver built with Rust and Apache OpenDAL.
 
 > [!WARNING]  
-> KubeDAL is currently in an early experimental development phase and nowhere near production ready, expect bugs and breaking changes.
+> KubeDAL is currently in an early experimental development phase and nowhere near production ready, expect bugs, breaking changes and missing functionality. Stay tuned for a 0.1.0 release to check it out.
 
 ## What is KubeDAL?
 

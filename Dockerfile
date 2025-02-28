@@ -1,33 +1,16 @@
-FROM rust:1.85-slim as builder
-
-WORKDIR /workspace
-
-# Install build dependencies
-RUN apt-get update && apt-get install -y \
-    protobuf-compiler \
-    libfuse-dev \
-    pkg-config \
-    && rm -rf /var/lib/apt/lists/*
-
-# Add source files
-COPY proto/ proto/
-COPY Cargo.toml .
-COPY build.rs .
-COPY src/ src/
-
-# Build release binary
+FROM rust:1.85-alpine3.21 AS builder
+WORKDIR /build
+RUN apk update
+RUN apk upgrade
+ENV RUSTFLAGS="-C target-feature=-crt-static"
+ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
+RUN apk add llvm cmake gcc ca-certificates libc-dev pkgconfig openssl-dev protoc protobuf-dev protobuf-dev musl-dev git curl openssh
+COPY . .
 RUN cargo build --release
 
-# Runtime image
-FROM debian:bullseye-slim
-
-# Install runtime dependencies
-RUN apt-get update && apt-get install -y \
-    libfuse2 \
-    && rm -rf /var/lib/apt/lists/*
-
-# Copy binary from builder stage
-COPY --from=builder /workspace/target/release/kubedal /usr/local/bin/kubedal
-
-# Set the entrypoint
+FROM alpine:3.21
+RUN apk update
+RUN apk upgrade
+RUN apk add libgcc gcompat ca-certificates openssl-dev
+COPY --from=builder /build/target/release/kubedal /usr/local/bin/kubedal
 ENTRYPOINT ["kubedal"]

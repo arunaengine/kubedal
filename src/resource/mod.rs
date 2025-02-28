@@ -107,7 +107,7 @@ fn default_secret_key() -> String {
 }
 
 /// Helper to create an OpenDAL operator from a Resource
-pub fn create_opendal_operator(resource: &Resource) -> Result<(), String> {
+pub fn _create_opendal_operator(resource: &Resource) -> Result<(), String> {
     // In a real implementation, this would:
     // 1. Fetch credentials from the referenced secret if specified
     // 2. Create an OpenDAL Operator with the appropriate backend

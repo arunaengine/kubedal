@@ -1,5 +1,7 @@
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
+use kube::{Api, Client};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 use tonic::{Request, Response, Status};
 
 use crate::csi::controller_server::Controller;
@@ -13,17 +15,33 @@ use crate::csi::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume,
 };
+use crate::resource::crd::Resource;
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
+pub struct ResourceStorage {
+    resources: HashMap<String, (Resource, Option<Secret>)>,
+}
+
 pub struct ControllerService {
     // In-memory storage for volumes (for a dummy driver)
     volumes: Arc<Mutex<HashMap<String, Volume>>>,
+    storage: Arc<RwLock<ResourceStorage>>,
+    client: Client,
 }
 
 impl ControllerService {
-    pub fn new() -> Self {
+    pub async fn new(client: Client) -> Self {
+        let storage = Arc::new(RwLock::new(ResourceStorage::default()));
+        // Spawn the controller / resource reconciler
+        tokio::spawn(crate::resource::controller::run(
+            client.clone(),
+            storage.clone(),
+        ));
+
         Self {
+            client,
             volumes: Arc::new(Mutex::new(HashMap::new())),
+            storage: Arc::new(RwLock::new(ResourceStorage::default())),
         }
     }
 }
@@ -59,6 +77,20 @@ impl Controller for ControllerService {
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let request = request.into_inner();
+
+        let namespace = request.parameters.get("resourceNamespace").ok_or_else(|| {
+            tracing::error!("Resource namespace not provided in parameters");
+            Status::invalid_argument("Resource namespace not provided in parameters")
+        })?;
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
+        let pvc = pvcs.get_metadata(&request.name).await.map_err(|e| {
+            tracing::error!("Error getting PVC: {:?}", e);
+            Status::internal("Error getting PVC")
+        })?;
+
+        tracing::trace!("PVC meta: {:?}", pvc.metadata);
+
+        tracing::trace!("CreateVolume request: {:?}", request);
         let volume_name = request.name;
 
         if volume_name.is_empty() {

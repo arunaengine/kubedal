@@ -1,3 +1,4 @@
+use kube::Client;
 use std::collections::HashMap;
 use std::fs;
 use std::os::unix::fs::DirBuilderExt;
@@ -13,16 +14,17 @@ use crate::csi::{
     NodeUnpublishVolumeResponse,
 };
 
-#[derive(Debug)]
 pub struct NodeService {
+    client: Client,
     node_id: String,
     // Track mounted volumes for our dummy driver
     mounts: Arc<Mutex<HashMap<String, String>>>,
 }
 
 impl NodeService {
-    pub fn new(node_id: &str) -> Self {
+    pub fn new(client: Client, node_id: &str) -> Self {
         Self {
+            client,
             node_id: node_id.to_string(),
             mounts: Arc::new(Mutex::new(HashMap::new())),
         }

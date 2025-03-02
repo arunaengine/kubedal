@@ -63,7 +63,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["kubedal.arunaengine.org"]
     resources: ["resources"]
-    verbs: ["get", "list", "watch"]
+    verbs: ["get", "list", "watch", "patch", "update"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]

@@ -1,4 +1,5 @@
 use clap::{Arg, Command};
+use kube::Client;
 use kubedal::csi::{
     controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
 };
@@ -55,10 +56,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("Endpoint: {}", endpoint);
     tracing::info!("Node ID: {}", node_id);
 
+    let is_controller = matches!(node_id.as_str(), "controller");
+
+    let client = kube::Client::try_default().await?;
+
     // Create service instances
     let identity_service = IdentityService::new(NAME, VERSION);
-    let controller_service = ControllerService::new();
-    let node_service = NodeService::new(node_id);
 
     // Parse the endpoint
     if !endpoint.starts_with("unix://") {
@@ -87,10 +90,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     tracing::info!("CSI server listening on {}", socket_path);
 
     // Build and start the gRPC server
-    Server::builder()
-        .add_service(IdentityServer::new(identity_service))
-        .add_service(ControllerServer::new(controller_service))
-        .add_service(NodeServer::new(node_service))
+
+    let builder = Server::builder().add_service(IdentityServer::new(identity_service));
+
+    let builder = if is_controller {
+        // Is a controller node
+        let controller_service = ControllerService::new(client.clone()).await;
+        builder.add_service(ControllerServer::new(controller_service))
+    } else {
+        // Is a csi driver noder
+        let node_service = NodeService::new(client, node_id);
+        builder.add_service(NodeServer::new(node_service))
+    };
+
+    builder
         .serve_with_incoming_shutdown(uds_stream, async {
             signal::ctrl_c()
                 .await

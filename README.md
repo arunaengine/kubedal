@@ -37,15 +37,23 @@ KubeDAL creates a seamless experience for both developers and operators:
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: Resource
 metadata:
-  name: quarterly-reports
+  name: example-s3-dataset
 spec:
-  backend: s3
-  bucket: company-data
-  path: /reports/quarterly
-  accessMode: ReadOnlyMany
+  backend: S3 # Currently only S3 and HTTP are supported
+  access_mode: ReadOnlyMany
+  mount: Cached # Can be Cached or Fuse
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
   credentials:
     secretRef:
-      name: s3-credentials
+      name: my-secret
+      namespace: my-namespace
+  config:
+    endpoint: http://localhost:9000
+    bucket: my-bucket
+    region: us-east-1
+    root: /foo/bar/my-root/
 ```
 
 ```yaml
@@ -55,8 +63,8 @@ kind: PersistentVolumeClaim
 metadata:
   name: quarterly-data
   annotations:
-    kubedal.arunaengine.org/resource: quarterly-reports
-    kubedal.arunaengine.org/access-mode: cached  # or "fuse"
+    kubedal.arunaengine.org/resource: example-s3-dataset # Resource must be in the same namespace
+    kubedal.arunaengine.org/access-mode: cached # Optional, overwrite access mode
 spec:
   storageClassName: kubedal
   accessModes:

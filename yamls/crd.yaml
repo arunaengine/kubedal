@@ -30,19 +30,21 @@ spec:
                 - ReadOnlyMany
                 type: string
               backend:
-                description: Storage backend type (s3, azblob, gcs, etc.)
+                description: Storage backend scheme (s3, azblob, gcs, etc.)
                 enum:
                 - S3
                 - HTTP
                 type: string
-              bucket:
-                description: Bucket or container name
-                type: string
+              config:
+                additionalProperties:
+                  type: string
+                description: Additional config options for the backend
+                type: object
               credentials:
                 description: Credentials for accessing the backend
                 nullable: true
                 properties:
-                  secret_ref:
+                  secretRef:
                     description: Secret reference for credentials
                     properties:
                       name:
@@ -56,28 +58,17 @@ spec:
                     - name
                     type: object
                 required:
-                - secret_ref
+                - secretRef
                 type: object
-              endpoint:
-                description: Optional endpoint for the backend
-                nullable: true
-                type: string
-              options:
-                additionalProperties:
-                  type: string
-                description: Additional options for the backend
-                type: object
-              path:
-                description: Path/prefix within the bucket
-                nullable: true
-                type: string
-              region:
-                description: Optional region for the backend
-                nullable: true
+              mount:
+                default: Cached
+                description: Mount mode for the resource
+                enum:
+                - Cached
+                - Fuse
                 type: string
             required:
             - backend
-            - bucket
             type: object
         required:
         - spec

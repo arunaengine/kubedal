@@ -13,41 +13,31 @@ use std::collections::HashMap;
     namespaced
 )]
 pub struct ResourceSpec {
-    /// Storage backend type (s3, azblob, gcs, etc.)
+    /// Storage backend scheme (s3, azblob, gcs, etc.)
     pub backend: Backend,
-
-    /// Bucket or container name
-    pub bucket: String,
-
-    /// Path/prefix within the bucket
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub path: Option<String>,
 
     /// Access mode for the resource (default: Cached)
     #[serde(default = "default_access_mode")]
     pub access_mode: AccessMode,
 
-    /// Optional endpoint for the backend
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub endpoint: Option<String>,
-
-    /// Optional region for the backend
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub region: Option<String>,
+    /// Mount mode for the resource
+    #[serde(default)]
+    pub mount: MountMode,
 
     /// Credentials for accessing the backend
     #[serde(skip_serializing_if = "Option::is_none")]
     pub credentials: Option<Credentials>,
 
-    /// Additional options for the backend
+    /// Additional config options for the backend
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
-    pub options: HashMap<String, String>,
+    pub config: HashMap<String, String>,
 }
 
 /// Credentials configuration for accessing storage backends
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
 pub struct Credentials {
     /// Secret reference for credentials
+    #[serde(rename = "secretRef")]
     pub secret_ref: SecretRef,
 }
 
@@ -70,6 +60,17 @@ pub enum AccessMode {
     ReadWriteOnce,
     /// Read only access from multiple nodes
     ReadOnlyMany,
+}
+
+/// Mount mode for the resource
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[serde(rename_all = "PascalCase")]
+pub enum MountMode {
+    /// Mount the resource as a cached local directory
+    #[default]
+    Cached,
+    /// Mount the resource via fuse
+    Fuse,
 }
 
 /// Resource access mode

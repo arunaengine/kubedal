@@ -1,7 +1,4 @@
-use crate::{
-    resource::crd::{Resource as OpendalResource, ResourceStatus},
-    services::controller::ResourceStorage,
-};
+use crate::resource::crd::{Resource as OpendalResource, ResourceStatus};
 use futures::StreamExt;
 use kube::{
     Resource,
@@ -15,10 +12,7 @@ use kube::{
     },
 };
 use serde_json::json;
-use std::{
-    sync::{Arc, RwLock},
-    time::Duration,
-};
+use std::{sync::Arc, time::Duration};
 use tracing::*;
 
 // Context for our reconciler
@@ -28,8 +22,6 @@ pub struct Context {
     pub client: Client,
     /// Event recorder
     pub recorder: Recorder,
-    /// Resource storage
-    pub storage: Arc<RwLock<ResourceStorage>>,
 }
 
 const RESOURCE_FINALIZER: &str = "kubedal.arunaengine.org/resource";
@@ -76,29 +68,50 @@ fn error_policy(doc: Arc<OpendalResource>, error: &Error, _ctx: Arc<Context>) ->
 impl OpendalResource {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, Error> {
+        if self.status.is_some() {
+            return Ok(Action::requeue(Duration::from_secs(30 * 60)));
+        }
+
+        // If the status is already initialized, do nothing
         let client = ctx.client.clone();
         let ns = self
             .namespace()
             .ok_or_else(|| Error::ReconcilerError("Missing namespace".into()))?;
+
         let name = self.name_any();
         let docs: Api<OpendalResource> = Api::namespaced(client, &ns);
 
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
-            "apiVersion": "kubedal.aruna-egine.org/v1alpha1",
-            "kind": "Resource",
             "status": ResourceStatus {
-                bindings: Vec::new(),
+                bindings: self.status.as_ref().map_or_else(|| vec![], |s| s.bindings.clone()),
             }
         }));
+
+        trace!("Patching status for {}", name);
         let ps = PatchParams::apply("cntrlr").force();
         let _o = docs
             .patch_status(&name, &ps, &new_status)
             .await
+            .inspect_err(|e| error!("Failed to patch status: {:?}", e))
             .map_err(Error::KubeError)?;
 
-        // If no events were received, check back every 2 minutes
-        Ok(Action::requeue(Duration::from_secs(2 * 60)))
+        ctx.recorder
+            .publish(
+                &Event {
+                    type_: EventType::Normal,
+                    reason: "Initialized".into(),
+                    note: Some(format!("Init `{}`", self.name_any())),
+                    action: "Initialized".into(),
+                    secondary: None,
+                },
+                &self.object_ref(&()),
+            )
+            .await
+            .map_err(Error::KubeError)?;
+
+        // If no events were received, check back every 30 minutes
+        Ok(Action::requeue(Duration::from_secs(30 * 60)))
     }
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
@@ -122,7 +135,7 @@ impl OpendalResource {
 }
 
 /// Initialize the controller and shared state (given the crd is installed)
-pub async fn run(client: Client, storage: Arc<RwLock<ResourceStorage>>) {
+pub async fn run(client: Client) {
     let docs = Api::<OpendalResource>::all(client.clone());
     if let Err(e) = docs.list(&ListParams::default().limit(1)).await {
         error!("CRD is not queryable; {e:?}. Is the CRD installed?");
@@ -133,7 +146,6 @@ pub async fn run(client: Client, storage: Arc<RwLock<ResourceStorage>>) {
     let state = Arc::new(Context {
         client: client.clone(),
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
-        storage,
     });
 
     Controller::new(docs, Config::default().any_semantic())

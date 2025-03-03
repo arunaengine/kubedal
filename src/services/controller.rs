@@ -1,7 +1,8 @@
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Secret};
+use k8s_openapi::api::core::v1::PersistentVolumeClaim;
+use kube::api::{ListParams, ObjectMeta};
 use kube::{Api, Client};
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex, RwLock};
+use std::sync::{Arc, Mutex};
 use tonic::{Request, Response, Status};
 
 use crate::csi::controller_server::Controller;
@@ -17,31 +18,20 @@ use crate::csi::{
 };
 use crate::resource::crd::Resource;
 
-#[derive(Debug, Default)]
-pub struct ResourceStorage {
-    resources: HashMap<String, (Resource, Option<Secret>)>,
-}
-
 pub struct ControllerService {
     // In-memory storage for volumes (for a dummy driver)
     volumes: Arc<Mutex<HashMap<String, Volume>>>,
-    storage: Arc<RwLock<ResourceStorage>>,
     client: Client,
 }
 
 impl ControllerService {
     pub async fn new(client: Client) -> Self {
-        let storage = Arc::new(RwLock::new(ResourceStorage::default()));
         // Spawn the controller / resource reconciler
-        tokio::spawn(crate::resource::controller::run(
-            client.clone(),
-            storage.clone(),
-        ));
+        tokio::spawn(crate::resource::controller::run(client.clone()));
 
         Self {
             client,
             volumes: Arc::new(Mutex::new(HashMap::new())),
-            storage: Arc::new(RwLock::new(ResourceStorage::default())),
         }
     }
 }
@@ -71,63 +61,52 @@ impl Controller for ControllerService {
         Ok(Response::new(response))
     }
 
-    #[tracing::instrument(skip(self))]
+    #[tracing::instrument(skip(self, request))]
     async fn create_volume(
         &self,
         request: Request<CreateVolumeRequest>,
     ) -> Result<Response<CreateVolumeResponse>, Status> {
         let request = request.into_inner();
+        tracing::trace!("CreateVolume request: {:?}", request);
+
+        if request.name.is_empty() {
+            return Err(Status::invalid_argument("Volume name cannot be empty"));
+        }
+
+        {
+            let volumes = self.volumes.lock().unwrap();
+            // Check if volume already exists
+            if volumes.contains_key(&request.name) {
+                let existing_volume = volumes.get(&request.name).unwrap().clone();
+                return Ok(Response::new(CreateVolumeResponse {
+                    volume: Some(existing_volume),
+                }));
+            }
+        }
 
         let namespace = request.parameters.get("resourceNamespace").ok_or_else(|| {
             tracing::error!("Resource namespace not provided in parameters");
             Status::invalid_argument("Resource namespace not provided in parameters")
         })?;
-        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(self.client.clone(), &namespace);
-        let pvc = pvcs.get_metadata(&request.name).await.map_err(|e| {
-            tracing::error!("Error getting PVC: {:?}", e);
-            Status::internal("Error getting PVC")
-        })?;
 
-        tracing::trace!("PVC meta: {:?}", pvc.metadata);
+        let client = self.client.clone();
+        let pvc_meta = get_pvc(client.clone(), &namespace, &request.name).await?;
+        let context = get_config_from_pvc_meta(client, pvc_meta.clone()).await?;
 
-        tracing::trace!("CreateVolume request: {:?}", request);
-        let volume_name = request.name;
-
-        if volume_name.is_empty() {
-            return Err(Status::invalid_argument("Volume name cannot be empty"));
-        }
-
-        // Check for resource annotation in parameters
-        let parameters = request.parameters;
-        let resource_name = parameters.get("resource").cloned().unwrap_or_default();
+        tracing::trace!("PVC meta: {:?}", pvc_meta);
+        tracing::trace!("Volume context: {:?}", context);
 
         tracing::info!(
-            "Creating volume '{}' with resource '{}'",
-            volume_name,
-            resource_name
+            "Creating volume '{}' with annotations '{:?}'",
+            request.name,
+            pvc_meta.annotations.unwrap_or_default()
         );
-
-        // In a real driver, we would validate and process the resource reference here
-        // For our dummy driver, we'll just create a simple volume record
-
-        let mut volumes = self.volumes.lock().unwrap();
-
-        // Check if volume already exists
-        if volumes.contains_key(&volume_name) {
-            let existing_volume = volumes.get(&volume_name).unwrap().clone();
-            return Ok(Response::new(CreateVolumeResponse {
-                volume: Some(existing_volume),
-            }));
-        }
 
         // Create a new volume entry
         let volume_id = format!("kubedal-{}", uuid::Uuid::new_v4());
         let capacity_bytes = request
             .capacity_range
             .map_or(5 * 1024 * 1024 * 1024, |range| range.required_bytes);
-
-        let mut context = HashMap::new();
-        context.insert("resource".to_string(), resource_name);
 
         let volume = Volume {
             volume_id: volume_id.clone(),
@@ -137,7 +116,8 @@ impl Controller for ControllerService {
             volume_context: context,
         };
 
-        volumes.insert(volume_name, volume.clone());
+        let mut volumes = self.volumes.lock().unwrap();
+        volumes.insert(request.name, volume.clone());
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
@@ -296,4 +276,97 @@ impl Controller for ControllerService {
             "ControllerModifyVolume is not implemented",
         ))
     }
+}
+
+async fn get_pvc(client: Client, namespace: &str, uid: &str) -> Result<ObjectMeta, Status> {
+    let uid = uid.strip_prefix("pvc-").ok_or_else(|| {
+        tracing::error!("PVC name not provided in request");
+        Status::invalid_argument("PVC name not provided in request")
+    })?;
+
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, &namespace);
+
+    let all_pvc = pvcs
+        .list_metadata(&ListParams::default())
+        .await
+        .map_err(|e| {
+            tracing::error!("Error listing PVCs: {:?}", e);
+            Status::internal("Error listing PVCs")
+        })?;
+
+    let pvc = all_pvc
+        .items
+        .into_iter()
+        .find(|pvc| {
+            pvc.metadata
+                .uid
+                .as_ref()
+                .map_or(false, |has_uid| has_uid == uid)
+        })
+        .ok_or_else(|| {
+            tracing::error!("PVC not found");
+            Status::not_found("PVC not found")
+        })?;
+
+    let pvc_meta = pvc.metadata;
+
+    Ok(pvc_meta)
+}
+
+async fn get_config_from_pvc_meta(
+    client: Client,
+    pvc_meta: ObjectMeta,
+) -> Result<HashMap<String, String>, Status> {
+    let annotations = pvc_meta.annotations.unwrap_or_default();
+
+    let resource = annotations
+        .get("kubedal.arunaengine.org/resource")
+        .ok_or_else(|| {
+            tracing::error!("Resource annotation not found");
+            Status::invalid_argument("Resource annotation not found")
+        })?;
+
+    let resource_ns = annotations
+        .get("kubedal.arunaengine.org/namespace")
+        .cloned()
+        .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
+
+    let res_api: Api<Resource> = Api::namespaced(client, &resource_ns);
+    let res = res_api.get(resource).await.map_err(|e| {
+        tracing::error!("Error getting resource: {:?}", e);
+        Status::internal("Error getting resource")
+    })?;
+
+    let mut config = res.spec.config.clone();
+    match res.spec.backend {
+        crate::resource::crd::Backend::S3 => config.insert("backend".to_string(), "s3".to_string()),
+        crate::resource::crd::Backend::HTTP => {
+            config.insert("backend".to_string(), "http".to_string())
+        }
+    };
+
+    // Override the mount mode if specified in the PVC annotations
+    config.insert(
+        "mount".to_string(),
+        annotations
+            .get("kubedal.arunaengine.org/mount")
+            .and_then(|mode| match mode.as_str() {
+                m @ ("cached" | "fuse") => Some(m),
+                _ => None,
+            })
+            .unwrap_or_else(|| match res.spec.mount {
+                crate::resource::crd::MountMode::Cached => "cached",
+                crate::resource::crd::MountMode::Fuse => "fuse",
+            })
+            .to_string(),
+    );
+
+    if let Some(cred) = res.spec.credentials {
+        let secret_ns = cred.secret_ref.namespace.unwrap_or(resource_ns);
+        let secret_name = cred.secret_ref.name;
+        config.insert("secret".to_string(), secret_name);
+        config.insert("secret_ns".to_string(), secret_ns);
+    }
+
+    Ok(config)
 }

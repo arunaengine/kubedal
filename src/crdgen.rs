@@ -38,6 +38,7 @@ fn main() {
                 map
             },
         },
+        status: None,
     };
 
     serde_yaml::to_writer(std::io::stdout(), &demo_resource).expect("Failed to serialize Resource");

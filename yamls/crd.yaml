@@ -70,10 +70,28 @@ spec:
             required:
             - backend
             type: object
+          status:
+            description: Status of the Resource
+            nullable: true
+            properties:
+              bindings:
+                items:
+                  description: Volume binding currently in use
+                  properties:
+                    volume_id:
+                      type: string
+                  required:
+                  - volume_id
+                  type: object
+                type: array
+            required:
+            - bindings
+            type: object
         required:
         - spec
         title: Resource
         type: object
     served: true
     storage: true
-    subresources: {}
+    subresources:
+      status: {}

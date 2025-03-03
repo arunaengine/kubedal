@@ -76,6 +76,20 @@ impl Node for NodeService {
         let volume_id = request.volume_id;
         let target_path = request.target_path;
 
+        // let secret_version = match self.spec.credentials.as_ref() {
+        //     None => None,
+        //     Some(cred) => {
+        //         let secret_ns = cred.secret_ref.namespace.as_deref().unwrap_or(&ns);
+        //         let secret_name = &cred.secret_ref.name;
+        //         let secret_api: Api<Secret> = Api::namespaced(client.clone(), secret_ns);
+        //         let secret = secret_api
+        //             .get_metadata(secret_name)
+        //             .await
+        //             .map_err(|e| Error::MissingSecret(e.to_string()))?;
+        //         secret.metadata.resource_version.clone()
+        //     }
+        // };
+
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
         }

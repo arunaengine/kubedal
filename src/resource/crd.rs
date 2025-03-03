@@ -10,6 +10,7 @@ use std::collections::HashMap;
     version = "v1alpha1",
     kind = "Resource",
     shortname = "res",
+    status = "ResourceStatus",
     namespaced
 )]
 pub struct ResourceSpec {
@@ -92,7 +93,6 @@ fn default_access_mode() -> AccessMode {
 /// Status of the Resource
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
 pub struct ResourceStatus {
-    // List of all active volume bindings
     pub bindings: Vec<Binding>,
 }
 

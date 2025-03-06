@@ -8,9 +8,11 @@ use crate::csi::{
 use crate::resource::crd::{Backend, Datasource};
 use crate::util::opendal::get_operator;
 use futures::TryStreamExt;
-use k8s_openapi::api::authorization::v1::{ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec};
+use k8s_openapi::api::authorization::v1::{
+    ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
+};
 use k8s_openapi::api::core::v1::Secret;
-use kube::api::ObjectMeta;
+use kube::api::PostParams;
 use kube::{Api, Client};
 use std::collections::HashMap;
 use std::fs;
@@ -83,24 +85,6 @@ impl Node for NodeService {
         let volume_id = request.volume_id; // This is just the volume-handle 
         let target_path = request.target_path;
 
-        // let subjectaccessreview = SubjectAccessReview {
-        //     metadata: ObjectMeta::default(),
-        //     spec: SubjectAccessReviewSpec {
-        //         resource_attributes: Some(
-        //             ResourceAttributes {
-        //                 verb: Some("get".to_string()),
-        //                 resource: "secret",
-        //                 namespace: "default",
-        //                 name: volume_id,
-        //                 ..Default::default()
-        //             },
-        //         ),
-        //         user: Some("PodServiceAccount".to_string()),
-        //         ..Default::default()
-        //     },
-        //     status: None,
-        // };
-
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
         }
@@ -109,25 +93,80 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
 
-        // Get the resource info from volume context
-        let resource_name = request
+        // Get DataSource meta from volume context
+        let datasource_name = request
             .volume_context
             .get("kubedal.arunaengine.org/resource")
             .cloned()
             .expect("No resource propagated");
 
-        // Fetch resource
-        let res_ns = match request
+        let datasource_namespace = match request
             .volume_context
-            .get("kubedal.arunaengine.org/resource_ns")
+            .get("kubedal.arunaengine.org/resource_namespace")
         {
-            Some(ns) => ns,
-            None => "default",
+            Some(ns) => ns.to_string(),
+            None => "default".to_string(),
         };
-        let res_api: Api<Datasource> = Api::namespaced(self.client.clone(), res_ns);
-        let res = res_api.get(&resource_name).await.map_err(|e| {
-            tracing::error!("Error getting resource: {:?}", e);
-            Status::internal("Error getting resource")
+
+        // Fetch Pod meta from context and check with SubjectAccessReview
+        let _pod_name = request
+            .volume_context
+            .get("csi.storage.k8s.io/pod.name")
+            .expect("Pod name not provided");
+        let pod_namespace = request
+            .volume_context
+            .get("csi.storage.k8s.io/pod.namespace")
+            .expect("Pod namespace not provided");
+        let pod_service_account = request
+            .volume_context
+            .get("csi.storage.k8s.io/serviceAccount.name")
+            .expect("Pod service account not provided");
+
+        let auth_api: Api<SubjectAccessReview> = Api::all(self.client.clone());
+        let response = auth_api
+            .create(
+                &PostParams::default(),
+                &SubjectAccessReview {
+                    metadata: Default::default(),
+                    spec: SubjectAccessReviewSpec {
+                        resource_attributes: Some(ResourceAttributes {
+                            group: Some("kubedal.arunaengine.org".to_string()),
+                            name: Some(datasource_name.clone()),
+                            namespace: Some(datasource_namespace.clone()),
+                            resource: Some("datasources".to_string()),
+                            verb: Some("get".to_string()),
+                            ..Default::default()
+                        }),
+                        user: Some(format!(
+                            "system:serviceaccount:{}:{}",
+                            pod_namespace, pod_service_account
+                        )),
+                        ..Default::default()
+                    },
+                    status: None,
+                },
+            )
+            .await
+            .unwrap();
+        tracing::info!("SubjectAccessReview response: {:#?}", &response);
+
+        if let Some(status) = response.status {
+            if !status.allowed {
+                return Err(Status::permission_denied(
+                    "No permissions to read data source",
+                ));
+            }
+        } else {
+            return Err(Status::permission_denied(
+                "SubjectAccessReview did not return status",
+            ));
+        }
+
+        // Fetch DataSource if access review success
+        let res_api: Api<Datasource> = Api::namespaced(self.client.clone(), &datasource_namespace);
+        let res = res_api.get(&datasource_name).await.map_err(|e| {
+            tracing::error!("Error getting DataSource: {:?}", e);
+            Status::internal("Error getting DataSource")
         })?;
 
         // Fetch secret
@@ -156,7 +195,6 @@ impl Node for NodeService {
                         );
                     }
                 }
-
                 config
             }
         };
@@ -167,9 +205,9 @@ impl Node for NodeService {
 
         // Read dataset into target path
         tracing::info!(
-            "Publishing volume '{}' with resource '{}' to '{}'",
+            "Publishing volume '{}' with data source '{}' to '{}'",
             volume_id,
-            resource_name,
+            datasource_name,
             target_path
         );
 
@@ -194,7 +232,7 @@ impl Node for NodeService {
         }
 
         // Cache data source in target directory
-        //TODO: More sophisticated directory structure to cache for resource/resource-version
+        //TODO: More sophisticated directory structure to cache for data-source/version
         for entry in data_source_children {
             let entry_path = Path::new(&target_path).join(entry.path());
             match entry.metadata().mode() {

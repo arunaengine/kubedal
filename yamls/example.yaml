@@ -19,6 +19,7 @@ spec:
     endpoint: http://localhost:9000
     region: us-east-1
     root: /foo/bar/my-root/
+    enable_virtual_host_style: "true"
 ---
 # Example Secret with credentials
 apiVersion: v1

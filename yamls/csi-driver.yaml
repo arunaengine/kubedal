@@ -139,7 +139,7 @@ spec:
             - name: socket-dir
               mountPath: /var/lib/csi/sockets/pluginproxy/
         - name: kubedal-csi
-          image: stanni/kubedal:latest 
+          image: harbor.computational.bio.uni-giessen.de/aruna/kubedal:latest 
           args:
             - "--endpoint=unix:///var/lib/csi/sockets/pluginproxy/csi.sock"
             - "--node-id=controller"
@@ -191,7 +191,7 @@ spec:
             - name: registration-dir
               mountPath: /registration
         - name: kubedal-csi
-          image: stanni/kubedal:latest
+          image: harbor.computational.bio.uni-giessen.de/aruna/kubedal:latest
           securityContext:
             privileged: true
           args:

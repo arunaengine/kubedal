@@ -1,33 +1,33 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: resources.kubedal.arunaengine.org
+  name: datasources.kubedal.arunaengine.org
 spec:
   group: kubedal.arunaengine.org
   names:
     categories: []
-    kind: Resource
-    plural: resources
+    kind: Datasource
+    plural: datasources
     shortNames:
-    - res
-    singular: resource
+    - ds
+    singular: datasource
   scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for ResourceSpec via `CustomResource`
+        description: Auto-generated derived type for DatasourceSpec via `CustomResource`
         properties:
           spec:
             description: Resource is our main custom resource
             properties:
               access_mode:
-                default: ReadOnlyMany
+                default: ReadOnly
                 description: 'Access mode for the resource (default: Cached)'
                 enum:
-                - ReadWriteOnce
-                - ReadOnlyMany
+                - ReadOnly
+                - ReadWrite
                 type: string
               backend:
                 description: Storage backend scheme (s3, azblob, gcs, etc.)
@@ -89,7 +89,7 @@ spec:
             type: object
         required:
         - spec
-        title: Resource
+        title: Datasource
         type: object
     served: true
     storage: true

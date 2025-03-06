@@ -5,7 +5,7 @@ use crate::csi::{
     NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
     NodeUnpublishVolumeResponse,
 };
-use crate::resource::crd::{Backend, Resource};
+use crate::resource::crd::{Backend, Datasource};
 use crate::util::opendal::get_operator;
 use futures::TryStreamExt;
 use k8s_openapi::api::core::v1::Secret;
@@ -104,7 +104,7 @@ impl Node for NodeService {
             Some(ns) => ns,
             None => "default",
         };
-        let res_api: Api<Resource> = Api::namespaced(self.client.clone(), &res_ns);
+        let res_api: Api<Datasource> = Api::namespaced(self.client.clone(), &res_ns);
         let res = res_api.get(&resource_name).await.map_err(|e| {
             tracing::error!("Error getting resource: {:?}", e);
             Status::internal("Error getting resource")

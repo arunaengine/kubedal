@@ -1,4 +1,4 @@
-use crate::resource::crd::{Resource as OpendalResource, ResourceStatus};
+use crate::resource::crd::{Datasource, DatasourceStatus};
 use futures::StreamExt;
 use kube::{
     Resource,
@@ -45,9 +45,9 @@ pub enum Error {
 }
 
 #[instrument(skip(ctx, res), fields(trace_id))]
-async fn reconcile(res: Arc<OpendalResource>, ctx: Arc<Context>) -> Result<Action, Error> {
+async fn reconcile(res: Arc<Datasource>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = res.namespace().unwrap(); // res is namespace scoped
-    let ress: Api<OpendalResource> = Api::namespaced(ctx.client.clone(), &ns);
+    let ress: Api<Datasource> = Api::namespaced(ctx.client.clone(), &ns);
 
     info!("Reconciling Document \"{}\" in {}", res.name_any(), ns);
     finalizer(&ress, RESOURCE_FINALIZER, res, |event| async {
@@ -60,12 +60,12 @@ async fn reconcile(res: Arc<OpendalResource>, ctx: Arc<Context>) -> Result<Actio
     .map_err(|e| Error::FinalizerError(Box::new(e)))
 }
 
-fn error_policy(doc: Arc<OpendalResource>, error: &Error, _ctx: Arc<Context>) -> Action {
+fn error_policy(doc: Arc<Datasource>, error: &Error, _ctx: Arc<Context>) -> Action {
     warn!("reconcile failed: {:?}, {:?}", error, doc);
     Action::requeue(Duration::from_secs(5 * 60))
 }
 
-impl OpendalResource {
+impl Datasource {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, Error> {
         if self.status.is_some() {
@@ -79,11 +79,11 @@ impl OpendalResource {
             .ok_or_else(|| Error::ReconcilerError("Missing namespace".into()))?;
 
         let name = self.name_any();
-        let docs: Api<OpendalResource> = Api::namespaced(client, &ns);
+        let docs: Api<Datasource> = Api::namespaced(client, &ns);
 
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
-            "status": ResourceStatus {
+            "status": DatasourceStatus {
                 bindings: self.status.as_ref().map_or_else(|| vec![], |s| s.bindings.clone()),
             }
         }));
@@ -136,7 +136,7 @@ impl OpendalResource {
 
 /// Initialize the controller and shared state (given the crd is installed)
 pub async fn run(client: Client) {
-    let docs = Api::<OpendalResource>::all(client.clone());
+    let docs = Api::<Datasource>::all(client.clone());
     if let Err(e) = docs.list(&ListParams::default().limit(1)).await {
         error!("CRD is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");

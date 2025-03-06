@@ -1,9 +1,9 @@
 use kube::{CustomResourceExt, api::ObjectMeta};
-use kubedal::resource::crd::{Resource, ResourceSpec};
+use kubedal::resource::crd::{Datasource, DatasourceSpec};
 
 fn main() {
     // Generate the CRD yaml for our Resource type
-    let crd = Resource::crd();
+    let crd = Datasource::crd();
 
     let path = std::env::args()
         .nth(1)
@@ -14,14 +14,14 @@ fn main() {
     // Print it to stdout
     serde_yaml::to_writer(file, &crd).expect("Failed to serialize CRD");
 
-    let demo_resource = Resource {
+    let demo_resource = Datasource {
         metadata: ObjectMeta {
             name: Some("my-resource".to_string()),
             ..Default::default()
         },
-        spec: ResourceSpec {
+        spec: DatasourceSpec {
             backend: kubedal::resource::crd::Backend::S3,
-            access_mode: kubedal::resource::crd::AccessMode::ReadOnlyMany,
+            access_mode: kubedal::resource::crd::AccessMode::ReadOnly,
             mount: kubedal::resource::crd::MountMode::Cached,
             credentials: Some(kubedal::resource::crd::Credentials {
                 secret_ref: kubedal::resource::crd::SecretRef {

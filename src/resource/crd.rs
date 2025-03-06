@@ -8,12 +8,12 @@ use std::collections::HashMap;
 #[kube(
     group = "kubedal.arunaengine.org",
     version = "v1alpha1",
-    kind = "Resource",
-    shortname = "res",
-    status = "ResourceStatus",
+    kind = "Datasource",
+    shortname = "ds",
+    status = "DatasourceStatus",
     namespaced
 )]
-pub struct ResourceSpec {
+pub struct DatasourceSpec {
     /// Storage backend scheme (s3, azblob, gcs, etc.)
     pub backend: Backend,
 
@@ -57,10 +57,10 @@ pub struct SecretRef {
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[serde(rename_all = "PascalCase")]
 pub enum AccessMode {
-    /// Read Write access (currently needs FUSE)
-    ReadWriteOnce,
-    /// Read only access from multiple nodes
-    ReadOnlyMany,
+    /// Read only access
+    ReadOnly,
+    /// Read and write access
+    ReadWrite,
 }
 
 /// Mount mode for the resource
@@ -87,12 +87,12 @@ pub enum Backend {
 
 /// Default access mode is Cached
 fn default_access_mode() -> AccessMode {
-    AccessMode::ReadOnlyMany
+    AccessMode::ReadOnly
 }
 
 /// Status of the Resource
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct ResourceStatus {
+pub struct DatasourceStatus {
     pub bindings: Vec<Binding>,
 }
 

@@ -16,7 +16,7 @@ use crate::csi::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume,
 };
-use crate::resource::crd::Resource;
+use crate::resource::crd::Datasource;
 
 pub struct ControllerService {
     // In-memory storage for volumes (for a dummy driver)
@@ -331,7 +331,7 @@ async fn get_config_from_pvc_meta(
         .cloned()
         .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
 
-    let res_api: Api<Resource> = Api::namespaced(client, &resource_ns);
+    let res_api: Api<Datasource> = Api::namespaced(client, &resource_ns);
     let res = res_api.get(resource).await.map_err(|e| {
         tracing::error!("Error getting resource: {:?}", e);
         Status::internal("Error getting resource")

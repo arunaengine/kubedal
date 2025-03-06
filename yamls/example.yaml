@@ -1,22 +1,22 @@
-# Example Resource for S3
+# Example Datasource for S3
 apiVersion: kubedal.arunaengine.org/v1alpha1
-kind: Resource
+kind: Datasource
 metadata:
   name: example-s3-dataset
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
-  access_mode: ReadOnlyMany
+  access_mode: ReadOnly # Can be ReadOnly or ReadWrite
   mount: Cached # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
   # 2. As a key/values in the referenced Secret (for sensitive information)
   credentials:
     secretRef:
-      name: my-secret
-      namespace: my-namespace
+      name: s3-credentials
+      namespace: default
   config:
-    endpoint: http://localhost:9000
     bucket: my-bucket
+    endpoint: http://localhost:9000
     region: us-east-1
     root: /foo/bar/my-root/
 ---

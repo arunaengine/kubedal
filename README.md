@@ -20,12 +20,12 @@ KubeDAL creates a seamless experience for both developers and operators:
 - **Kubernetes-native Resources**: Define storage locations as proper Kubernetes Resources with full RBAC support
 - **Universal Storage Support**: Leverage OpenDAL's extensive backend support for virtually any storage system
 - **Flexible Access Modes**: Choose between local caching for performance or direct FUSE mounting for real-time access
-- **Simple PVC Integration**: Connect to Resources via simple PVC annotations
+- **Simple PVC Integration**: Connect to Datasources via simple PVC annotations
 - **Zero Application Changes**: Works transparently with existing applications
 
 ## How It Works
 
-1. Define your storage locations as KubeDAL Resources
+1. Define your storage locations as KubeDAL Datasource
 2. Create PVCs with annotations referencing these Resources
 3. KubeDAL either downloads and caches the data or mounts it directly via FUSE
 4. Your pods can access the data as standard volumes
@@ -33,25 +33,25 @@ KubeDAL creates a seamless experience for both developers and operators:
 ## Getting Started
 
 ```yaml
-# Define a storage Resource
+# Define a storage Datasource
 apiVersion: kubedal.arunaengine.org/v1alpha1
-kind: Resource
+kind: Datasource
 metadata:
   name: example-s3-dataset
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
-  access_mode: ReadOnlyMany
+  access_mode: ReadOnly # Can be ReadOnly or ReadWrite
   mount: Cached # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
   # 2. As a key/values in the referenced Secret (for sensitive information)
   credentials:
     secretRef:
-      name: my-secret
-      namespace: my-namespace
+      name: s3-credentials
+      namespace: default
   config:
-    endpoint: http://localhost:9000
     bucket: my-bucket
+    endpoint: http://localhost:9000
     region: us-east-1
     root: /foo/bar/my-root/
 ```

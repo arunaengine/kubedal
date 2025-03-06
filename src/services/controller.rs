@@ -338,6 +338,10 @@ async fn get_config_from_pvc_meta(
     })?;
 
     let mut config = res.spec.config.clone();
+    config.insert(
+        "kubedal.arunaengine.org/resource".to_string(),
+        resource.to_string(),
+    );
     match res.spec.backend {
         crate::resource::crd::Backend::S3 => config.insert("backend".to_string(), "s3".to_string()),
         crate::resource::crd::Backend::HTTP => {

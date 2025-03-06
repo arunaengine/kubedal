@@ -8,7 +8,9 @@ use crate::csi::{
 use crate::resource::crd::{Backend, Datasource};
 use crate::util::opendal::get_operator;
 use futures::TryStreamExt;
+use k8s_openapi::api::authorization::v1::{ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec};
 use k8s_openapi::api::core::v1::Secret;
+use kube::api::ObjectMeta;
 use kube::{Api, Client};
 use std::collections::HashMap;
 use std::fs;
@@ -80,6 +82,24 @@ impl Node for NodeService {
         let request = request.into_inner();
         let volume_id = request.volume_id; // This is just the volume-handle 
         let target_path = request.target_path;
+
+        // let subjectaccessreview = SubjectAccessReview {
+        //     metadata: ObjectMeta::default(),
+        //     spec: SubjectAccessReviewSpec {
+        //         resource_attributes: Some(
+        //             ResourceAttributes {
+        //                 verb: Some("get".to_string()),
+        //                 resource: "secret",
+        //                 namespace: "default",
+        //                 name: volume_id,
+        //                 ..Default::default()
+        //             },
+        //         ),
+        //         user: Some("PodServiceAccount".to_string()),
+        //         ..Default::default()
+        //     },
+        //     status: None,
+        // };
 
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));

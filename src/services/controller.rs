@@ -342,6 +342,10 @@ async fn get_config_from_pvc_meta(
         "kubedal.arunaengine.org/resource".to_string(),
         resource.to_string(),
     );
+    config.insert(
+        "kubedal.arunaengine.org/resource_namespace".to_string(),
+        resource_ns.to_string(),
+    );
     match res.spec.backend {
         crate::resource::crd::Backend::S3 => config.insert("backend".to_string(), "s3".to_string()),
         crate::resource::crd::Backend::HTTP => {

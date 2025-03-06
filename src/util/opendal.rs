@@ -8,7 +8,6 @@ pub fn get_operator(backend: Backend, cfg: HashMap<String, String>) -> Result<Op
     let op = match backend {
         Backend::S3 => init_service::<services::S3>(cfg)?,
         Backend::HTTP => init_service::<services::Http>(cfg)?,
-        //_ => return Err(Status::invalid_argument("Backend not supported")),
     };
 
     Ok(op)

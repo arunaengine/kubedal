@@ -38,7 +38,8 @@ metadata:
   name: example-dataset-pvc
   namespace: default
   annotations:
-    kubedal.arunaengine.org/resource: example-s3-dataset
+    kubedal.arunaengine.org/datasource: example-s3-dataset
+    kubedal.arunaengine.org/namespace: default
 spec:
   accessModes:
     - ReadOnlyMany

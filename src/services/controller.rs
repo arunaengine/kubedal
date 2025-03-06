@@ -320,10 +320,10 @@ async fn get_config_from_pvc_meta(
     let annotations = pvc_meta.annotations.unwrap_or_default();
 
     let resource = annotations
-        .get("kubedal.arunaengine.org/resource")
+        .get("kubedal.arunaengine.org/datasource")
         .ok_or_else(|| {
-            tracing::error!("Resource annotation not found");
-            Status::invalid_argument("Resource annotation not found")
+            tracing::error!("Datasource annotation not found");
+            Status::invalid_argument("Datasource annotation not found")
         })?;
 
     let resource_ns = annotations

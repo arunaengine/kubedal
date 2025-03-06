@@ -1,11 +1,3 @@
-use kube::Client;
-use std::collections::HashMap;
-use std::fs;
-use std::os::unix::fs::DirBuilderExt;
-use std::path::Path;
-use std::sync::{Arc, Mutex};
-use tonic::{Request, Response, Status};
-
 use crate::csi::node_server::Node;
 use crate::csi::{
     NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
@@ -13,6 +5,18 @@ use crate::csi::{
     NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
     NodeUnpublishVolumeResponse,
 };
+use crate::resource::crd::{Backend, Resource};
+use crate::util::opendal::get_operator;
+use futures::TryStreamExt;
+use k8s_openapi::api::core::v1::Secret;
+use kube::{Api, Client};
+use std::collections::HashMap;
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::DirBuilderExt;
+use std::path::Path;
+use std::sync::{Arc, Mutex};
+use tonic::{Request, Response, Status};
 
 pub struct NodeService {
     client: Client,
@@ -68,27 +72,14 @@ impl Node for NodeService {
         Ok(Response::new(response))
     }
 
+    #[tracing::instrument(skip(self, request))]
     async fn node_publish_volume(
         &self,
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        let volume_id = request.volume_id;
+        let volume_id = request.volume_id; // This is just the volume-handle 
         let target_path = request.target_path;
-
-        // let secret_version = match self.spec.credentials.as_ref() {
-        //     None => None,
-        //     Some(cred) => {
-        //         let secret_ns = cred.secret_ref.namespace.as_deref().unwrap_or(&ns);
-        //         let secret_name = &cred.secret_ref.name;
-        //         let secret_api: Api<Secret> = Api::namespaced(client.clone(), secret_ns);
-        //         let secret = secret_api
-        //             .get_metadata(secret_name)
-        //             .await
-        //             .map_err(|e| Error::MissingSecret(e.to_string()))?;
-        //         secret.metadata.resource_version.clone()
-        //     }
-        // };
 
         if volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
@@ -101,16 +92,73 @@ impl Node for NodeService {
         // Get the resource info from volume context
         let resource_name = request
             .volume_context
-            .get("resource")
+            .get("kubedal.arunaengine.org/resource")
             .cloned()
-            .unwrap_or_default();
+            .expect("No resource propagated");
 
+        // Fetch resource
+        let res_ns = match request
+            .volume_context
+            .get("kubedal.arunaengine.org/resource_ns")
+        {
+            Some(ns) => ns,
+            None => "default",
+        };
+        let res_api: Api<Resource> = Api::namespaced(self.client.clone(), &res_ns);
+        let res = res_api.get(&resource_name).await.map_err(|e| {
+            tracing::error!("Error getting resource: {:?}", e);
+            Status::internal("Error getting resource")
+        })?;
+
+        // Fetch secret
+        let mut config = match res.spec.credentials.as_ref() {
+            None => HashMap::new(),
+            Some(cred) => {
+                let secret_ns = cred.secret_ref.namespace.as_deref().unwrap_or("default");
+                let secret_name = &cred.secret_ref.name;
+                let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), secret_ns);
+                let secret = secret_api
+                    .get(&secret_name)
+                    .await
+                    .map_err(|_| Status::not_found("Secret not found"))?;
+
+                let mut config = HashMap::new();
+
+                if let Some(data) = secret.data {
+                    for (k, v) in data.into_iter() {
+                        config.insert(
+                            k,
+                            std::str::from_utf8(&v.0)
+                                .map_err(|e| {
+                                    Status::internal(format!("Failed to deserialize secret: {}", e))
+                                })?
+                                .to_string(),
+                        );
+                    }
+                }
+
+                config
+            }
+        };
+
+        // Create openDAL config and operator
+        config.extend(res.spec.config);
+        let operator = get_operator(Backend::S3, config.clone())?; //TODO: Match backend provided from resource
+
+        // Read dataset into target path
         tracing::info!(
             "Publishing volume '{}' with resource '{}' to '{}'",
             volume_id,
             resource_name,
             target_path
         );
+
+        //TODO: Match Resource mount type. Currently the data source is just mirrored into the volume.
+        //let data_source_children = operator.list_with("").recursive(true).await.map_err(|e| {
+        let data_source_children = operator
+            .list("")
+            .await
+            .map_err(|e| Status::internal(format!("Data source listing failed: {}", e)))?;
 
         // Create the target directory if it doesn't exist
         let target_path_obj = Path::new(&target_path);
@@ -125,17 +173,51 @@ impl Node for NodeService {
                 })?;
         }
 
-        // In a real driver, we would:
-        // 1. Either download data from the resource to the target path
-        // 2. Or set up a FUSE mount at the target path
-
-        // For our dummy driver, we'll just create a dummy file
-        let dummy_file_path = Path::new(&target_path).join("dummy_data.txt");
-        fs::write(
-            &dummy_file_path,
-            format!("Dummy content for resource: {}", resource_name),
-        )
-        .map_err(|e| Status::internal(format!("Failed to write dummy file: {}", e)))?;
+        // Cache data source in target directory
+        //TODO: More sophisticated directory structure to cache for resource/resource-version
+        for entry in data_source_children {
+            let entry_path = Path::new(&target_path).join(entry.path());
+            match entry.metadata().mode() {
+                opendal::EntryMode::FILE => {
+                    // Create file
+                    let mut file = std::fs::File::create(entry_path)?;
+                    // Create stream
+                    let mut r = operator
+                        .reader(entry.path())
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to open file reader: {}", e))
+                        })?
+                        .into_bytes_stream(..)
+                        .await
+                        .map_err(|e| {
+                            Status::internal(format!("Failed to convert reader into stream: {}", e))
+                        })?;
+                    // Write stream into file
+                    while let Some(bytes) = r.try_next().await? {
+                        file.write_all(&bytes)?;
+                    }
+                }
+                opendal::EntryMode::DIR => {
+                    if !entry_path.exists() {
+                        let mut builder = fs::DirBuilder::new();
+                        builder
+                            .mode(0o755)
+                            .recursive(true)
+                            .create(entry_path)
+                            .map_err(|e| {
+                                Status::internal(format!(
+                                    "Failed to create target directory: {}",
+                                    e
+                                ))
+                            })?;
+                    }
+                }
+                opendal::EntryMode::Unknown => {
+                    return Err(Status::unknown("Data source entry type is unknown"));
+                }
+            }
+        }
 
         // Track this mount in our in-memory state
         let mut mounts = self.mounts.lock().unwrap();

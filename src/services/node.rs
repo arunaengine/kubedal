@@ -104,7 +104,7 @@ impl Node for NodeService {
             Some(ns) => ns,
             None => "default",
         };
-        let res_api: Api<Datasource> = Api::namespaced(self.client.clone(), &res_ns);
+        let res_api: Api<Datasource> = Api::namespaced(self.client.clone(), res_ns);
         let res = res_api.get(&resource_name).await.map_err(|e| {
             tracing::error!("Error getting resource: {:?}", e);
             Status::internal("Error getting resource")
@@ -118,7 +118,7 @@ impl Node for NodeService {
                 let secret_name = &cred.secret_ref.name;
                 let secret_api: Api<Secret> = Api::namespaced(self.client.clone(), secret_ns);
                 let secret = secret_api
-                    .get(&secret_name)
+                    .get(secret_name)
                     .await
                     .map_err(|_| Status::not_found("Secret not found"))?;
 

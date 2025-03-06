@@ -90,7 +90,7 @@ impl Controller for ControllerService {
         })?;
 
         let client = self.client.clone();
-        let pvc_meta = get_pvc(client.clone(), &namespace, &request.name).await?;
+        let pvc_meta = get_pvc(client.clone(), namespace, &request.name).await?;
         let context = get_config_from_pvc_meta(client, pvc_meta.clone()).await?;
 
         tracing::trace!("PVC meta: {:?}", pvc_meta);
@@ -284,7 +284,7 @@ async fn get_pvc(client: Client, namespace: &str, uid: &str) -> Result<ObjectMet
         Status::invalid_argument("PVC name not provided in request")
     })?;
 
-    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, &namespace);
+    let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
 
     let all_pvc = pvcs
         .list_metadata(&ListParams::default())
@@ -301,7 +301,7 @@ async fn get_pvc(client: Client, namespace: &str, uid: &str) -> Result<ObjectMet
             pvc.metadata
                 .uid
                 .as_ref()
-                .map_or(false, |has_uid| has_uid == uid)
+                .is_some_and(|has_uid| has_uid == uid)
         })
         .ok_or_else(|| {
             tracing::error!("PVC not found");
@@ -358,7 +358,7 @@ async fn get_config_from_pvc_meta(
                 m @ ("cached" | "fuse") => Some(m),
                 _ => None,
             })
-            .unwrap_or_else(|| match res.spec.mount {
+            .unwrap_or(match res.spec.mount {
                 crate::resource::crd::MountMode::Cached => "cached",
                 crate::resource::crd::MountMode::Fuse => "fuse",
             })

@@ -1,5 +1,4 @@
 use clap::{Arg, Command};
-use kube::Client;
 use kubedal::csi::{
     controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
 };

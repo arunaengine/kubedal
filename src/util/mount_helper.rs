@@ -1,6 +1,7 @@
 use std::{fs, io::Write, os::unix::fs::DirBuilderExt, path::Path};
 
-use fuse3::raw::MountHandle;
+use fuse3::{MountOptions, path::Session, raw::MountHandle};
+use fuse3_opendal::Filesystem;
 use futures::TryStreamExt;
 use tonic::Status;
 
@@ -37,7 +38,35 @@ impl Mount {
         }
     }
 
+    pub async fn unmount(&mut self) -> Result<(), Status> {
+        match self.mount_mode {
+            MountMode::Cached => Ok(()),
+            MountMode::Fuse => self.unmount_fuse().await,
+        }
+    }
+
     async fn mount_fuse(&mut self) -> Result<(), Status> {
+        let fs = Filesystem::new(self.operator.clone(), 1000, 1000);
+
+        let mut mount_options = MountOptions::default();
+
+        if self.access_mode == AccessMode::ReadOnly {
+            mount_options.read_only(true);
+        }
+
+        let mount_handle = Session::new(mount_options)
+            .mount_with_unprivileged(fs, self.target_path.clone())
+            .await?;
+
+        self.fuse_mount = Some(mount_handle);
+
+        Ok(())
+    }
+
+    async fn unmount_fuse(&mut self) -> Result<(), Status> {
+        if let Some(mount_handle) = self.fuse_mount.take() {
+            mount_handle.unmount().await?;
+        }
         Ok(())
     }
 

@@ -18,7 +18,8 @@ use opendal::Operator;
 use std::collections::HashMap;
 use std::fs;
 use std::path::Path;
-use std::sync::{Arc, Mutex};
+use std::sync::Arc;
+use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 pub struct FullDataSource {
@@ -129,7 +130,7 @@ impl Node for NodeService {
         mount.mount().await?;
 
         // Track this mount in our in-memory state
-        let mut mounts = self.mounts.lock().unwrap();
+        let mut mounts = self.mounts.lock().await;
         mounts.insert(volume_id, mount);
 
         Ok(Response::new(NodePublishVolumeResponse {}))
@@ -165,8 +166,10 @@ impl Node for NodeService {
         }
 
         // Remove from our tracking
-        let mut mounts = self.mounts.lock().unwrap();
-        mounts.remove(&volume_id);
+        let mut mounts = self.mounts.lock().await;
+        if let Some(mut mount) = mounts.remove(&volume_id) {
+            mount.unmount().await?;
+        }
 
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }

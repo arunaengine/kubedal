@@ -32,6 +32,19 @@ impl Mount {
     }
 
     pub async fn mount(&mut self) -> Result<(), Status> {
+        // Create the target directory if it doesn't exist
+        let target_path_obj = Path::new(&self.target_path);
+        if !target_path_obj.exists() {
+            let mut builder = fs::DirBuilder::new();
+            builder
+                .mode(0o755)
+                .recursive(true)
+                .create(target_path_obj)
+                .map_err(|e| {
+                    Status::internal(format!("Failed to create target directory: {}", e))
+                })?;
+        }
+
         match self.mount_mode {
             MountMode::Cached => self.mount_cached().await,
             MountMode::Fuse => self.mount_fuse().await,
@@ -78,19 +91,6 @@ impl Mount {
             .list("")
             .await
             .map_err(|e| Status::internal(format!("Data source listing failed: {}", e)))?;
-
-        // Create the target directory if it doesn't exist
-        let target_path_obj = Path::new(&self.target_path);
-        if !target_path_obj.exists() {
-            let mut builder = fs::DirBuilder::new();
-            builder
-                .mode(0o755)
-                .recursive(true)
-                .create(target_path_obj)
-                .map_err(|e| {
-                    Status::internal(format!("Failed to create target directory: {}", e))
-                })?;
-        }
 
         // Cache data source in target directory
         //TODO: More sophisticated directory structure to cache for data-source/version

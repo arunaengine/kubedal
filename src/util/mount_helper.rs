@@ -32,6 +32,12 @@ impl Mount {
     }
 
     pub async fn mount(&mut self) -> Result<(), Status> {
+
+        // Check if openDAL operator is working
+        self.operator.check().await.map_err(|e| {
+            Status::internal(format!("Operator check failed: {}", e))
+        })?;
+
         // Create the target directory if it doesn't exist
         let target_path_obj = Path::new(&self.target_path);
         if !target_path_obj.exists() {

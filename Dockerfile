@@ -11,6 +11,6 @@ RUN cargo build --release
 FROM alpine:3.21
 RUN apk update
 RUN apk upgrade
-RUN apk add libgcc gcompat ca-certificates openssl-dev
+RUN apk add libgcc gcompat ca-certificates openssl-dev fuse3
 COPY --from=builder /build/target/release/kubedal /usr/local/bin/kubedal
 ENTRYPOINT ["kubedal"]

@@ -16,9 +16,8 @@ spec:
       namespace: default
   config:
     bucket: my-bucket
-    endpoint: http://minio-service:9000
+    endpoint: http://minio-service.default.svc.cluster.local:9000
     region: us-east-1
-    enable_virtual_host_style: "true"
 ---
 # Example Secret with credentials
 apiVersion: v1
@@ -56,9 +55,14 @@ spec:
         args:
         - server
         - /data
+        env: 
+        - name: MINIO_CONSOLE_ADDRESS
+          value: ":9001"
         ports:
         - containerPort: 9000
-          hostPort: 9000          
+          hostPort: 9000
+        - containerPort: 9001
+          hostPort: 9001        
 ---
 apiVersion: v1
 kind: Service
@@ -67,8 +71,13 @@ metadata:
 spec:
   type: ClusterIP
   ports:
-    - port: 9000
+    - name: s3
+      port: 9000
       targetPort: 9000
+      protocol: TCP
+    - name: console
+      port: 9001
+      targetPort: 9001
       protocol: TCP
   selector:
     app: minio

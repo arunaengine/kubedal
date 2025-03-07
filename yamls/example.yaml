@@ -6,7 +6,7 @@ metadata:
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
   access_mode: ReadOnly # Can be ReadOnly or ReadWrite
-  mount: Cached # Can be Cached or Fuse
+  mount: Fuse # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
   # 2. As a key/values in the referenced Secret (for sensitive information)
@@ -16,9 +16,8 @@ spec:
       namespace: default
   config:
     bucket: my-bucket
-    endpoint: http://localhost:9000
+    endpoint: http://minio-service:9000
     region: us-east-1
-    root: /foo/bar/my-root/
     enable_virtual_host_style: "true"
 ---
 # Example Secret with credentials
@@ -29,8 +28,50 @@ metadata:
   namespace: default
 type: Kubedal
 stringData:
-  access_key_id: "YOUR_ACCESS_KEY" # Must be exactly as defined in the opendal config
-  secret_access_key: "YOUR_SECRET_KEY" # Must be exactly as defined in the opendal config
+  access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
+  secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
+
+---
+# Example Minio Deployment and Service
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: minio
+  labels:
+    app: minio
+spec:
+  selector:
+    matchLabels:
+      app: minio
+  strategy:
+    type: Recreate
+  template:
+    metadata:
+      labels:
+        app: minio
+    spec:
+      containers:
+      - name: minio
+        image: minio/minio:latest
+        args:
+        - server
+        - /data
+        ports:
+        - containerPort: 9000
+          hostPort: 9000          
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: minio-service
+spec:
+  type: ClusterIP
+  ports:
+    - port: 9000
+      targetPort: 9000
+      protocol: TCP
+  selector:
+    app: minio
 ---
 # Example PVC that references the resource
 apiVersion: v1

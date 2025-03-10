@@ -24,6 +24,7 @@ tracing-subscriber = { version = "0.3.18", features = ["env-filter", "fmt"] }
 schemars = "0.8.22"
 serde_yaml = "0.9.34"
 thiserror = "2.0.12"
+sys-mount = "3.0.1"
 
 [build-dependencies]
 tonic-build = "0.12.3"

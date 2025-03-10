@@ -16,8 +16,6 @@ use kube::api::PostParams;
 use kube::{Api, Client};
 use opendal::Operator;
 use std::collections::HashMap;
-use std::fs;
-use std::path::Path;
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
@@ -126,7 +124,13 @@ impl Node for NodeService {
 
         let (operator, mount_mode, access_mode) = full_data_source.into_parts()?;
 
-        let mut mount = Mount::new(target_path, operator, mount_mode, access_mode);
+        let mut mount = Mount::new(
+            volume_id.clone(),
+            target_path,
+            operator,
+            mount_mode,
+            access_mode,
+        );
         mount.mount().await?;
 
         // Track this mount in our in-memory state
@@ -154,17 +158,6 @@ impl Node for NodeService {
 
         tracing::info!("Unpublishing volume '{}' from '{}'", volume_id, target_path);
 
-        // In a real driver, we would:
-        // 1. Unmount any FUSE mount
-        // 2. Clean up any cached data if necessary
-
-        // For our dummy driver, we'll just remove our dummy file
-        let dummy_file_path = Path::new(&target_path).join("dummy_data.txt");
-        if dummy_file_path.exists() {
-            fs::remove_file(&dummy_file_path)
-                .map_err(|e| Status::internal(format!("Failed to remove dummy file: {}", e)))?;
-        }
-
         // Remove from our tracking
         let mut mounts = self.mounts.lock().await;
         if let Some(mut mount) = mounts.remove(&volume_id) {
@@ -174,11 +167,12 @@ impl Node for NodeService {
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
 
+    // Not implemented methods (optional)
     async fn node_stage_volume(
         &self,
         _request: Request<crate::csi::NodeStageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeStageVolumeResponse>, Status> {
-        // For our dummy driver, we don't need to do anything here
+        // Our simple driver doesn't support this
         Ok(Response::new(crate::csi::NodeStageVolumeResponse {}))
     }
 
@@ -186,7 +180,7 @@ impl Node for NodeService {
         &self,
         _request: Request<crate::csi::NodeUnstageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeUnstageVolumeResponse>, Status> {
-        // For our dummy driver, we don't need to do anything here
+        // Our simple driver doesn't support this
         Ok(Response::new(crate::csi::NodeUnstageVolumeResponse {}))
     }
 
@@ -194,49 +188,17 @@ impl Node for NodeService {
         &self,
         _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        // For our dummy driver, we don't support volume expansion
+        // Our simple driver doesn't support this
         Err(Status::unimplemented("Volume expansion is not supported"))
     }
 
     // Additional required methods
     async fn node_get_volume_stats(
         &self,
-        request: Request<crate::csi::NodeGetVolumeStatsRequest>,
+        _request: Request<crate::csi::NodeGetVolumeStatsRequest>,
     ) -> Result<Response<crate::csi::NodeGetVolumeStatsResponse>, Status> {
-        let request = request.into_inner();
-        let volume_id = request.volume_id;
-        let volume_path = request.volume_path;
-
-        tracing::info!(
-            "Getting stats for volume '{}' at '{}'",
-            volume_id,
-            volume_path
-        );
-
-        // For our dummy driver, return fixed values
-        let available = 1024 * 1024 * 1024 * 10; // 10 GB
-        let total = 1024 * 1024 * 1024 * 20; // 20 GB
-        let used = total - available;
-
-        let usage = vec![
-            crate::csi::VolumeUsage {
-                available,
-                total,
-                used,
-                unit: crate::csi::volume_usage::Unit::Bytes.into(),
-            },
-            crate::csi::VolumeUsage {
-                available: 1000,
-                total: 1000,
-                used: 0,
-                unit: crate::csi::volume_usage::Unit::Inodes.into(),
-            },
-        ];
-
-        Ok(Response::new(crate::csi::NodeGetVolumeStatsResponse {
-            usage,
-            volume_condition: None,
-        }))
+        // Our simple driver doesn't support this
+        Err(Status::unimplemented("NodeGetVolumeStats is not supported"))
     }
 }
 

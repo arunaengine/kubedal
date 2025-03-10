@@ -6,7 +6,7 @@ metadata:
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
   access_mode: ReadOnly # Can be ReadOnly or ReadWrite
-  mount: Fuse # Can be Cached or Fuse
+  mount: Cached # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
   # 2. As a key/values in the referenced Secret (for sensitive information)

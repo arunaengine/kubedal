@@ -161,9 +161,13 @@ impl Mount {
         }
 
         let mut mount_builder = SysMount::builder();
-        if self.access_mode == AccessMode::ReadOnly {
-            mount_builder = mount_builder.flags(MountFlags::RDONLY)
-        }
+        let mountflags = if self.access_mode == AccessMode::ReadOnly {
+            MountFlags::RDONLY | MountFlags::BIND
+        } else {
+            MountFlags::BIND
+        };
+
+        mount_builder = mount_builder.flags(mountflags);
         // Mount cache directory to target directory
         let target_path = self.target_path.clone();
         tokio::task::spawn_blocking(move || {

@@ -1,18 +1,25 @@
+use std::io::Write;
+
 use kube::{CustomResourceExt, api::ObjectMeta};
-use kubedal::resource::crd::{Datasource, DatasourceSpec};
+use kubedal::resource::crd::{Datasource, Sync, DatasourceSpec};
 
 fn main() {
     // Generate the CRD yaml for our Resource type
-    let crd = Datasource::crd();
+    let datasource_crd = Datasource::crd();
+    let sync_crd = Sync::crd();
+
 
     let path = std::env::args()
         .nth(1)
         .unwrap_or("./yamls/crd.yaml".to_string());
 
-    let file = std::fs::File::create(path).expect("Failed to create file");
+    let mut file = std::fs::File::create(path).expect("Failed to create file");
 
-    // Print it to stdout
-    serde_yaml::to_writer(file, &crd).expect("Failed to serialize CRD");
+    serde_yaml::to_writer(&mut file, &datasource_crd).expect("Failed to serialize CRD");
+    file.write_all(b"\n---\n").expect("Failed to write CRD separator");
+    serde_yaml::to_writer(&mut file, &sync_crd).expect("Failed to serialize CRD");
+
+    
 
     let demo_resource = Datasource {
         metadata: ObjectMeta {

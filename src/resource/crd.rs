@@ -101,3 +101,37 @@ pub struct DatasourceStatus {
 pub struct Binding {
     pub volume_id: String,
 }
+
+/// Reference to a datasource
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct DataSourceRef {
+    pub name: String,
+    pub namespace: Option<String>,
+}
+
+/// Sync data from one datasource to another
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "kubedal.arunaengine.org",
+    version = "v1alpha1",
+    kind = "Sync",
+    shortname = "sy",
+    status = "SyncStatus",
+    namespaced
+)]
+pub struct SyncSpec {
+    /// Source datasource to sync from
+    pub source: DataSourceRef,
+
+    /// Destination datasource to sync to
+    pub destination: DataSourceRef,
+
+    /// Auto-clean up
+    #[serde(default)]
+    pub clean_up: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct SyncStatus {
+    pub status: String,
+}

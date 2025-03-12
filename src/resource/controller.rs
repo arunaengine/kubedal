@@ -1,4 +1,11 @@
-use crate::resource::crd::{Datasource, Sync};
+use super::{
+    datasource_controller::{error_policy_ds, reconcile_ds},
+    sync_controller::{error_policy_sy, reconcile_sy},
+};
+use crate::resource::{
+    backup_controller::{error_policy_ba, reconcile_ba},
+    crd::{Backup, Datasource, Sync},
+};
 use futures::StreamExt;
 use kube::{
     api::{Api, ListParams},
@@ -8,11 +15,6 @@ use kube::{
 use std::sync::Arc;
 use tracing::*;
 
-use super::{
-    datasource_controller::{error_policy_ds, reconcile_ds},
-    sync_controller::{error_policy_sy, reconcile_sy},
-};
-
 // Context for our reconciler
 #[derive(Clone)]
 pub struct Context {
@@ -21,8 +23,6 @@ pub struct Context {
     /// Event recorder
     pub recorder: Recorder,
 }
-
-pub const BACKUP_FINALIZER: &str = "kubedal.arunaengine.org/backup";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -58,6 +58,13 @@ pub async fn run(client: Client) {
         std::process::exit(1);
     }
 
+    let backup_api = Api::<Backup>::all(client.clone());
+    if let Err(e) = backup_api.list(&ListParams::default().limit(1)).await {
+        error!("CRD Sync is not queryable; {e:?}. Is the CRD installed?");
+        info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
+        std::process::exit(1);
+    }
+
     let state = Arc::new(Context {
         client: client.clone(),
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
@@ -71,9 +78,15 @@ pub async fn run(client: Client) {
 
     let sync_controller = Controller::new(sync_api, Config::default().any_semantic())
         .shutdown_on_signal()
-        .run(reconcile_sy, error_policy_sy, state)
+        .run(reconcile_sy, error_policy_sy, state.clone())
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| futures::future::ready(()));
 
-    tokio::join!(ds_controller, sync_controller);
+    let backup_controller = Controller::new(backup_api, Config::default().any_semantic())
+        .shutdown_on_signal()
+        .run(reconcile_ba, error_policy_ba, state)
+        .filter_map(|x| async move { std::result::Result::ok(x) })
+        .for_each(|_| futures::future::ready(()));
+
+    tokio::join!(ds_controller, sync_controller, backup_controller);
 }

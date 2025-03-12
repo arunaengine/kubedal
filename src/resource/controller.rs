@@ -1,19 +1,14 @@
-use crate::resource::crd::{Datasource, DatasourceStatus};
+use crate::resource::crd::Datasource;
 use futures::StreamExt;
 use kube::{
-    Resource,
-    api::{Api, ListParams, Patch, PatchParams, ResourceExt},
+    api::{Api, ListParams},
     client::Client,
-    runtime::{
-        controller::{Action, Controller},
-        events::{Event, EventType, Recorder},
-        finalizer::{Event as Finalizer, finalizer},
-        watcher::Config,
-    },
+    runtime::{controller::Controller, events::Recorder, watcher::Config},
 };
-use serde_json::json;
-use std::{sync::Arc, time::Duration};
+use std::sync::Arc;
 use tracing::*;
+
+use super::datasource_controller::{error_policy_ds, reconcile_ds};
 
 // Context for our reconciler
 #[derive(Clone)]
@@ -24,7 +19,9 @@ pub struct Context {
     pub recorder: Recorder,
 }
 
-const RESOURCE_FINALIZER: &str = "kubedal.arunaengine.org/resource";
+pub const DATASOURCE_FINALIZER: &str = "kubedal.arunaengine.org/datasource";
+pub const SYNC_FINALIZER: &str = "kubedal.arunaengine.org/sync";
+pub const BACKUP_FINALIZER: &str = "kubedal.arunaengine.org/backup";
 
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
@@ -44,96 +41,6 @@ pub enum Error {
     FinalizerError(#[source] Box<kube::runtime::finalizer::Error<Error>>),
 }
 
-#[instrument(skip(ctx, res), fields(trace_id))]
-async fn reconcile(res: Arc<Datasource>, ctx: Arc<Context>) -> Result<Action, Error> {
-    let ns = res.namespace().unwrap(); // res is namespace scoped
-    let ress: Api<Datasource> = Api::namespaced(ctx.client.clone(), &ns);
-
-    info!("Reconciling Document \"{}\" in {}", res.name_any(), ns);
-    finalizer(&ress, RESOURCE_FINALIZER, res, |event| async {
-        match event {
-            Finalizer::Apply(doc) => doc.reconcile(ctx.clone()).await,
-            Finalizer::Cleanup(doc) => doc.cleanup(ctx.clone()).await,
-        }
-    })
-    .await
-    .map_err(|e| Error::FinalizerError(Box::new(e)))
-}
-
-fn error_policy(doc: Arc<Datasource>, error: &Error, _ctx: Arc<Context>) -> Action {
-    warn!("reconcile failed: {:?}, {:?}", error, doc);
-    Action::requeue(Duration::from_secs(5 * 60))
-}
-
-impl Datasource {
-    // Reconcile (for non-finalizer related changes)
-    async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, Error> {
-        if self.status.is_some() {
-            return Ok(Action::requeue(Duration::from_secs(30 * 60)));
-        }
-
-        // If the status is already initialized, do nothing
-        let client = ctx.client.clone();
-        let ns = self
-            .namespace()
-            .ok_or_else(|| Error::ReconcilerError("Missing namespace".into()))?;
-
-        let name = self.name_any();
-        let docs: Api<Datasource> = Api::namespaced(client, &ns);
-
-        // always overwrite status object with what we saw
-        let new_status = Patch::Apply(json!({
-            "status": DatasourceStatus {
-                bindings: self.status.as_ref().map_or_else(std::vec::Vec::new, |s| s.bindings.clone()),
-            }
-        }));
-
-        trace!("Patching status for {}", name);
-        let ps = PatchParams::apply("cntrlr").force();
-        let _o = docs
-            .patch_status(&name, &ps, &new_status)
-            .await
-            .inspect_err(|e| error!("Failed to patch status: {:?}", e))
-            .map_err(Error::KubeError)?;
-
-        ctx.recorder
-            .publish(
-                &Event {
-                    type_: EventType::Normal,
-                    reason: "Initialized".into(),
-                    note: Some(format!("Init `{}`", self.name_any())),
-                    action: "Initialized".into(),
-                    secondary: None,
-                },
-                &self.object_ref(&()),
-            )
-            .await
-            .map_err(Error::KubeError)?;
-
-        // If no events were received, check back every 30 minutes
-        Ok(Action::requeue(Duration::from_secs(30 * 60)))
-    }
-
-    // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
-    async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action, Error> {
-        let oref = self.object_ref(&());
-        ctx.recorder
-            .publish(
-                &Event {
-                    type_: EventType::Normal,
-                    reason: "DeleteRequested".into(),
-                    note: Some(format!("Delete `{}`", self.name_any())),
-                    action: "Deleting".into(),
-                    secondary: None,
-                },
-                &oref,
-            )
-            .await
-            .map_err(Error::KubeError)?;
-        Ok(Action::await_change())
-    }
-}
-
 /// Initialize the controller and shared state (given the crd is installed)
 pub async fn run(client: Client) {
     let docs = Api::<Datasource>::all(client.clone());
@@ -150,7 +57,7 @@ pub async fn run(client: Client) {
 
     Controller::new(docs, Config::default().any_semantic())
         .shutdown_on_signal()
-        .run(reconcile, error_policy, state)
+        .run(reconcile_ds, error_policy_ds, state)
         .filter_map(|x| async move { std::result::Result::ok(x) })
         .for_each(|_| futures::future::ready(()))
         .await;

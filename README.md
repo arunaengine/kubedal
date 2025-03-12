@@ -1,13 +1,13 @@
 # KubeDAL: Universal Data Access Layer for Kubernetes
 
-KubeDAL bridges the gap between Kubernetes workloads and any storage backend through a powerful CSI driver built with Rust and Apache OpenDAL.
+KubeDAL bridges the gap between Kubernetes workloads and any storage backend through a powerful CSI driver built with Rust and [Apache OpenDAL](https://github.com/apache/opendal).
 
 > [!WARNING]  
-> KubeDAL is currently in an early experimental development phase and nowhere near production ready, expect bugs, breaking changes and missing functionality. Stay tuned for a 0.1.0 release to check it out.
+> KubeDAL is currently in an early experimental development phase and nowhere near production ready, expect bugs, breaking changes and missing functionality.
 
 ## What is KubeDAL?
 
-KubeDAL is a Kubernetes CSI driver that enables you to declare storage "Resources" as first-class Kubernetes objects. These Resources can point to virtually any storage backend supported by Apache OpenDAL, including AWS S3, Google Cloud Storage, Azure Blob Storage, local filesystems, HDFS, and many more.
+KubeDAL is a Kubernetes CSI driver that enables you to declare "Datasources" as first-class Kubernetes objects. These Data sources can point to virtually any storage backend supported by Apache OpenDAL, including AWS S3, Google Cloud Storage, Azure Blob Storage, HDFS, and many more.
 
 ## Why KubeDAL?
 

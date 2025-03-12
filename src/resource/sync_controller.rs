@@ -1,4 +1,4 @@
-use crate::resource::crd::{Datasource, DatasourceStatus};
+use crate::resource::crd::{Sync, SyncStatus};
 use kube::{
     Resource,
     api::{Api, Patch, PatchParams, ResourceExt},
@@ -12,17 +12,21 @@ use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tracing::*;
 
-const DATASOURCE_FINALIZER: &str = "kubedal.arunaengine.org/datasource";
+const SYNC_FINALIZER: &str = "kubedal.arunaengine.org/sync";
 
 use super::controller::{Context, Error};
 
 #[instrument(skip(ctx, res), fields(trace_id))]
-pub async fn reconcile_ds(res: Arc<Datasource>, ctx: Arc<Context>) -> Result<Action, Error> {
+pub async fn reconcile_sy(res: Arc<Sync>, ctx: Arc<Context>) -> Result<Action, Error> {
     let ns = res.namespace().unwrap(); // res is namespace scoped
-    let ds: Api<Datasource> = Api::namespaced(ctx.client.clone(), &ns);
+    let ds: Api<Sync> = Api::namespaced(ctx.client.clone(), &ns);
 
-    info!("Reconciling Document \"{}\" in {}", res.name_any(), ns);
-    finalizer(&ds, DATASOURCE_FINALIZER, res, |event| async {
+    info!(
+        "Reconciling Sync operation \"{}\" in {}",
+        res.name_any(),
+        ns
+    );
+    finalizer(&ds, SYNC_FINALIZER, res, |event| async {
         match event {
             Finalizer::Apply(doc) => doc.reconcile(ctx.clone()).await,
             Finalizer::Cleanup(doc) => doc.cleanup(ctx.clone()).await,
@@ -32,12 +36,12 @@ pub async fn reconcile_ds(res: Arc<Datasource>, ctx: Arc<Context>) -> Result<Act
     .map_err(|e| Error::FinalizerError(Box::new(e)))
 }
 
-pub fn error_policy_ds(doc: Arc<Datasource>, error: &Error, _ctx: Arc<Context>) -> Action {
+pub fn error_policy_sy(doc: Arc<Sync>, error: &Error, _ctx: Arc<Context>) -> Action {
     warn!("reconcile failed: {:?}, {:?}", error, doc);
     Action::requeue(Duration::from_secs(5 * 60))
 }
 
-impl Datasource {
+impl Sync {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, Error> {
         if self.status.is_some() {
@@ -51,12 +55,12 @@ impl Datasource {
             .ok_or_else(|| Error::ReconcilerError("Missing namespace".into()))?;
 
         let name = self.name_any();
-        let docs: Api<Datasource> = Api::namespaced(client, &ns);
+        let docs: Api<Sync> = Api::namespaced(client, &ns);
 
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
-            "status": DatasourceStatus {
-                bindings: self.status.as_ref().map_or_else(std::vec::Vec::new, |s| s.bindings.clone()),
+            "status": SyncStatus {
+                status: "Initialized".to_string(),
             }
         }));
 

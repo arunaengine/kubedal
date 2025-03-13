@@ -1,0 +1,54 @@
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: Datasource
+metadata:
+  name: from-s3
+spec:
+  backend: S3 # Currently only S3 and HTTP are supported
+  access_mode: ReadOnly # Can be ReadOnly or ReadWrite
+  mount: Fuse # Can be Cached or Fuse
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
+  credentials:
+    secretRef:
+      name: s3-credentials
+      namespace: default
+  config:
+    bucket: frombucket
+    endpoint: http://minio-service.default.svc.cluster.local:9000
+    region: us-east-1
+
+---
+
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: Datasource
+metadata:
+  name: to-s3
+spec:
+  backend: S3 # Currently only S3 and HTTP are supported
+  access_mode: ReadOnly # Can be ReadOnly or ReadWrite
+  mount: Fuse # Can be Cached or Fuse
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
+  credentials:
+    secretRef:
+      name: s3-credentials
+      namespace: default
+  config:
+    bucket: tobucket
+    endpoint: http://minio-service.default.svc.cluster.local:9000
+    region: us-east-1
+
+---
+
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: Sync
+metadata:
+  name: my-sync
+spec:
+  source:
+    name: frombucket
+  destination:
+    name: tobucket
+  clean_up: true

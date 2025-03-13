@@ -29,7 +29,7 @@ type: Kubedal
 stringData:
   access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
   secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
-  
+
 ---
 # Example PVC that references the resource
 apiVersion: v1
@@ -40,6 +40,7 @@ metadata:
   annotations:
     kubedal.arunaengine.org/datasource: example-s3-dataset
     kubedal.arunaengine.org/namespace: default
+    kubedal.arunaengine.org/mount: fuse
 spec:
   accessModes:
     - ReadOnlyMany

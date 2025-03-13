@@ -1,7 +1,7 @@
 use std::io::Write;
 
 use kube::{CustomResourceExt, api::ObjectMeta};
-use kubedal::resource::crd::{Datasource, DatasourceSpec, Sync};
+use kubedal::resource::crd::{DataSourceRef, Datasource, DatasourceSpec, Sync};
 
 fn main() {
     // Generate the CRD yaml for our Resource type
@@ -47,4 +47,21 @@ fn main() {
     };
 
     serde_yaml::to_writer(std::io::stdout(), &demo_resource).expect("Failed to serialize Resource");
+
+    let demo_sync = Sync {
+        metadata: ObjectMeta {
+            name: Some("my-sync".to_string()),
+            ..Default::default()
+        },
+        spec: kubedal::resource::crd::SyncSpec {
+            source: DataSourceRef { name: "from".to_string(), namespace: None },
+            destination: DataSourceRef { name: "to".to_string(), namespace: None },
+            clean_up: true,
+        },
+        status: None,
+    };
+
+    std::io::stdout().write_all(b"\n---\n").expect("Failed to write Resource separator");
+
+    serde_yaml::to_writer(std::io::stdout(), &demo_sync).expect("Failed to serialize Resource");
 }

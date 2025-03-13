@@ -95,8 +95,8 @@ impl Sync {
                 }))
             }
             None => {
-                let (source, destination) = create_pvcs(client.clone(), &self).await?;
-                let pod = create_pod(client, &self, source, destination).await?;
+                let (source, destination) = create_pvcs(client.clone(), self).await?;
+                let pod = create_pod(client, self, source, destination).await?;
 
                 // always overwrite status object with what we saw
                 Patch::Apply(json!({

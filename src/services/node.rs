@@ -264,7 +264,7 @@ async fn get_full_data_source(
                 .as_ref()
                 .or(res.metadata.namespace.as_ref())
                 .ok_or_else(|| Status::invalid_argument("Secret namespace not provided"))?;
-            let secret_api: Api<Secret> = Api::namespaced(client.clone(), &secret_ns);
+            let secret_api: Api<Secret> = Api::namespaced(client.clone(), secret_ns);
             let secret = secret_api
                 .get(secret_name)
                 .await
@@ -402,7 +402,7 @@ async fn check_access(
 
 impl FullDataSource {
     pub fn into_parts(self) -> Result<(Operator, MountMode, AccessMode), Status> {
-        let mut config = HashMap::from_iter(self.source.spec.config.into_iter());
+        let mut config = HashMap::from_iter(self.source.spec.config);
 
         if let Some(secret) = self.secret {
             if let Some(data) = secret.data {

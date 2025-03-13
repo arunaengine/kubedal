@@ -4,10 +4,15 @@ use super::{
 };
 use crate::resource::crd::{Datasource, Sync};
 use futures::StreamExt;
+use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
 use kube::{
     api::{Api, ListParams},
     client::Client,
-    runtime::{controller::Controller, events::Recorder, watcher::Config},
+    runtime::{
+        controller::Controller,
+        events::Recorder,
+        watcher::{self, Config},
+    },
 };
 use std::sync::Arc;
 use tracing::*;
@@ -55,6 +60,9 @@ pub async fn run(client: Client) {
         std::process::exit(1);
     }
 
+    let pod_api = Api::<Pod>::all(client.clone());
+    let pvc_api = Api::<PersistentVolumeClaim>::all(client.clone());
+
     let state = Arc::new(Context {
         client: client.clone(),
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
@@ -63,14 +71,14 @@ pub async fn run(client: Client) {
     let ds_controller = Controller::new(ds_api, Config::default().any_semantic())
         .shutdown_on_signal()
         .run(reconcile_ds, error_policy_ds, state.clone())
-        .filter_map(|x| async move { std::result::Result::ok(x) })
-        .for_each(|_| futures::future::ready(()));
+        .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
 
     let sync_controller = Controller::new(sync_api, Config::default().any_semantic())
+        .owns(pod_api, watcher::Config::default())
+        .owns(pvc_api, watcher::Config::default())
         .shutdown_on_signal()
         .run(reconcile_sy, error_policy_sy, state.clone())
-        .filter_map(|x| async move { std::result::Result::ok(x) })
-        .for_each(|_| futures::future::ready(()));
+        .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
 
     tokio::join!(ds_controller, sync_controller);
 }

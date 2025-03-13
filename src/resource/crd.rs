@@ -131,7 +131,18 @@ pub struct SyncSpec {
     pub clean_up: bool,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub enum SyncPodStatus {
+    #[default]
+    Unknown,
+    Pending,
+    Running,
+    Completed,
+    Failed,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct SyncStatus {
-    pub status: String,
+    pub pod_name: String,
+    pub sync_status: SyncPodStatus,
 }

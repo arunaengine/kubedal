@@ -233,18 +233,23 @@ async fn get_full_data_source(
 ) -> Result<FullDataSource, Status> {
     // Get DataSource meta from volume context
     let datasource_name = volume_context
-        .get("kubedal.arunaengine.org/resource")
+        .get("kubedal.arunaengine.org/datasource")
         .cloned()
         .ok_or_else(|| Status::invalid_argument("Resource name not provided"))?;
 
     let datasource_namespace = volume_context
-        .get("kubedal.arunaengine.org/resource_namespace")
+        .get("kubedal.arunaengine.org/namespace")
+        .cloned()
+        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?;
+
+    let mount = volume_context
+        .get("kubedal.arunaengine.org/mount")
         .cloned()
         .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?;
 
     // Fetch DataSource if access review success
     let res_api: Api<Datasource> = Api::namespaced(client.clone(), &datasource_namespace);
-    let res = res_api.get(&datasource_name).await.map_err(|e| {
+    let mut res = res_api.get(&datasource_name).await.map_err(|e| {
         tracing::error!("Error getting DataSource: {:?}", e);
         Status::internal("Error getting DataSource")
     })?;
@@ -267,6 +272,16 @@ async fn get_full_data_source(
             Some(secret)
         }
     };
+
+    match mount.as_str() {
+        "cached" => {
+            res.spec.mount = MountMode::Cached;
+        }
+        "fuse" => {
+            res.spec.mount = MountMode::Fuse;
+        }
+        _ => {}
+    }
 
     Ok(FullDataSource {
         source: res,

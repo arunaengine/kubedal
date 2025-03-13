@@ -330,43 +330,37 @@ async fn get_config_from_pvc_meta(
 ) -> Result<HashMap<String, String>, Status> {
     let annotations = pvc_meta.annotations.unwrap_or_default();
 
-    let resource = annotations
+    let datasource = annotations
         .get("kubedal.arunaengine.org/datasource")
         .ok_or_else(|| {
             tracing::error!("Datasource annotation not found");
             Status::invalid_argument("Datasource annotation not found")
         })?;
 
-    let resource_ns = annotations
+    let datasource_namespace = annotations
         .get("kubedal.arunaengine.org/namespace")
         .cloned()
         .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
 
-    let res_api: Api<Datasource> = Api::namespaced(client, &resource_ns);
-    let res = res_api.get(resource).await.map_err(|e| {
+    let res_api: Api<Datasource> = Api::namespaced(client, &datasource_namespace);
+    let res = res_api.get(datasource).await.map_err(|e| {
         tracing::error!("Error getting resource: {:?}", e);
         Status::internal("Error getting resource")
     })?;
 
-    let mut config = res.spec.config.clone();
+    let mut config = HashMap::new();
     config.insert(
-        "kubedal.arunaengine.org/resource".to_string(),
-        resource.to_string(),
+        "kubedal.arunaengine.org/datasource".to_string(),
+        datasource.to_string(),
     );
     config.insert(
-        "kubedal.arunaengine.org/resource_namespace".to_string(),
-        resource_ns.to_string(),
+        "kubedal.arunaengine.org/namespace".to_string(),
+        datasource_namespace.to_string(),
     );
-    match res.spec.backend {
-        crate::resource::crd::Backend::S3 => config.insert("backend".to_string(), "s3".to_string()),
-        crate::resource::crd::Backend::HTTP => {
-            config.insert("backend".to_string(), "http".to_string())
-        }
-    };
 
     // Override the mount mode if specified in the PVC annotations
     config.insert(
-        "mount".to_string(),
+        "kubedal.arunaengine.org/mount".to_string(),
         annotations
             .get("kubedal.arunaengine.org/mount")
             .and_then(|mode| match mode.as_str() {
@@ -379,13 +373,6 @@ async fn get_config_from_pvc_meta(
             })
             .to_string(),
     );
-
-    if let Some(cred) = res.spec.credentials {
-        let secret_ns = cred.secret_ref.namespace.unwrap_or(resource_ns);
-        let secret_name = cred.secret_ref.name;
-        config.insert("secret".to_string(), secret_name);
-        config.insert("secret_ns".to_string(), secret_ns);
-    }
 
     Ok(config)
 }

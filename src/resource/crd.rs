@@ -9,7 +9,7 @@ use std::collections::HashMap;
     group = "kubedal.arunaengine.org",
     version = "v1alpha1",
     kind = "Datasource",
-    shortname = "ds",
+    shortname = "dsrc",
     status = "DatasourceStatus",
     namespaced
 )]

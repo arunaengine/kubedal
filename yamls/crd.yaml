@@ -9,7 +9,7 @@ spec:
     kind: Datasource
     plural: datasources
     shortNames:
-    - ds
+    - dsrc
     singular: datasource
   scope: Namespaced
   versions:
@@ -154,10 +154,19 @@ spec:
           status:
             nullable: true
             properties:
-              status:
+              pod_name:
+                type: string
+              sync_status:
+                enum:
+                - Unknown
+                - Pending
+                - Running
+                - Completed
+                - Failed
                 type: string
             required:
-            - status
+            - pod_name
+            - sync_status
             type: object
         required:
         - spec

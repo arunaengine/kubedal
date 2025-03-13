@@ -135,36 +135,3 @@ pub struct SyncSpec {
 pub struct SyncStatus {
     pub status: String,
 }
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct PvcSource {
-    pub pvc_name: String,
-    pub namespace: Option<String>,
-}
-
-/// Sync data from one datasource to another
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[kube(
-    group = "kubedal.arunaengine.org",
-    version = "v1alpha1",
-    kind = "Backup",
-    shortname = "ba",
-    status = "BackupStatus",
-    namespaced
-)]
-pub struct BackupSpec {
-    /// Source datasource to sync from
-    pub pvc_source: PvcSource,
-
-    /// Destination datasource to sync to
-    pub destination: DataSourceRef,
-
-    /// Auto-clean up
-    #[serde(default)]
-    pub clean_up: bool,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct BackupStatus {
-    pub status: String,
-}

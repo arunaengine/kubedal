@@ -54,6 +54,8 @@ impl Datasource {
 
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
+            "apiVersion": Datasource::api_version(&()),
+            "kind": Datasource::kind(&()),
             "status": DatasourceStatus {
                 bindings: self.status.as_ref().map_or_else(std::vec::Vec::new, |s| s.bindings.clone()),
             }

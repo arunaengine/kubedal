@@ -54,8 +54,18 @@ impl Controller for ControllerService {
             )),
         };
 
+        let snapshot = ControllerServiceCapability {
+            r#type: Some(crate::csi::controller_service_capability::Type::Rpc(
+                crate::csi::controller_service_capability::Rpc {
+                    r#type:
+                        crate::csi::controller_service_capability::rpc::Type::CreateDeleteSnapshot
+                            .into(),
+                },
+            )),
+        };
+
         let response = ControllerGetCapabilitiesResponse {
-            capabilities: vec![create_delete],
+            capabilities: vec![create_delete, snapshot],
         };
 
         Ok(Response::new(response))
@@ -238,6 +248,7 @@ impl Controller for ControllerService {
         &self,
         _request: Request<crate::csi::CreateSnapshotRequest>,
     ) -> Result<Response<crate::csi::CreateSnapshotResponse>, Status> {
+        tracing::info!("Creating snapshot for {:?}", _request);
         Err(Status::unimplemented("CreateSnapshot is not implemented"))
     }
 

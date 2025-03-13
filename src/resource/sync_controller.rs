@@ -306,6 +306,7 @@ async fn create_pod(
                         ..Default::default()
                     },
                 ]),
+                restart_policy: Some("Never".to_string()),
                 ..Default::default()
             }],
             volumes: Some(vec![

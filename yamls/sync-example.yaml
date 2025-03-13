@@ -26,7 +26,7 @@ metadata:
   name: to-s3
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
-  access_mode: ReadOnly # Can be ReadOnly or ReadWrite
+  access_mode: ReadWrite # Can be ReadOnly or ReadWrite
   mount: Fuse # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
@@ -48,7 +48,7 @@ metadata:
   name: my-sync
 spec:
   source:
-    name: frombucket
+    name: from-s3
   destination:
-    name: tobucket
+    name: to-s3
   clean_up: true

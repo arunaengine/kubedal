@@ -1,9 +1,12 @@
 use crate::resource::crd::{Sync, SyncPodStatus, SyncStatus};
 use k8s_openapi::{
-    api::core::v1::{
-        Container, PersistentVolumeClaim, PersistentVolumeClaimSpec,
-        PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
-        VolumeResourceRequirements,
+    api::{
+        batch::v1::{Job, JobStatus},
+        core::v1::{
+            Container, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+            PersistentVolumeClaimVolumeSource, PodSpec, Volume, VolumeMount,
+            VolumeResourceRequirements,
+        },
     },
     apimachinery::pkg::api::resource::Quantity,
 };
@@ -63,27 +66,13 @@ impl Sync {
 
         let status_update = match self.status {
             Some(ref status) => {
-                let pod_api = Api::<Pod>::namespaced(client.clone(), &ns);
-                let pod = pod_api
+                let job_api = Api::<Job>::namespaced(client.clone(), &ns);
+                let job = job_api
                     .get(&status.pod_name)
                     .await
                     .map_err(Error::KubeError)?;
 
-                let sync_status = if let Some(status) = pod.status {
-                    if let Some(phase) = status.phase {
-                        match phase.as_str() {
-                            "Pending" => SyncPodStatus::Pending,
-                            "Running" => SyncPodStatus::Running,
-                            "Succeeded" => SyncPodStatus::Completed,
-                            "Failed" => SyncPodStatus::Failed,
-                            _ => SyncPodStatus::Unknown,
-                        }
-                    } else {
-                        SyncPodStatus::Unknown
-                    }
-                } else {
-                    SyncPodStatus::Unknown
-                };
+                let sync_status = job_status_to_sync_status(&job.status);
 
                 Patch::Apply(json!({
                     "apiVersion": Sync::api_version(&()),
@@ -96,14 +85,14 @@ impl Sync {
             }
             None => {
                 let (source, destination) = create_pvcs(client.clone(), self).await?;
-                let pod = create_pod(client, self, source, destination).await?;
+                let job = create_job(client, self, source, destination).await?;
 
                 // always overwrite status object with what we saw
                 Patch::Apply(json!({
                     "apiVersion": Sync::api_version(&()),
                     "kind": Sync::kind(&()),
                     "status": SyncStatus {
-                        pod_name: pod.metadata.name.clone().unwrap(),
+                        pod_name: job.metadata.name.clone().unwrap(),
                         sync_status: SyncPodStatus::Pending,
                     }
                 }))
@@ -124,8 +113,12 @@ impl Sync {
                     &Event {
                         type_: EventType::Normal,
                         reason: format!(
-                            "StatusUpdatedTo{:?}",
-                            new_sync.status.map(|s| s.sync_status).unwrap_or_default()
+                            "Status{:?}",
+                            new_sync
+                                .status
+                                .as_ref()
+                                .map(|s| s.sync_status.clone())
+                                .unwrap_or_default()
                         ),
                         action: "ReconciledSync".into(),
                         note: None,
@@ -137,8 +130,15 @@ impl Sync {
                 .map_err(Error::KubeError)?;
         }
 
-        // If no events were received, check back every 30 minutes
-        Ok(Action::requeue(Duration::from_secs(30 * 60)))
+        if let Some(SyncStatus {
+            sync_status: SyncPodStatus::Completed,
+            ..
+        }) = new_sync.status.as_ref()
+        {
+            Ok(Action::await_change())
+        } else {
+            Ok(Action::requeue(Duration::from_secs(15)))
+        }
     }
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
@@ -268,72 +268,129 @@ async fn create_pvcs(
     Ok((source, destination))
 }
 
-async fn create_pod(
+async fn create_job(
     client: Client,
     sync: &Sync,
     source: PersistentVolumeClaim,
     destination: PersistentVolumeClaim,
-) -> Result<Pod, Error> {
+) -> Result<Job, Error> {
     let ns = sync
         .namespace()
         .ok_or_else(|| Error::ReconcilerError("Missing namespace".into()))?;
-    let pod_api = Api::<Pod>::namespaced(client.clone(), &ns);
+    let job_api = Api::<Job>::namespaced(client.clone(), &ns);
 
     let sync_owner = sync.owner_ref(&()).unwrap();
 
-    let pod = Pod {
+    let job = Job {
         metadata: ObjectMeta {
-            name: Some(format!("sync{}", sync.uid().unwrap_or(sync.name_any()))),
+            name: Some(format!(
+                "sync-{}{}",
+                sync.uid().unwrap_or(sync.name_any()),
+                sync.metadata.resource_version.clone().unwrap_or_default()
+            )),
             namespace: Some(ns.clone()),
-            owner_references: Some(vec![sync_owner]),
+            owner_references: Some(vec![sync_owner.clone()]),
             ..Default::default()
         },
-        spec: Some(PodSpec {
-            containers: vec![Container {
-                name: "sync".to_string(),
-                image: Some("alpine:3.20".to_string()),
-                command: Some(vec!["sh".to_string(), "-c".to_string()]),
-                args: Some(vec![format!("cp -a /source/. /destination/")]),
-                volume_mounts: Some(vec![
-                    VolumeMount {
-                        name: "source".to_string(),
-                        mount_path: "/source".to_string(),
+        spec: Some(k8s_openapi::api::batch::v1::JobSpec {
+
+            template: k8s_openapi::api::core::v1::PodTemplateSpec {
+                metadata: Some(ObjectMeta {
+                    name: Some(format!(
+                        "sync-{}{}",
+                        sync.uid().unwrap_or(sync.name_any()),
+                        sync.metadata.resource_version.clone().unwrap_or_default()
+                    )),
+                    owner_references: Some(vec![sync_owner.clone()]),
+                    ..Default::default()
+                }),
+                spec: Some(PodSpec {
+                    restart_policy: Some("OnFailure".to_string()),
+                    containers: vec![Container {
+                        name: "sync".to_string(),
+                        image: Some("alpine:3.20".to_string()),
+                        command: Some(vec!["sh".to_string(), "-c".to_string()]),
+                        args: Some(vec![format!("cp -a /source/. /destination/")]),
+                        volume_mounts: Some(vec![
+                            VolumeMount {
+                                name: "source".to_string(),
+                                mount_path: "/source".to_string(),
+                                ..Default::default()
+                            },
+                            VolumeMount {
+                                name: "destination".to_string(),
+                                mount_path: "/destination".to_string(),
+                                ..Default::default()
+                            },
+                        ]),
                         ..Default::default()
-                    },
-                    VolumeMount {
-                        name: "destination".to_string(),
-                        mount_path: "/destination".to_string(),
-                        ..Default::default()
-                    },
-                ]),
-                restart_policy: Some("Never".to_string()),
+                    }],
+                    volumes: Some(vec![
+                        Volume {
+                            name: "source".to_string(),
+                            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                                claim_name: source.metadata.name.clone().unwrap(),
+                                read_only: Some(true),
+                            }),
+                            ..Default::default()
+                        },
+                        Volume {
+                            name: "destination".to_string(),
+                            persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
+                                claim_name: destination.metadata.name.clone().unwrap(),
+                                read_only: None,
+                            }),
+                            ..Default::default()
+                        },
+                    ]),
+                    ..Default::default()
+                }),
                 ..Default::default()
-            }],
-            volumes: Some(vec![
-                Volume {
-                    name: "source".to_string(),
-                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                        claim_name: source.metadata.name.clone().unwrap(),
-                        read_only: Some(true),
-                    }),
-                    ..Default::default()
-                },
-                Volume {
-                    name: "destination".to_string(),
-                    persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                        claim_name: destination.metadata.name.clone().unwrap(),
-                        read_only: None,
-                    }),
-                    ..Default::default()
-                },
-            ]),
+            },
             ..Default::default()
         }),
         ..Default::default()
     };
 
-    pod_api
-        .create(&PostParams::default(), &pod)
+    job_api
+        .create(&PostParams::default(), &job)
         .await
         .map_err(Error::KubeError)
+}
+
+/// Maps a Kubernetes Job status to a SyncPodStatus
+pub fn job_status_to_sync_status(job_status: &Option<JobStatus>) -> SyncPodStatus {
+    match job_status {
+        None => SyncPodStatus::Pending,
+        Some(status) => {
+            // Check if the job has failed
+            if let Some(failed) = status.failed {
+                if failed > 0 {
+                    return SyncPodStatus::Failed;
+                }
+            }
+
+            // Check if the job has completed successfully
+            if let Some(succeeded) = status.succeeded {
+                if succeeded > 0 {
+                    return SyncPodStatus::Completed;
+                }
+            }
+
+            // Check if the job has active pods
+            if let Some(active) = status.active {
+                if active > 0 {
+                    return SyncPodStatus::Running;
+                }
+            }
+
+            // Check if the job has a start time
+            if status.start_time.is_some() {
+                return SyncPodStatus::Running;
+            }
+
+            // Default to Pending if we can't determine status
+            SyncPodStatus::Pending
+        }
+    }
 }

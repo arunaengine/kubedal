@@ -54,14 +54,22 @@ fn main() {
             ..Default::default()
         },
         spec: kubedal::resource::crd::SyncSpec {
-            source: DataSourceRef { name: "from".to_string(), namespace: None },
-            destination: DataSourceRef { name: "to".to_string(), namespace: None },
+            source: DataSourceRef {
+                name: "from".to_string(),
+                namespace: None,
+            },
+            destination: DataSourceRef {
+                name: "to".to_string(),
+                namespace: None,
+            },
             clean_up: true,
         },
         status: None,
     };
 
-    std::io::stdout().write_all(b"\n---\n").expect("Failed to write Resource separator");
+    std::io::stdout()
+        .write_all(b"\n---\n")
+        .expect("Failed to write Resource separator");
 
     serde_yaml::to_writer(std::io::stdout(), &demo_sync).expect("Failed to serialize Resource");
 }

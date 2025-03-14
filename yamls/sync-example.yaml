@@ -30,7 +30,7 @@ spec:
   mount: Fuse # Can be Cached or Fuse
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
-  # 2. As a key/values in the referenced Secret (for sensitive information)
+  # 2. As a key/values in the referenced A  Q<< (for sensitive information)
   credentials:
     secretRef:
       name: s3-credentials
@@ -45,7 +45,7 @@ spec:
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: Sync
 metadata:
-  name: my-sync
+  name: sync-from-s3-to-s3
 spec:
   source:
     name: from-s3

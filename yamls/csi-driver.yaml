@@ -53,6 +53,9 @@ apiVersion: rbac.authorization.k8s.io/v1
 metadata:
   name: kubedal-csi-provisioner-role
 rules:
+  - apiGroups: ["batch"]
+    resources: ["jobs"]
+    verbs: ["get", "list", "watch", "create", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumes", "pods"]
     verbs: ["get", "list", "watch", "create", "delete"]
@@ -66,7 +69,7 @@ rules:
     resources: ["volumesnapshotclasses", "volumesnapshotcontents", "volumesnapshots", "volumesnapshotcontents/status"]
     verbs: ["get", "list", "watch", "patch"]
   - apiGroups: ["events.k8s.io"]
-    resources: ["events"]
+    resources: ["", "events"]
     verbs: ["list", "watch", "create", "update", "patch"]
   - apiGroups: ["storage.k8s.io"]
     resources: ["csinodes"]

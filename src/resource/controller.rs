@@ -1,10 +1,9 @@
-use super::{
-    datasource_controller::{error_policy_ds, reconcile_ds},
-    sync_controller::{error_policy_sy, reconcile_sy},
-};
-use crate::resource::crd::{Datasource, Sync};
+use crate::resource::crd::{DataNode, DataPod, DataReplicaSet};
 use futures::StreamExt;
-use k8s_openapi::api::core::v1::{PersistentVolumeClaim, Pod};
+use k8s_openapi::api::{
+    core::v1::{PersistentVolumeClaim, Pod},
+    node,
+};
 use kube::{
     api::{Api, ListParams},
     client::Client,
@@ -42,19 +41,29 @@ pub enum Error {
 
     #[error("Finalizer Error: {0}")]
     FinalizerError(#[source] Box<kube::runtime::finalizer::Error<Error>>),
+
+    #[error("Tonic error: {0}")]
+    TonicError(#[from] tonic::Status),
 }
 
 /// Initialize the controller and shared state (given the crd is installed)
 pub async fn run(client: Client) {
-    let ds_api = Api::<Datasource>::all(client.clone());
-    if let Err(e) = ds_api.list(&ListParams::default().limit(1)).await {
+    let data_node_api = Api::<DataNode>::all(client.clone());
+    if let Err(e) = data_node_api.list(&ListParams::default().limit(1)).await {
         error!("CRD Datasource is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
 
-    let sync_api = Api::<Sync>::all(client.clone());
-    if let Err(e) = sync_api.list(&ListParams::default().limit(1)).await {
+    let data_pod_api = Api::<DataPod>::all(client.clone());
+    if let Err(e) = data_pod_api.list(&ListParams::default().limit(1)).await {
+        error!("CRD Sync is not queryable; {e:?}. Is the CRD installed?");
+        info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
+        std::process::exit(1);
+    }
+
+    let drs_api = Api::<DataReplicaSet>::all(client.clone());
+    if let Err(e) = drs_api.list(&ListParams::default().limit(1)).await {
         error!("CRD Sync is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
@@ -68,17 +77,17 @@ pub async fn run(client: Client) {
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
     });
 
-    let ds_controller = Controller::new(ds_api, Config::default().any_semantic())
-        .shutdown_on_signal()
-        .run(reconcile_ds, error_policy_ds, state.clone())
-        .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
+    // let ds_controller = Controller::new(ds_api, Config::default().any_semantic())
+    //     .shutdown_on_signal()
+    //     .run(reconcile_ds, error_policy_ds, state.clone())
+    //     .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
 
-    let sync_controller = Controller::new(sync_api, Config::default().any_semantic())
-        .owns(pod_api, watcher::Config::default())
-        .owns(pvc_api, watcher::Config::default())
-        .shutdown_on_signal()
-        .run(reconcile_sy, error_policy_sy, state.clone())
-        .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
+    // let sync_controller = Controller::new(sync_api, Config::default().any_semantic())
+    //     .owns(pod_api, watcher::Config::default())
+    //     .owns(pvc_api, watcher::Config::default())
+    //     .shutdown_on_signal()
+    //     .run(reconcile_sy, error_policy_sy, state.clone())
+    //     .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
 
-    tokio::join!(ds_controller, sync_controller);
+    // tokio::join!(ds_controller, sync_controller);
 }

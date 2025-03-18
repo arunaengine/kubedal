@@ -293,7 +293,6 @@ async fn create_job(
             ..Default::default()
         },
         spec: Some(k8s_openapi::api::batch::v1::JobSpec {
-
             template: k8s_openapi::api::core::v1::PodTemplateSpec {
                 metadata: Some(ObjectMeta {
                     name: Some(format!(

@@ -1,17 +1,11 @@
 use crate::resource::crd::{DataNode, DataPod, DataReplicaSet};
+use crate::resource::data_node_controller::{error_policy_dn, reconcile_dn};
+use crate::resource::data_pod_controller::{error_policy_dp, reconcile_dp};
 use futures::StreamExt;
-use k8s_openapi::api::{
-    core::v1::{PersistentVolumeClaim, Pod},
-    node,
-};
 use kube::{
     api::{Api, ListParams},
     client::Client,
-    runtime::{
-        controller::Controller,
-        events::Recorder,
-        watcher::{self, Config},
-    },
+    runtime::{controller::Controller, events::Recorder, watcher::Config},
 };
 use std::sync::Arc;
 use tracing::*;
@@ -50,44 +44,44 @@ pub enum Error {
 pub async fn run(client: Client) {
     let data_node_api = Api::<DataNode>::all(client.clone());
     if let Err(e) = data_node_api.list(&ListParams::default().limit(1)).await {
-        error!("CRD Datasource is not queryable; {e:?}. Is the CRD installed?");
+        error!("CRD DataNode is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
 
     let data_pod_api = Api::<DataPod>::all(client.clone());
     if let Err(e) = data_pod_api.list(&ListParams::default().limit(1)).await {
-        error!("CRD Sync is not queryable; {e:?}. Is the CRD installed?");
+        error!("CRD DataPod is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
 
     let drs_api = Api::<DataReplicaSet>::all(client.clone());
     if let Err(e) = drs_api.list(&ListParams::default().limit(1)).await {
-        error!("CRD Sync is not queryable; {e:?}. Is the CRD installed?");
+        error!("CRD DataReplicaSet is not queryable; {e:?}. Is the CRD installed?");
         info!("Installation: cargo run --bin crdgen | kubectl apply -f -");
         std::process::exit(1);
     }
-
-    let pod_api = Api::<Pod>::all(client.clone());
-    let pvc_api = Api::<PersistentVolumeClaim>::all(client.clone());
 
     let state = Arc::new(Context {
         client: client.clone(),
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
     });
 
-    // let ds_controller = Controller::new(ds_api, Config::default().any_semantic())
-    //     .shutdown_on_signal()
-    //     .run(reconcile_ds, error_policy_ds, state.clone())
-    //     .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
+    let state_clone = state.clone();
+    let data_node_controller_handle = tokio::spawn(async move {
+        Controller::new(data_node_api, Config::default().any_semantic())
+            .shutdown_on_signal()
+            .run(reconcile_dn, error_policy_dn, state_clone)
+            .for_each(|_| futures::future::ready(()))
+    });
 
-    // let sync_controller = Controller::new(sync_api, Config::default().any_semantic())
-    //     .owns(pod_api, watcher::Config::default())
-    //     .owns(pvc_api, watcher::Config::default())
-    //     .shutdown_on_signal()
-    //     .run(reconcile_sy, error_policy_sy, state.clone())
-    //     .for_each(|_| futures::future::ready(())); // We don't care about the result (for now)
+    let data_pod_controller_handle = tokio::spawn(async move {
+        Controller::new(data_pod_api, Config::default().any_semantic())
+            .shutdown_on_signal()
+            .run(reconcile_dp, error_policy_dp, state.clone())
+            .for_each(|_| futures::future::ready(()))
+    });
 
-    // tokio::join!(ds_controller, sync_controller);
+    _ = tokio::join!(data_node_controller_handle, data_pod_controller_handle);
 }

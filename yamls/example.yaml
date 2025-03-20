@@ -36,7 +36,7 @@ kind: DataPod
 metadata:
   name: example-data-pod
 spec:
-  path: /data
+  path: /newdata
   dataNodeRef:
     name: example-s3-node
     namespace: default

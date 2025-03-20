@@ -16,7 +16,6 @@ use crate::csi::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume,
 };
-use crate::resource::crd::Datasource;
 
 pub struct ControllerService {
     // In-memory storage for volumes (for a dummy driver)
@@ -101,7 +100,7 @@ impl Controller for ControllerService {
 
         let client = self.client.clone();
         let pvc_meta = get_pvc(client.clone(), namespace, &request.name).await?;
-        let context = get_config_from_pvc_meta(client, pvc_meta.clone()).await?;
+        let context = get_config_from_pvc_meta(pvc_meta.clone()).await?;
 
         tracing::trace!("PVC meta: {:?}", pvc_meta);
         tracing::trace!("Volume context: {:?}", context);
@@ -324,41 +323,72 @@ async fn get_pvc(client: Client, namespace: &str, uid: &str) -> Result<ObjectMet
     Ok(pvc_meta)
 }
 
-async fn get_config_from_pvc_meta(
-    client: Client,
-    pvc_meta: ObjectMeta,
-) -> Result<HashMap<String, String>, Status> {
+async fn get_config_from_pvc_meta(pvc_meta: ObjectMeta) -> Result<HashMap<String, String>, Status> {
     let annotations = pvc_meta.annotations.unwrap_or_default();
 
-    let datasource = annotations
-        .get("kubedal.arunaengine.org/datasource")
+    let data_node_name = annotations
+        .get("kubedal.arunaengine.org/data-node-name")
         .ok_or_else(|| {
-            tracing::error!("Datasource annotation not found");
-            Status::invalid_argument("Datasource annotation not found")
+            tracing::error!("DataNode name annotation not found");
+            Status::invalid_argument("DataNode name annotation not found")
         })?;
 
-    let datasource_namespace = annotations
-        .get("kubedal.arunaengine.org/namespace")
+    let data_node_namespace = annotations
+        .get("kubedal.arunaengine.org/data-node-namespace")
         .cloned()
         .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
 
-    let res_api: Api<Datasource> = Api::namespaced(client, &datasource_namespace);
-    let res = res_api.get(datasource).await.map_err(|e| {
+    let data_pod_name = annotations
+        .get("kubedal.arunaengine.org/data-pod-name")
+        .ok_or_else(|| {
+            tracing::error!("DataPod name annotation not found");
+            Status::invalid_argument("DataPod name annotation not found")
+        })?;
+
+    let data_pod_namespace = annotations
+        .get("kubedal.arunaengine.org/data-pod-namespace")
+        .cloned()
+        .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
+
+    let data_mount = annotations
+        .get("kubedal.arunaengine.org/mount")
+        .ok_or_else(|| {
+            tracing::error!("Mount mode annotation not found");
+            Status::invalid_argument("Mount mode annotation not found")
+        })?;
+
+    let mut config = HashMap::new();
+    config.extend([
+        (
+            "kubedal.arunaengine.org/data-node-name".to_string(),
+            data_node_name.to_string(),
+        ),
+        (
+            "kubedal.arunaengine.org/data-node-namespace".to_string(),
+            data_node_namespace.to_string(),
+        ),
+        (
+            "kubedal.arunaengine.org/data-pod-name".to_string(),
+            data_pod_name.to_string(),
+        ),
+        (
+            "kubedal.arunaengine.org/data-pod-namespace".to_string(),
+            data_pod_namespace.to_string(),
+        ),
+        (
+            "kubedal.arunaengine.org/mount".to_string(),
+            data_mount.to_string(),
+        ),
+    ]);
+
+    // Override the mount mode if specified in the PVC annotations
+    /*
+    let res_api: Api<DataNode> = Api::namespaced(client, &data_node_namespace);
+    let res = res_api.get(data_node_name).await.map_err(|e| {
         tracing::error!("Error getting resource: {:?}", e);
         Status::internal("Error getting resource")
     })?;
 
-    let mut config = HashMap::new();
-    config.insert(
-        "kubedal.arunaengine.org/datasource".to_string(),
-        datasource.to_string(),
-    );
-    config.insert(
-        "kubedal.arunaengine.org/namespace".to_string(),
-        datasource_namespace.to_string(),
-    );
-
-    // Override the mount mode if specified in the PVC annotations
     config.insert(
         "kubedal.arunaengine.org/mount".to_string(),
         annotations
@@ -373,6 +403,7 @@ async fn get_config_from_pvc_meta(
             })
             .to_string(),
     );
+    */
 
     Ok(config)
 }

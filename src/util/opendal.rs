@@ -6,16 +6,8 @@ use opendal::{Builder, Operator, services};
 use std::collections::HashMap;
 use tonic::Status;
 
-pub async fn get_operator(
-    client: &Client,
-    node: &DataNode,
-    root: Option<String>,
-) -> Result<Operator, Status> {
+pub async fn get_operator(client: &Client, node: &DataNode) -> Result<Operator, Status> {
     let mut cfg = node.spec.config.clone();
-
-    if let Some(root) = root {
-        cfg.insert("root".to_string(), root);
-    }
 
     let secret = match node.spec.secret_ref.as_ref() {
         None => None,

@@ -4,6 +4,14 @@ use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub enum MountAccess {
+    CacheReadWrite,
+    CacheReadOnly,
+    FuseReadWrite,
+    FuseReadOnly,
+}
+
 /// Datanode is a custom resource for defining data location, it is similar to a K8s Node
 /// but for data sources. It can be used to define a data source and its access configuration.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]

@@ -68,20 +68,15 @@ pub async fn run(client: Client) {
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
     });
 
-    let state_clone = state.clone();
-    let data_node_controller_handle = tokio::spawn(async move {
-        Controller::new(data_node_api, Config::default().any_semantic())
-            .shutdown_on_signal()
-            .run(reconcile_dn, error_policy_dn, state_clone)
-            .for_each(|_| futures::future::ready(()))
-    });
+    let data_node_controller = Controller::new(data_node_api, Config::default().any_semantic())
+        .shutdown_on_signal()
+        .run(reconcile_dn, error_policy_dn, state.clone())
+        .for_each(|_| futures::future::ready(()));
 
-    let data_pod_controller_handle = tokio::spawn(async move {
-        Controller::new(data_pod_api, Config::default().any_semantic())
-            .shutdown_on_signal()
-            .run(reconcile_dp, error_policy_dp, state.clone())
-            .for_each(|_| futures::future::ready(()))
-    });
+    let data_pod_controller = Controller::new(data_pod_api, Config::default().any_semantic())
+        .shutdown_on_signal()
+        .run(reconcile_dp, error_policy_dp, state.clone())
+        .for_each(|_| futures::future::ready(()));
 
-    _ = tokio::join!(data_node_controller_handle, data_pod_controller_handle);
+    tokio::join!(data_node_controller, data_pod_controller);
 }

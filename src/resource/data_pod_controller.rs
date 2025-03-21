@@ -1,4 +1,6 @@
-use crate::resource::crd::{DataPod, DataPodStatus};
+use crate::resource::crd::{DataNode, DataPod, DataPodSpec, DataPodStatus};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use kube::core::PartialObjectMetaExt;
 use kube::{
     Resource,
     api::{Api, Patch, PatchParams, ResourceExt},
@@ -49,7 +51,74 @@ impl DataPod {
         // Fetch DataPod
         let name = self.name_any();
         let data_pod_api: Api<DataPod> = Api::namespaced(client.clone(), &ns);
-        let data_pod = data_pod_api.get(&name).await.map_err(Error::KubeError)?;
+
+        // Set path to DataPod uid if None, empty or "/"
+        let (new_path, generated) = if self
+            .spec
+            .path
+            .as_ref()
+            .map_or(true, |path| path.is_empty() || path == "/")
+        {
+            (
+                format!(
+                    "/{}",
+                    self.uid().expect("DataPods uid is missing.").as_str()
+                ),
+                true,
+            )
+        } else {
+            (self.spec.path.clone().unwrap(), false) // Cannot fail as the other branch collects all the other cases.
+        };
+
+        let path_patch = Patch::Apply(json!({
+            "apiVersion": DataPod::api_version(&()),
+            "kind": DataPod::kind(&()),
+            "spec": DataPodSpec {
+                path: Some(new_path),
+                ..Default::default()
+            }
+        }));
+        data_pod_api
+            .patch(&name, &PatchParams::apply("cntrlr").force(), &path_patch)
+            .await
+            .inspect_err(|e| error!("Failed to patch path: {:?}", e))
+            .map_err(Error::KubeError)?;
+
+        //TODO: Set owner reference and datNodeRef depending on ref/selector
+        if let Some(node_ref) = &self.spec.data_node_ref {
+            let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &ns);
+            let data_node = data_node_api
+                .get(&node_ref.name)
+                .await
+                .map_err(Error::KubeError)?;
+
+            let owner = OwnerReference {
+                api_version: DataNode::api_version(&()).to_string(),
+                block_owner_deletion: None,
+                controller: None,
+                kind: DataNode::kind(&()).to_string(),
+                name: data_node.name_any(),
+                uid: data_node.metadata.uid.unwrap(),
+            };
+
+            let metadata_patch = Patch::Apply(
+                ObjectMeta {
+                    owner_references: Some(vec![owner]),
+                    ..Default::default()
+                }
+                .into_request_partial::<DataPod>(),
+            );
+            data_pod_api
+                .patch_metadata(&name, &PatchParams::apply("cntrlr"), &metadata_patch)
+                .await?;
+            info!("PartialMetadataPatch for {} succeeded.", &name)
+        } else if let Some(selector) = &self.spec.data_node_selector {
+            //TODO:
+            //  - Fetch DataNodes with selector
+            //  - Take first result and set as owner (?)
+        } else {
+            return Err(Error::ReconcilerError(format!("DataPod {} has no DataNode reference", &name)));
+        }
 
         // always overwrite status object with what we saw
         let new_status = Patch::Apply(json!({
@@ -57,14 +126,11 @@ impl DataPod {
             "kind": DataPod::kind(&()),
             "status": DataPodStatus {
                 available: true,
-                generated_path: data_pod.spec.path.is_some(),
+                generated_path: generated,
             }
         }));
 
-        //TODO: Patch resource
-        //  - Set owner reference and datNodeRef depending on ref/selector
-        //  - Set path if changed (and generated_path if necessary)
-
+        //  - Set generated_path if changed
         trace!("Patching status for {}", name);
         let ps = PatchParams::apply("cntrlr").force();
         let new_data_pod = data_pod_api
@@ -96,8 +162,8 @@ impl DataPod {
                 .map_err(Error::KubeError)?;
         }
 
-        // If no events were received, check back every 1 minute
-        Ok(Action::requeue(Duration::from_secs(1 * 60)))
+        // If no events were received, check back every 5 minutes
+        Ok(Action::requeue(Duration::from_secs(5 * 60)))
     }
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)

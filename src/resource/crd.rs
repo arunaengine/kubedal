@@ -51,7 +51,7 @@ pub struct DataNodeStatus {
     pub used: Quantity,
 }
 
-#[derive(CustomResource, Default, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(CustomResource, Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 #[kube(
     group = "kubedal.arunaengine.org",
     version = "v1alpha1",
@@ -60,6 +60,7 @@ pub struct DataNodeStatus {
     status = "DataPodStatus",
     namespaced
 )]
+#[kube(derive = "PartialEq")]
 pub struct DataPodSpec {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub path: Option<String>,
@@ -116,7 +117,7 @@ pub struct DataReplicaSetStatus {
 }
 
 /// Reference to a Kubernetes resource
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub struct Ref {
     /// Name of the resource
     pub name: String,

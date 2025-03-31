@@ -79,7 +79,7 @@ rules:
     verbs: ["get", "list", "watch"]
   - apiGroups: ["kubedal.arunaengine.org"]
     resources: ["datanodes", "datanodes/status", "datapods", "datapods/status", "datareplicasets", "datareplicasets/status"]
-    verbs: ["get", "list", "watch", "patch", "update"]
+    verbs: ["get", "list", "watch", "patch", "update", "create"]
   - apiGroups: [""]
     resources: ["secrets"]
     verbs: ["get"]

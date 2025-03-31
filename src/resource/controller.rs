@@ -1,6 +1,7 @@
 use crate::resource::crd::{DataNode, DataPod, DataReplicaSet};
 use crate::resource::data_node_controller::{error_policy_dn, reconcile_dn};
 use crate::resource::data_pod_controller::{error_policy_dp, reconcile_dp};
+use crate::resource::data_replica_set_controller::{error_policy_drs, reconcile_drs};
 use futures::StreamExt;
 use kube::{
     api::{Api, ListParams},
@@ -78,5 +79,14 @@ pub async fn run(client: Client) {
         .run(reconcile_dp, error_policy_dp, state.clone())
         .for_each(|_| futures::future::ready(()));
 
-    tokio::join!(data_node_controller, data_pod_controller);
+    let data_replica_set_controller = Controller::new(drs_api, Config::default().any_semantic())
+        .shutdown_on_signal()
+        .run(reconcile_drs, error_policy_drs, state.clone())
+        .for_each(|_| futures::future::ready(()));
+
+    tokio::join!(
+        data_node_controller,
+        data_pod_controller,
+        data_replica_set_controller
+    );
 }

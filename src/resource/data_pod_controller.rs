@@ -1,5 +1,5 @@
 use crate::resource::crd::{DataNode, DataPod, DataPodSpec, DataPodStatus};
-use k8s_openapi::apimachinery::pkg::apis::meta::v1::{ObjectMeta, OwnerReference};
+use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::ListParams;
 use kube::{
     Resource,
@@ -101,14 +101,12 @@ impl DataPod {
         };
 
         // Patch owner ref
-        let owner = OwnerReference {
-            api_version: DataNode::api_version(&()).to_string(),
-            block_owner_deletion: None,
-            controller: None,
-            kind: DataNode::kind(&()).to_string(),
-            name: data_node.name_any(),
-            uid: data_node.metadata.uid.unwrap(),
-        };
+        let owner = data_node.owner_ref(&()).ok_or_else(|| {
+            Error::ReconcilerError(format!(
+                "Failed to create owner ref from DataNode: {}",
+                data_node.name_any()
+            ))
+        })?;
 
         // Patch everything at once
         let data_pod_clone = data_pod.clone();
@@ -142,7 +140,6 @@ impl DataPod {
                     &Event {
                         type_: EventType::Normal,
                         reason: format!(
-                            //"Status changed: {:?}",
                             "Reconciled: DataPod changed (path generated: {:?})",
                             new_data_pod
                                 .status

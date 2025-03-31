@@ -3,6 +3,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub enum MountAccess {
@@ -10,6 +11,17 @@ pub enum MountAccess {
     CacheReadOnly,
     FuseReadWrite,
     FuseReadOnly,
+}
+
+impl fmt::Display for MountAccess {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MountAccess::CacheReadWrite => write!(f, "cache-read-write"),
+            MountAccess::CacheReadOnly => write!(f, "cache-read-only"),
+            MountAccess::FuseReadWrite => write!(f, "fuse-read-write"),
+            MountAccess::FuseReadOnly => write!(f, "fuse-read-only"),
+        }
+    }
 }
 
 /// Datanode is a custom resource for defining data location, it is similar to a K8s Node

@@ -4,6 +4,31 @@ kind: DataNode
 metadata:
   name: example-s3-node
   namespace: default
+  labels:
+    region: us-east
+spec:
+  backend: S3 # Currently only S3 and HTTP are supported
+  read_only: true
+  limit: 10G
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
+  secretRef:
+    name: s3-credentials
+    namespace: default
+  config:
+    bucket: my-bucket
+    endpoint: http://minio-service.default.svc.cluster.local:9000
+    region: us-east-1
+---
+# Example DataNode for S3
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataNode
+metadata:
+  name: replica-node-01
+  namespace: default
+  labels:
+    region: eu-central
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
   read_only: true
@@ -15,9 +40,33 @@ spec:
     name: s3-credentials
     namespace: default
   config:
-    bucket: my-bucket
+    bucket: some-replica
     endpoint: http://minio-service.default.svc.cluster.local:9000
     region: us-east-1
+---
+# Example DataNode for S3
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataNode
+metadata:
+  name: replica-node-02
+  namespace: default
+  labels:
+    region: eu-central
+spec:
+  backend: S3 # Currently only S3 and HTTP are supported
+  read_only: true
+  #limit: 10G
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
+  secretRef:
+    name: s3-credentials
+    namespace: default
+  config:
+    bucket: another-replica
+    endpoint: http://minio-service.default.svc.cluster.local:9000
+    region: us-east-1
+
 ---
 # Example Secret with credentials
 apiVersion: v1
@@ -36,10 +85,12 @@ kind: DataPod
 metadata:
   name: example-data-pod
 spec:
-  path: /newdata
+  path: /data
   dataNodeRef:
     name: example-s3-node
     namespace: default
+  #dataNodeSelector:
+  #  region: eu-central
 ---
 # Example PVC that references the resource
 apiVersion: v1
@@ -48,8 +99,8 @@ metadata:
   name: example-dataset-pvc
   namespace: default
   annotations:
-    kubedal.arunaengine.org/data-node-name: example-s3-node
-    kubedal.arunaengine.org/data-node-namespace: default
+    kubedal.arunaengine.org/data-node-name: example-s3-node #TODO: Remove -> Use dataNodeRef in DataPod spec
+    kubedal.arunaengine.org/data-node-namespace: default    #TODO: Remove -> Use dataNodeRef in DataPod spec
     kubedal.arunaengine.org/data-pod-name: example-data-pod
     kubedal.arunaengine.org/data-pod-namespace: default
     kubedal.arunaengine.org/mount: fuse-read-only
@@ -80,3 +131,26 @@ spec:
     - name: dataset
       persistentVolumeClaim:
         claimName: example-dataset-pvc
+---
+# Example DataReplicaset that creates replicas with synced data of example-data-pod
+#apiVersion: kubedal.arunaengine.org/v1alpha1
+#kind: DataReplicaSet
+#metadata:
+#  name: example-data-replica-set
+#  namespace: default
+#  labels:
+#    foo: bar
+#spec:
+#  replicas: 2
+#  selector:
+#    matchLabels:
+#      foo: bar
+#  sourceDataPodRef:
+#    name: example-data-pod
+#    namespace: default
+#  template:
+#    metadata:
+#      labels:
+#        foo: bar
+#    spec:
+#      path: /sync-data

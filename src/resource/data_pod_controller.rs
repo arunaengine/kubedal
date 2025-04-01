@@ -1,4 +1,4 @@
-use crate::resource::crd::{DataNode, DataPod, DataPodSpec, DataPodStatus};
+use crate::resource::crd::{DataNode, DataPod, DataPodSpec, DataPodStatus, Ref};
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
 use kube::api::ListParams;
 use kube::{
@@ -121,7 +121,10 @@ impl DataPod {
             },
             "spec": DataPodSpec {
                 path: Some(new_path),
-                data_node_ref: data_pod_clone.spec.data_node_ref,
+                data_node_ref: Some(Ref {
+                    name: data_node.name_any(),
+                    namespace: Some(data_node.metadata.namespace.unwrap_or_default()),
+                }),
                 data_node_selector: data_pod_clone.spec.data_node_selector,
                 request: data_pod_clone.spec.request,
             },

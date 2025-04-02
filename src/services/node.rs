@@ -261,8 +261,10 @@ async fn get_full_data_mount(
         .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?
         .as_str()
     {
+        "cache" => MountAccess::CacheReadOnly,
         "cache-read-only" => MountAccess::CacheReadOnly,
         "cache-read-write" => MountAccess::CacheReadWrite,
+        "fuse" => MountAccess::FuseReadOnly,
         "fuse-read-only" => MountAccess::FuseReadOnly,
         "fuse-read-write" => MountAccess::FuseReadWrite,
         _ => return Err(Status::invalid_argument("Unsupported mount type")),

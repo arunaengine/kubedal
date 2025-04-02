@@ -2,8 +2,9 @@ use super::controller::{Context, Error};
 use crate::resource::crd::{DataNode, DataPod, MountAccess};
 use crate::resource::crd::{DataPodSpec, DataReplicaSet, Ref};
 use k8s_openapi::api::core::v1::{
-    Container, PersistentVolumeClaim, PersistentVolumeClaimSpec, PersistentVolumeClaimVolumeSource,
-    Pod, PodSpec, Volume, VolumeMount, VolumeResourceRequirements,
+    Container, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
+    VolumeResourceRequirements,
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
@@ -136,7 +137,7 @@ impl DataReplicaSet {
                 &source_data_pod,
                 &source_data_node,
                 &self,
-                MountAccess::FuseReadOnly,
+                MountAccess::FuseReadWrite,
                 &pvc_api,
             )
             .await?;
@@ -241,7 +242,7 @@ async fn create_replica_data_pod(
                 namespace: data_node.namespace(),
             }),
             data_node_selector: None,
-            request: None, //TODO: ???
+            request: None, //TODO: ...
         },
         status: None,
     };
@@ -354,10 +355,17 @@ async fn create_replica_pod(
         ))
     })?;
 
+    let source_pod_path = source_data_pod.spec.path.clone().ok_or_else(|| {
+        Error::ReconcilerError(format!(
+            "Source DataPod {} is missing path.",
+            source_data_pod.name_any()
+        ))
+    })?;
+
     // Add source volume
     let src_pvcsc = PersistentVolumeClaimVolumeSource {
         claim_name: source_pvc.name_any(),
-        read_only: Some(true),
+        read_only: Some(false),
     };
     let mut volumes: Vec<Volume> = vec![Volume {
         name: "source".to_string(),
@@ -366,16 +374,19 @@ async fn create_replica_pod(
     }];
     let mut volume_mounts: Vec<VolumeMount> = vec![VolumeMount {
         name: "source".to_string(),
-        mount_path: source_data_pod.spec.path.clone().ok_or_else(|| {
-            Error::ReconcilerError(format!(
-                "DataPod {} is missing path.",
-                source_data_pod.name_any()
-            ))
-        })?,
+        mount_path: source_pod_path.clone(),
         ..Default::default()
     }];
 
+    let mut replica_paths = vec![];
     for (i, (replica_pod, replica_pvc)) in replica_resources.iter().enumerate() {
+        let replica_path = replica_pod.spec.path.clone().ok_or_else(|| {
+            Error::ReconcilerError(format!(
+                "Replica DataPod {} is missing path.",
+                source_data_pod.name_any()
+            ))
+        })?;
+
         let replica_pvcsc = PersistentVolumeClaimVolumeSource {
             claim_name: replica_pvc.name_any(),
             read_only: Some(false),
@@ -387,20 +398,34 @@ async fn create_replica_pod(
         });
         volume_mounts.push(VolumeMount {
             name: format!("replica-{}", i),
-            mount_path: replica_pod.spec.path.clone().ok_or_else(|| {
-                Error::ReconcilerError(format!(
-                    "Replica DataPod {} is missing path.",
-                    source_data_pod.name_any()
-                ))
-            })?,
+            mount_path: replica_path.clone(),
             ..Default::default()
         });
+
+        replica_paths.push(replica_path);
     }
 
     let container = Container {
         name: "sync-replica".to_string(),
-        image: Some("alpine:3.21".to_string()),
-        command: Some(vec!["sleep".to_string(), "infinity".to_string()]), //TODO: Sync src mount to replica mounts
+        image: Some("harbor.computational.bio.uni-giessen.de/aruna/kd-replicator".to_string()),
+        image_pull_policy: Some("Always".to_string()),
+        env: Some(vec![
+            EnvVar {
+                name: "source".to_string(),
+                value: Some(source_pod_path),
+                value_from: None,
+            },
+            EnvVar {
+                name: "sleep_duration".to_string(),
+                value: Some("1".to_string()),
+                value_from: None,
+            },
+            EnvVar {
+                name: "replicas".to_string(),
+                value: Some(replica_paths.join(";")),
+                value_from: None,
+            },
+        ]),
         volume_mounts: Some(volume_mounts),
         ..Default::default()
     };

@@ -8,7 +8,7 @@ metadata:
     region: us-east
 spec:
   backend: S3 # Currently only S3 and HTTP are supported
-  read_only: true
+  read_only: false
   limit: 10G
   # You can specify any valid OpenDAL configuration entries either:
   # 1. Directly in the config field
@@ -79,19 +79,6 @@ stringData:
   access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
   secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
 ---
-# Example DataPod for S3
-apiVersion: kubedal.arunaengine.org/v1alpha1
-kind: DataPod
-metadata:
-  name: example-data-pod
-spec:
-  path: /data
-  dataNodeRef:
-    name: example-s3-node
-    namespace: default
-  #dataNodeSelector:
-  #  region: eu-central
----
 # Example PVC that references the resource
 apiVersion: v1
 kind: PersistentVolumeClaim
@@ -103,54 +90,34 @@ metadata:
     kubedal.arunaengine.org/data-node-namespace: default    #TODO: Remove -> Use dataNodeRef in DataPod spec
     kubedal.arunaengine.org/data-pod-name: example-data-pod
     kubedal.arunaengine.org/data-pod-namespace: default
-    kubedal.arunaengine.org/mount: fuse-read-only
+    kubedal.arunaengine.org/mount: fuse-read-write
 spec:
   accessModes:
-    - ReadOnlyMany
+    - ReadWriteMany
   storageClassName: kubedal
   resources:
     requests:
       storage: 5Gi
 ---
-# Example Pod that uses the PVC
-apiVersion: v1
-kind: Pod
-metadata:
-  name: example-consumer
-  namespace: default
-spec:
-  containers:
-    - name: app
-      image: alpine
-      command: ["sleep", "infinity"]
-      volumeMounts:
-        - name: dataset
-          mountPath: /data
-          readOnly: true
-  volumes:
-    - name: dataset
-      persistentVolumeClaim:
-        claimName: example-dataset-pvc
----
 # Example DataReplicaset that creates replicas with synced data of example-data-pod
-#apiVersion: kubedal.arunaengine.org/v1alpha1
-#kind: DataReplicaSet
-#metadata:
-#  name: example-data-replica-set
-#  namespace: default
-#  labels:
-#    foo: bar
-#spec:
-#  replicas: 2
-#  selector:
-#    matchLabels:
-#      foo: bar
-#  sourceDataPodRef:
-#    name: example-data-pod
-#    namespace: default
-#  template:
-#    metadata:
-#      labels:
-#        foo: bar
-#    spec:
-#      path: /sync-data
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataReplicaSet
+metadata:
+ name: example-data-replica-set
+ namespace: default
+ labels:
+   foo: bar
+spec:
+ replicas: 2
+ selector:
+   matchLabels:
+     foo: bar
+ sourceDataPodRef:
+   name: example-data-pod
+   namespace: default
+ template:
+   metadata:
+     labels:
+       foo: bar
+   spec:
+     path: /sync-data

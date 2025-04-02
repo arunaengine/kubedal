@@ -1,0 +1,86 @@
+# Example DataNode for S3
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataNode
+metadata:
+  name: example-s3-node
+  namespace: default
+  labels:
+    region: us-east
+spec:
+  backend: S3 # Currently only S3 and HTTP are supported
+  read_only: false
+  limit: 10G
+  # You can specify any valid OpenDAL configuration entries either:
+  # 1. Directly in the config field
+  # 2. As a key/values in the referenced Secret (for sensitive information)
+  secretRef:
+    name: s3-credentials
+    namespace: default
+  config:
+    bucket: my-bucket
+    endpoint: http://minio-service.default.svc.cluster.local:9000
+    region: us-east-1
+---
+# Example Secret with credentials
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: default
+type: Kubedal
+stringData:
+  access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
+  secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
+---
+# Example DataPod for S3
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataPod
+metadata:
+  name: example-data-pod
+spec:
+  path: /data
+  dataNodeRef:
+    name: example-s3-node
+    namespace: default
+  #dataNodeSelector:
+  #  region: eu-central
+---
+# Example PVC that references the resource
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: example-dataset-pvc
+  namespace: default
+  annotations:
+    kubedal.arunaengine.org/data-node-name: example-s3-node #TODO: Remove -> Use dataNodeRef in DataPod spec
+    kubedal.arunaengine.org/data-node-namespace: default    #TODO: Remove -> Use dataNodeRef in DataPod spec
+    kubedal.arunaengine.org/data-pod-name: example-data-pod
+    kubedal.arunaengine.org/data-pod-namespace: default
+    kubedal.arunaengine.org/mount: fuse-read-write
+spec:
+  accessModes:
+    - ReadWriteMany
+  storageClassName: kubedal
+  resources:
+    requests:
+      storage: 5Gi
+---
+# Example Pod that uses the PVC
+apiVersion: v1
+kind: Pod
+metadata:
+  name: example-consumer
+  namespace: default
+spec:
+  containers:
+    - name: app
+      image: alpine
+      command: ["sleep", "infinity"]
+      volumeMounts:
+        - name: dataset
+          mountPath: /data
+          readOnly: true
+  volumes:
+    - name: dataset
+      persistentVolumeClaim:
+        claimName: example-dataset-pvc

@@ -3,10 +3,22 @@ use std::{fs, io::Write, os::unix::fs::DirBuilderExt, path::Path};
 use fuse3::{MountOptions, path::Session, raw::MountHandle};
 use fuse3_opendal::Filesystem;
 use futures::TryStreamExt;
+use schemars::JsonSchema;
+use serde::{Deserialize, Serialize};
 use sys_mount::{Mount as SysMount, MountFlags, UnmountFlags, unmount};
 use tonic::Status;
 
-use crate::resource::crd::{AccessMode, MountMode};
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub enum MountMode {
+    Cached,
+    Fuse,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub enum AccessMode {
+    ReadOnly,
+    ReadWrite,
+}
 
 pub struct Mount {
     pub volume_id: String,

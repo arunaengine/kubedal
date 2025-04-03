@@ -1,77 +1,142 @@
+use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
+use std::fmt;
 
-/// Resource is our main custom resource
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub enum MountAccess {
+    CacheReadWrite,
+    CacheReadOnly,
+    FuseReadWrite,
+    FuseReadOnly,
+}
+
+impl fmt::Display for MountAccess {
+    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
+        match self {
+            MountAccess::CacheReadWrite => write!(f, "cache-read-write"),
+            MountAccess::CacheReadOnly => write!(f, "cache-read-only"),
+            MountAccess::FuseReadWrite => write!(f, "fuse-read-write"),
+            MountAccess::FuseReadOnly => write!(f, "fuse-read-only"),
+        }
+    }
+}
+
+/// Datanode is a custom resource for defining data location, it is similar to a K8s Node
+/// but for data sources. It can be used to define a data source and its access configuration.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
 #[kube(
     group = "kubedal.arunaengine.org",
     version = "v1alpha1",
-    kind = "Datasource",
-    shortname = "dsrc",
-    status = "DatasourceStatus",
+    kind = "DataNode",
+    shortname = "dn",
+    status = "DataNodeStatus",
     namespaced
 )]
-pub struct DatasourceSpec {
+pub struct DataNodeSpec {
     /// Storage backend scheme (s3, azblob, gcs, etc.)
     pub backend: Backend,
 
-    /// Access mode for the resource (default: Cached)
-    #[serde(default = "default_access_mode")]
-    pub access_mode: AccessMode,
+    /// Is the resource read-only
+    pub read_only: bool,
 
-    /// Mount mode for the resource
-    #[serde(default)]
-    pub mount: MountMode,
-
-    /// Credentials for accessing the backend
+    /// Secrets / credentials for accessing the backend
+    /// Tokens, keys, etc. can be stored in a Kubernetes secret
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub credentials: Option<Credentials>,
+    #[serde(rename = "secretRef")]
+    pub secret_ref: Option<Ref>,
 
     /// Additional config options for the backend
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, String>,
+
+    /// Maximum storage capacity
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub limit: Option<Quantity>,
 }
 
-/// Credentials configuration for accessing storage backends
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct Credentials {
-    /// Secret reference for credentials
-    #[serde(rename = "secretRef")]
-    pub secret_ref: SecretRef,
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct DataNodeStatus {
+    pub available: bool,
+    pub used: Quantity,
 }
 
-/// Reference to a Kubernetes secret
+#[derive(CustomResource, Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+#[kube(
+    group = "kubedal.arunaengine.org",
+    version = "v1alpha1",
+    kind = "DataPod",
+    shortname = "dp",
+    status = "DataPodStatus",
+    namespaced
+)]
+#[kube(derive = "PartialEq")]
+pub struct DataPodSpec {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    #[serde(rename = "dataNodeRef")]
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data_node_ref: Option<Ref>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "dataNodeSelector")]
+    pub data_node_selector: Option<BTreeMap<String, String>>,
+
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub request: Option<Quantity>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct DataPodStatus {
+    pub available: bool,
+    pub generated_path: bool,
+}
+
+#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
+#[kube(
+    group = "kubedal.arunaengine.org",
+    version = "v1alpha1",
+    kind = "DataReplicaSet",
+    shortname = "drs",
+    status = "DataReplicaSetStatus",
+    namespaced
+)]
+pub struct DataReplicaSetSpec {
+    pub replicas: u32,
+    pub selector: MatchLabels,
+    #[serde(rename = "sourceDataPodRef")]
+    pub source_pod: Ref,
+    pub template: DataReplicaSetSpecTemplate,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct SecretRef {
-    /// Name of the secret
+pub struct DataReplicaSetSpecTemplate {
+    pub metadata: LabelsMetadata,
+    pub spec: DataPodSpec,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
+pub struct LabelsMetadata {
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub labels: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct DataReplicaSetStatus {
+    pub available: bool,
+}
+
+/// Reference to a Kubernetes resource
+#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
+pub struct Ref {
+    /// Name of the resource
     pub name: String,
 
-    /// Namespace of the secret (optional, defaults to resource namespace)
+    /// Namespace of the resource (optional, defaults to resource namespace)
     #[serde(skip_serializing_if = "Option::is_none")]
     pub namespace: Option<String>,
-}
-
-/// Resource access mode
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "PascalCase")]
-pub enum AccessMode {
-    /// Read only access
-    ReadOnly,
-    /// Read and write access
-    ReadWrite,
-}
-
-/// Mount mode for the resource
-#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-#[serde(rename_all = "PascalCase")]
-pub enum MountMode {
-    /// Mount the resource as a cached local directory
-    #[default]
-    Cached,
-    /// Mount the resource via fuse
-    Fuse,
 }
 
 /// Resource access mode
@@ -85,64 +150,8 @@ pub enum Backend {
     HTTP,
 }
 
-/// Default access mode is Cached
-fn default_access_mode() -> AccessMode {
-    AccessMode::ReadOnly
-}
-
-/// Status of the Resource
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct DatasourceStatus {
-    pub bindings: Vec<Binding>,
-}
-
-/// Volume binding currently in use
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, Default)]
-pub struct Binding {
-    pub volume_id: String,
-}
-
-/// Reference to a datasource
-#[derive(Debug, Clone, Serialize, Deserialize, JsonSchema)]
-pub struct DataSourceRef {
-    pub name: String,
-    pub namespace: Option<String>,
-}
-
-/// Sync data from one datasource to another
-#[derive(CustomResource, Debug, Clone, Serialize, Deserialize, JsonSchema)]
-#[kube(
-    group = "kubedal.arunaengine.org",
-    version = "v1alpha1",
-    kind = "Sync",
-    shortname = "sy",
-    status = "SyncStatus",
-    namespaced
-)]
-pub struct SyncSpec {
-    /// Source datasource to sync from
-    pub source: DataSourceRef,
-
-    /// Destination datasource to sync to
-    pub destination: DataSourceRef,
-
-    /// Auto-clean up
-    #[serde(default)]
-    pub clean_up: bool,
-}
-
-#[derive(Default, Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub enum SyncPodStatus {
-    #[default]
-    Unknown,
-    Pending,
-    Running,
-    Completed,
-    Failed,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
-pub struct SyncStatus {
-    pub pod_name: String,
-    pub sync_status: SyncPodStatus,
+pub struct MatchLabels {
+    #[serde(rename = "matchLabels")]
+    pub labels: BTreeMap<String, String>,
 }

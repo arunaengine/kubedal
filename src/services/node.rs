@@ -5,8 +5,8 @@ use crate::csi::{
     NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
     NodeUnpublishVolumeResponse,
 };
-use crate::resource::crd::{AccessMode, Datasource, MountMode};
-use crate::util::mount_helper::Mount;
+use crate::resource::crd::{DataNode, DataPod, MountAccess};
+use crate::util::mount_helper::{AccessMode, Mount, MountMode};
 use crate::util::opendal::get_operator;
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
@@ -21,7 +21,8 @@ use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
 
 pub struct FullDataSource {
-    pub source: Datasource,
+    pub source: DataNode,
+    pub pod: DataPod,
     pub secret: Option<Secret>,
 }
 
@@ -103,9 +104,10 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
 
-        let full_data_source =
-            get_full_data_source(self.client.clone(), &request.volume_context).await?;
+        let (full_data_source, mount_access) =
+            get_full_data_mount(self.client.clone(), &request.volume_context).await?;
         let pod_info = get_pod_info(&request.volume_context)?;
+
         // Checks if the pods service account has access to the data source / secret
         check_access(self.client.clone(), &full_data_source, &pod_info).await?;
 
@@ -122,7 +124,9 @@ impl Node for NodeService {
             target_path
         );
 
-        let (operator, mount_mode, access_mode) = full_data_source.into_parts()?;
+        let (operator, mount_mode, access_mode) = full_data_source
+            .into_parts(self.client.clone(), mount_access)
+            .await?;
 
         let mut mount = Mount::new(
             volume_id.clone(),
@@ -227,42 +231,66 @@ fn get_pod_info(volume_context: &HashMap<String, String>) -> Result<PodInfo, Sta
     })
 }
 
-async fn get_full_data_source(
+async fn get_full_data_mount(
     client: Client,
     volume_context: &HashMap<String, String>,
-) -> Result<FullDataSource, Status> {
+) -> Result<(FullDataSource, MountAccess), Status> {
     // Get DataSource meta from volume context
-    let datasource_name = volume_context
-        .get("kubedal.arunaengine.org/datasource")
+    let data_node_name = volume_context
+        .get("kubedal.arunaengine.org/data-node-name")
         .cloned()
-        .ok_or_else(|| Status::invalid_argument("Resource name not provided"))?;
+        .ok_or_else(|| Status::invalid_argument("DataNode name not provided"))?;
 
-    let datasource_namespace = volume_context
-        .get("kubedal.arunaengine.org/namespace")
+    let data_node_namespace = volume_context
+        .get("kubedal.arunaengine.org/data-node-namespace")
         .cloned()
-        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?;
+        .ok_or_else(|| Status::invalid_argument("DataNode namespace not provided"))?;
 
-    let mount = volume_context
+    let data_pod_name = volume_context
+        .get("kubedal.arunaengine.org/data-pod-name")
+        .cloned()
+        .ok_or_else(|| Status::invalid_argument("DataNode name not provided"))?;
+
+    let data_pod_namespace = volume_context
+        .get("kubedal.arunaengine.org/data-pod-namespace")
+        .cloned()
+        .ok_or_else(|| Status::invalid_argument("DataNode namespace not provided"))?;
+
+    let mount_mode = match volume_context
         .get("kubedal.arunaengine.org/mount")
-        .cloned()
-        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?;
+        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?
+        .as_str()
+    {
+        "cache" => MountAccess::CacheReadOnly,
+        "cache-read-only" => MountAccess::CacheReadOnly,
+        "cache-read-write" => MountAccess::CacheReadWrite,
+        "fuse" => MountAccess::FuseReadOnly,
+        "fuse-read-only" => MountAccess::FuseReadOnly,
+        "fuse-read-write" => MountAccess::FuseReadWrite,
+        _ => return Err(Status::invalid_argument("Unsupported mount type")),
+    };
 
-    // Fetch DataSource if access review success
-    let res_api: Api<Datasource> = Api::namespaced(client.clone(), &datasource_namespace);
-    let mut res = res_api.get(&datasource_name).await.map_err(|e| {
-        tracing::error!("Error getting DataSource: {:?}", e);
-        Status::internal("Error getting DataSource")
+    // Fetch DataNode, DataPod, [optional] Secret
+    let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &data_node_namespace);
+    let data_node = data_node_api.get(&data_node_name).await.map_err(|e| {
+        tracing::error!("Error getting DataNode: {:?}", e);
+        Status::internal("Error getting DataNode")
     })?;
 
-    let secret = match res.spec.credentials.as_ref() {
+    let data_pod_api: Api<DataPod> = Api::namespaced(client.clone(), &data_pod_namespace);
+    let data_pod = data_pod_api.get(&data_pod_name).await.map_err(|e| {
+        tracing::error!("Error getting DataPod: {:?}", e);
+        Status::internal("Error getting DataPod")
+    })?;
+
+    let secret = match data_node.spec.secret_ref.as_ref() {
         None => None,
-        Some(cred) => {
-            let secret_name = &cred.secret_ref.name;
-            let secret_ns = cred
-                .secret_ref
+        Some(secret_ref) => {
+            let secret_name = &secret_ref.name;
+            let secret_ns = secret_ref
                 .namespace
                 .as_ref()
-                .or(res.metadata.namespace.as_ref())
+                .or(data_node.metadata.namespace.as_ref())
                 .ok_or_else(|| Status::invalid_argument("Secret namespace not provided"))?;
             let secret_api: Api<Secret> = Api::namespaced(client.clone(), secret_ns);
             let secret = secret_api
@@ -273,20 +301,14 @@ async fn get_full_data_source(
         }
     };
 
-    match mount.as_str() {
-        "cached" => {
-            res.spec.mount = MountMode::Cached;
-        }
-        "fuse" => {
-            res.spec.mount = MountMode::Fuse;
-        }
-        _ => {}
-    }
-
-    Ok(FullDataSource {
-        source: res,
-        secret,
-    })
+    Ok((
+        FullDataSource {
+            source: data_node,
+            pod: data_pod,
+            secret,
+        },
+        mount_mode,
+    ))
 }
 
 #[tracing::instrument(skip(client, full_data_source, pod_info))]
@@ -306,7 +328,7 @@ async fn check_access(
                         group: Some("kubedal.arunaengine.org".to_string()),
                         name: full_data_source.source.metadata.name.clone(),
                         namespace: full_data_source.source.metadata.namespace.clone(),
-                        resource: Some("datasources".to_string()),
+                        resource: Some("datanodes".to_string()),
                         verb: Some("get".to_string()),
                         ..Default::default()
                     }),
@@ -326,7 +348,7 @@ async fn check_access(
     if let Some(status) = response.status {
         if !status.allowed {
             return Err(Status::permission_denied(format!(
-                "system:serviceaccount:{}:{}, has unsufficient permission to GET datasource.kubedal.arunaengine.org {:?} in namespace {:?}",
+                "system:serviceaccount:{}:{}, has unsufficient permission to GET datanode.kubedal.arunaengine.org {:?} in namespace {:?}",
                 pod_info.namespace,
                 pod_info.service_account,
                 full_data_source
@@ -401,27 +423,18 @@ async fn check_access(
 }
 
 impl FullDataSource {
-    pub fn into_parts(self) -> Result<(Operator, MountMode, AccessMode), Status> {
-        let mut config = HashMap::from_iter(self.source.spec.config);
+    pub async fn into_parts(
+        self,
+        client: Client,
+        mount_mode: MountAccess,
+    ) -> Result<(Operator, MountMode, AccessMode), Status> {
+        let (mode, access) = match mount_mode {
+            MountAccess::CacheReadWrite => (MountMode::Cached, AccessMode::ReadWrite),
+            MountAccess::CacheReadOnly => (MountMode::Cached, AccessMode::ReadOnly),
+            MountAccess::FuseReadWrite => (MountMode::Fuse, AccessMode::ReadWrite),
+            MountAccess::FuseReadOnly => (MountMode::Fuse, AccessMode::ReadOnly),
+        };
 
-        if let Some(secret) = self.secret {
-            if let Some(data) = secret.data {
-                for (k, v) in data.into_iter() {
-                    config.insert(
-                        k,
-                        std::str::from_utf8(&v.0)
-                            .map_err(|e| {
-                                Status::internal(format!("Failed to deserialize secret: {}", e))
-                            })?
-                            .to_string(),
-                    );
-                }
-            }
-        }
-        Ok((
-            get_operator(self.source.spec.backend, config)?,
-            self.source.spec.mount,
-            self.source.spec.access_mode,
-        ))
+        Ok((get_operator(&client, &self.source).await?, mode, access))
     }
 }

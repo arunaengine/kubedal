@@ -1,34 +1,27 @@
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: datasources.kubedal.arunaengine.org
+  name: datanodes.kubedal.arunaengine.org
 spec:
   group: kubedal.arunaengine.org
   names:
     categories: []
-    kind: Datasource
-    plural: datasources
+    kind: DataNode
+    plural: datanodes
     shortNames:
-    - dsrc
-    singular: datasource
+    - dn
+    singular: datanode
   scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for DatasourceSpec via `CustomResource`
+        description: Auto-generated derived type for DataNodeSpec via `CustomResource`
         properties:
           spec:
-            description: Resource is our main custom resource
+            description: Datanode is a custom resource for defining data location, it is similar to a K8s Node but for data sources. It can be used to define a data source and its access configuration.
             properties:
-              access_mode:
-                default: ReadOnly
-                description: 'Access mode for the resource (default: Cached)'
-                enum:
-                - ReadOnly
-                - ReadWrite
-                type: string
               backend:
                 description: Storage backend scheme (s3, azblob, gcs, etc.)
                 enum:
@@ -40,56 +33,46 @@ spec:
                   type: string
                 description: Additional config options for the backend
                 type: object
-              credentials:
-                description: Credentials for accessing the backend
+              limit:
+                description: Maximum storage capacity
+                nullable: true
+                type: string
+              read_only:
+                description: Is the resource read-only
+                type: boolean
+              secretRef:
+                description: Secrets / credentials for accessing the backend Tokens, keys, etc. can be stored in a Kubernetes secret
                 nullable: true
                 properties:
-                  secretRef:
-                    description: Secret reference for credentials
-                    properties:
-                      name:
-                        description: Name of the secret
-                        type: string
-                      namespace:
-                        description: Namespace of the secret (optional, defaults to resource namespace)
-                        nullable: true
-                        type: string
-                    required:
-                    - name
-                    type: object
+                  name:
+                    description: Name of the resource
+                    type: string
+                  namespace:
+                    description: Namespace of the resource (optional, defaults to resource namespace)
+                    nullable: true
+                    type: string
                 required:
-                - secretRef
+                - name
                 type: object
-              mount:
-                default: Cached
-                description: Mount mode for the resource
-                enum:
-                - Cached
-                - Fuse
-                type: string
             required:
             - backend
+            - read_only
             type: object
           status:
-            description: Status of the Resource
             nullable: true
             properties:
-              bindings:
-                items:
-                  description: Volume binding currently in use
-                  properties:
-                    volume_id:
-                      type: string
-                  required:
-                  - volume_id
-                  type: object
-                type: array
+              available:
+                type: boolean
+              used:
+                description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                type: string
             required:
-            - bindings
+            - available
+            - used
             type: object
         required:
         - spec
-        title: Datasource
+        title: DataNode
         type: object
     served: true
     storage: true
@@ -100,77 +83,182 @@ spec:
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: syncs.kubedal.arunaengine.org
+  name: datapods.kubedal.arunaengine.org
 spec:
   group: kubedal.arunaengine.org
   names:
     categories: []
-    kind: Sync
-    plural: syncs
+    kind: DataPod
+    plural: datapods
     shortNames:
-    - sy
-    singular: sync
+    - dp
+    singular: datapod
   scope: Namespaced
   versions:
   - additionalPrinterColumns: []
     name: v1alpha1
     schema:
       openAPIV3Schema:
-        description: Auto-generated derived type for SyncSpec via `CustomResource`
+        description: Auto-generated derived type for DataPodSpec via `CustomResource`
         properties:
           spec:
-            description: Sync data from one datasource to another
             properties:
-              clean_up:
-                default: false
-                description: Auto-clean up
-                type: boolean
-              destination:
-                description: Destination datasource to sync to
+              dataNodeRef:
+                description: Reference to a Kubernetes resource
+                nullable: true
                 properties:
                   name:
+                    description: Name of the resource
                     type: string
                   namespace:
+                    description: Namespace of the resource (optional, defaults to resource namespace)
                     nullable: true
                     type: string
                 required:
                 - name
                 type: object
-              source:
-                description: Source datasource to sync from
-                properties:
-                  name:
-                    type: string
-                  namespace:
-                    nullable: true
-                    type: string
-                required:
-                - name
+              dataNodeSelector:
+                additionalProperties:
+                  type: string
+                nullable: true
                 type: object
-            required:
-            - destination
-            - source
+              path:
+                nullable: true
+                type: string
+              request:
+                description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                nullable: true
+                type: string
             type: object
           status:
             nullable: true
             properties:
-              pod_name:
-                type: string
-              sync_status:
-                enum:
-                - Unknown
-                - Pending
-                - Running
-                - Completed
-                - Failed
-                type: string
+              available:
+                type: boolean
+              generated_path:
+                type: boolean
             required:
-            - pod_name
-            - sync_status
+            - available
+            - generated_path
             type: object
         required:
         - spec
-        title: Sync
+        title: DataPod
+        type: object
+    served: true
+    storage: true
+    subresources:
+      status: {}
+
+---
+apiVersion: apiextensions.k8s.io/v1
+kind: CustomResourceDefinition
+metadata:
+  name: datareplicasets.kubedal.arunaengine.org
+spec:
+  group: kubedal.arunaengine.org
+  names:
+    categories: []
+    kind: DataReplicaSet
+    plural: datareplicasets
+    shortNames:
+    - drs
+    singular: datareplicaset
+  scope: Namespaced
+  versions:
+  - additionalPrinterColumns: []
+    name: v1alpha1
+    schema:
+      openAPIV3Schema:
+        description: Auto-generated derived type for DataReplicaSetSpec via `CustomResource`
+        properties:
+          spec:
+            properties:
+              replicas:
+                format: uint32
+                minimum: 0.0
+                type: integer
+              selector:
+                properties:
+                  matchLabels:
+                    additionalProperties:
+                      type: string
+                    type: object
+                required:
+                - matchLabels
+                type: object
+              sourceDataPodRef:
+                description: Reference to a Kubernetes resource
+                properties:
+                  name:
+                    description: Name of the resource
+                    type: string
+                  namespace:
+                    description: Namespace of the resource (optional, defaults to resource namespace)
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
+              template:
+                properties:
+                  metadata:
+                    properties:
+                      labels:
+                        additionalProperties:
+                          type: string
+                        type: object
+                    type: object
+                  spec:
+                    properties:
+                      dataNodeRef:
+                        description: Reference to a Kubernetes resource
+                        nullable: true
+                        properties:
+                          name:
+                            description: Name of the resource
+                            type: string
+                          namespace:
+                            description: Namespace of the resource (optional, defaults to resource namespace)
+                            nullable: true
+                            type: string
+                        required:
+                        - name
+                        type: object
+                      dataNodeSelector:
+                        additionalProperties:
+                          type: string
+                        nullable: true
+                        type: object
+                      path:
+                        nullable: true
+                        type: string
+                      request:
+                        description: "Quantity is a fixed-point representation of a number. It provides convenient marshaling/unmarshaling in JSON and YAML, in addition to String() and AsInt64() accessors.\n\nThe serialization format is:\n\n``` <quantity>        ::= <signedNumber><suffix>\n\n\t(Note that <suffix> may be empty, from the \"\" case in <decimalSI>.)\n\n<digit>           ::= 0 | 1 | ... | 9 <digits>          ::= <digit> | <digit><digits> <number>          ::= <digits> | <digits>.<digits> | <digits>. | .<digits> <sign>            ::= \"+\" | \"-\" <signedNumber>    ::= <number> | <sign><number> <suffix>          ::= <binarySI> | <decimalExponent> | <decimalSI> <binarySI>        ::= Ki | Mi | Gi | Ti | Pi | Ei\n\n\t(International System of units; See: http://physics.nist.gov/cuu/Units/binary.html)\n\n<decimalSI>       ::= m | \"\" | k | M | G | T | P | E\n\n\t(Note that 1024 = 1Ki but 1000 = 1k; I didn't choose the capitalization.)\n\n<decimalExponent> ::= \"e\" <signedNumber> | \"E\" <signedNumber> ```\n\nNo matter which of the three exponent forms is used, no quantity may represent a number greater than 2^63-1 in magnitude, nor may it have more than 3 decimal places. Numbers larger or more precise will be capped or rounded up. (E.g.: 0.1m will rounded up to 1m.) This may be extended in the future if we require larger or smaller quantities.\n\nWhen a Quantity is parsed from a string, it will remember the type of suffix it had, and will use the same type again when it is serialized.\n\nBefore serializing, Quantity will be put in \"canonical form\". This means that Exponent/suffix will be adjusted up or down (with a corresponding increase or decrease in Mantissa) such that:\n\n- No precision is lost - No fractional digits will be emitted - The exponent (or suffix) is as large as possible.\n\nThe sign will be omitted unless the number is negative.\n\nExamples:\n\n- 1.5 will be serialized as \"1500m\" - 1.5Gi will be serialized as \"1536Mi\"\n\nNote that the quantity will NEVER be internally represented by a floating point number. That is the whole point of this exercise.\n\nNon-canonical values will still parse as long as they are well formed, but will be re-emitted in their canonical form. (So always use canonical form, or don't diff.)\n\nThis format is intended to make it difficult to use these numbers without writing some sort of special handling code in the hopes that that will cause implementors to also use a fixed point implementation."
+                        nullable: true
+                        type: string
+                    type: object
+                required:
+                - metadata
+                - spec
+                type: object
+            required:
+            - replicas
+            - selector
+            - sourceDataPodRef
+            - template
+            type: object
+          status:
+            nullable: true
+            properties:
+              available:
+                type: boolean
+            required:
+            - available
+            type: object
+        required:
+        - spec
+        title: DataReplicaSet
         type: object
     served: true
     storage: true

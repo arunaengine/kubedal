@@ -20,7 +20,7 @@ tokio-stream = { version = "0.1.17", features = ["net"] }
 tonic = { version = "0.12.3", features = ["server"] }
 uuid = "1.16.0"
 tracing = "0.1.41"
-tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
+tracing-subscriber = { version = "0.3.20", features = ["env-filter", "fmt"] }
 schemars = "0.8.22"
 serde_yaml = "0.9.34"
 thiserror = "2.0.12"

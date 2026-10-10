@@ -310,10 +310,16 @@ the cache. The least recently used files are removed when the cache grows over
   with "no space left on device". Content that is not uploaded is never deleted.
 - A reader keeps the file it opened: the shared spool if the file was being
   written, or else the object version it saw (on backends with ETags). If that
-  object is replaced, further reads fail with ESTALE.
+  object is replaced, further reads fail with ESTALE. On backends without ETags
+  (for example HTTP), a reader can see a newer object under the same name.
+- A FUSE file that is written but not uploaded yet can be opened, read and
+  stat'ed, but it does not show up in directory listings.
 - Renaming a closed file on S3, GCS or Azure Blob copies the object and removes the
   old one. Renaming a folder there fails with EXDEV, so tools like `mv` copy the
   files instead.
+- `rename` with `RENAME_NOREPLACE` is supported (checked just before the rename,
+  not atomic against another program creating the same name). `RENAME_EXCHANGE`
+  is not supported.
 - Write-back uploads new and changed files (compared by size, modification time,
   change time and inode). For pods with `fsGroup`, kubelet changes the owner of
   all files, which changes their change time, so all files are uploaded again.

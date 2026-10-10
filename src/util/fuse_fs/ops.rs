@@ -125,12 +125,8 @@ impl PathFilesystem for Filesystem {
         });
 
         let file_path = match (path.map(Into::into), fh_path) {
-            (Some(a), Some(b)) => {
-                if a != b {
-                    Err(Errno::from(libc::EBADF))?;
-                }
-                Some(a)
-            }
+            // After a rename the path is the current name; it wins.
+            (Some(a), Some(_)) => Some(a),
             (a, b) => a.or(b),
         };
 

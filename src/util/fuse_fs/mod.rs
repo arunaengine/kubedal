@@ -391,21 +391,10 @@ impl Filesystem {
         key: FileKey,
         path: Option<&OsStr>,
     ) -> Result<sharded_slab::Entry<'_, OpenedFile>> {
-        let file = self
-            .opened_files
-            .get(key.0)
-            .ok_or(Errno::from(libc::ENOENT))?;
-
-        if matches!(path, Some(path) if path != file.path) {
-            tracing::trace!(
-                "get_opened_file: path not match: path={:?}, file={:?}",
-                path,
-                file.path
-            );
-            Err(Errno::from(libc::EBADF))?;
-        }
-
-        Ok(file)
+        // The file handle is authoritative. After a rename the kernel sends the
+        // new path with the old handle, which is fine.
+        let _ = path;
+        self.opened_files.get(key.0).ok_or(Errno::from(libc::EBADF))
     }
 }
 

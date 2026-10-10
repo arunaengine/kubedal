@@ -939,3 +939,23 @@ async fn failed_retirement_after_a_closed_file_rename_stops_the_old_destination(
     assert!(fs.release(req(), pb, wb, 0, 0, false).await.is_err());
     assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
 }
+
+#[tokio::test]
+async fn a_file_handle_keeps_working_after_its_file_is_renamed() {
+    let fs = fs_with("other", "").await;
+    let w = create(&fs, "a").await;
+    fs.write(req(), Some(OsStr::new("/a")), w, 0, b"one", 0, 0)
+        .await
+        .unwrap();
+    let root = OsStr::new("/");
+    fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await
+        .unwrap();
+    // The kernel now sends the new path together with the old handle.
+    let pb = Some(OsStr::new("/b"));
+    fs.write(req(), pb, w, 3, b" two", 0, 0).await.unwrap();
+    fs.fsync(req(), pb, w, false).await.unwrap();
+    fs.getattr(req(), pb, Some(w), 0).await.unwrap();
+    fs.release(req(), pb, w, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"one two");
+}

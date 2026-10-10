@@ -210,6 +210,13 @@ printf final > result.tmp
 mv result.tmp result.txt
 test ! -e result.tmp
 test "$(cat result.txt)" = final
+# A descriptor keeps working after its file is renamed.
+exec 7>moved.tmp
+printf one >&7
+mv moved.tmp moved.txt
+printf " two" >&7
+exec 7>&-
+test "$(cat moved.txt)" = "one two"
 # A reader that opens while a writer appends sees the new bytes.
 printf x > ra.txt
 exec 8>>ra.txt
@@ -227,6 +234,7 @@ expect_object results/fuse-ops/two.txt xAB
 expect_object results/fuse-ops/t.txt 12
 expect_object results/fuse-ops/result.txt final
 expect_object results/fuse-ops/ra.txt xA
+expect_object results/fuse-ops/moved.txt "one two"
 inline_pod fuse-ops-check "dataNode: store
 path: results/fuse-ops
 mount: cache-read-only" '

@@ -162,7 +162,17 @@ impl DataReplicaSet {
                     .push(create_replica_data_pod(index, self, &replica_data_node, &dp_api).await?);
             }
         }
-        if old_replicas_can_go(replicas.len(), drs_replicas) {
+        // The replacements count as synced once the sync pod runs with exactly
+        // the current replicas.
+        let members = members_hash(
+            &member_id(&source_data_pod, &pvc_name(self, &source_data_pod)),
+            replicas.iter().map(|dp| member_id(dp, &pvc_name(self, dp))),
+        );
+        let synced = pod_api
+            .get_opt(&sync_pod_name(self))
+            .await?
+            .is_some_and(|pod| sync_pod_is_running(&pod, &members));
+        if old_replicas_can_go(replicas.len(), drs_replicas, synced) {
             for dp in &on_read_only {
                 info!(
                     "Removing replica {} from a read-only DataNode",
@@ -217,8 +227,10 @@ impl DataReplicaSet {
         // Make sure the sync pod exists and mounts exactly the current PVCs.
         //TODO: Interval poll source mount for changes and sync to replica mounts
         let members = members_hash(
-            &member_id(&source_data_pod, &source_pvc),
-            replica_resources.iter().map(|(dp, pvc)| member_id(dp, pvc)),
+            &member_id(&source_data_pod, &source_pvc.name_any()),
+            replica_resources
+                .iter()
+                .map(|(dp, pvc)| member_id(dp, &pvc.name_any())),
         );
         let pod = match pod_api.get_opt(&sync_pod_name(self)).await? {
             Some(pod) if sync_pod_is_current(&pod, &members) => pod,
@@ -573,9 +585,16 @@ fn split_excess(
 }
 
 /// Replicas on read-only DataNodes are only removed once enough replacements
-/// exist, so the set never has fewer copies than before.
-fn old_replicas_can_go(healthy: usize, desired: usize) -> bool {
-    healthy >= desired
+/// exist and the sync pod runs with them, so the set never has fewer copies.
+/// With zero replicas wanted, nothing needs syncing.
+fn old_replicas_can_go(healthy: usize, desired: usize, synced: bool) -> bool {
+    healthy >= desired && (synced || desired == 0)
+}
+
+/// True if the sync pod runs and mounts exactly `members`.
+fn sync_pod_is_running(pod: &Pod, members: &str) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    phase == Some("Running") && sync_pod_is_current(pod, members)
 }
 
 /// Annotation on the sync pod with a hash of the PVCs it mounts.
@@ -655,7 +674,7 @@ fn source_node_ref(source: &DataPod, default_namespace: &str) -> Result<Ref, Err
 
 /// What a sync pod mount depends on: the DataPod object (UID), its DataNode, its
 /// path and the PVC. If any of these change, the sync pod must be recreated.
-fn member_id(data_pod: &DataPod, pvc: &PersistentVolumeClaim) -> String {
+fn member_id(data_pod: &DataPod, pvc_name: &str) -> String {
     let node = data_pod
         .spec
         .data_node_ref
@@ -667,7 +686,7 @@ fn member_id(data_pod: &DataPod, pvc: &PersistentVolumeClaim) -> String {
         data_pod.metadata.uid.clone().unwrap_or_default(),
         node,
         data_pod.spec.path.clone().unwrap_or_default(),
-        pvc.name_any()
+        pvc_name
     )
 }
 
@@ -835,8 +854,8 @@ mod tests {
             dp
         };
         // Same names, but the replica was deleted and created on another DataNode.
-        let before = member_id(&replica("uid-1", "node-a"), &pvc);
-        let after = member_id(&replica("uid-2", "node-b"), &pvc);
+        let before = member_id(&replica("uid-1", "node-a"), &pvc.name_any());
+        let after = member_id(&replica("uid-2", "node-b"), &pvc.name_any());
         assert_ne!(
             members_hash("src", [before].into_iter()),
             members_hash("src", [after].into_iter())
@@ -895,9 +914,11 @@ mod tests {
         assert_eq!(free_replica_indexes("u", &taken, 1), vec![0]);
         assert_eq!(free_replica_indexes("u", &taken, 2), vec![0, 2]);
         assert!(free_replica_indexes("u", &taken, 0).is_empty());
-        // Old replicas wait until replacements exist.
-        assert!(!old_replicas_can_go(1, 2));
-        assert!(old_replicas_can_go(2, 2));
+        // Old replicas wait until replacements exist and are synced.
+        assert!(!old_replicas_can_go(1, 2, true));
+        assert!(!old_replicas_can_go(2, 2, false));
+        assert!(old_replicas_can_go(2, 2, true));
+        assert!(old_replicas_can_go(0, 0, false));
     }
 
     #[test]

@@ -59,6 +59,7 @@ impl NodeService {
             .get(&name)
             .await
             .map_err(|e| kube_status(e, &format!("DataPod {namespace}/{name}")))?;
+        let path = data_pod_path(&data_pod)?;
         let node = match data_pod.spec.data_node_ref {
             Some(node_ref) => DataNodeRef {
                 namespace: node_ref.namespace.unwrap_or_else(|| namespace.clone()),
@@ -72,7 +73,7 @@ impl NodeService {
         };
         Ok(VolumeSource::Tree {
             node,
-            path: data_pod_path(&data_pod)?,
+            path,
             mode,
             writable,
         })
@@ -93,45 +94,6 @@ fn data_pod_path(data_pod: &DataPod) -> Result<String, Status> {
             })?;
             Ok(format!("/{uid}"))
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use crate::resource::crd::DataPodSpec;
-
-    fn data_pod(path: Option<&str>, uid: Option<&str>) -> DataPod {
-        let mut dp = DataPod::new(
-            "dp",
-            DataPodSpec {
-                path: path.map(str::to_string),
-                ..Default::default()
-            },
-        );
-        dp.metadata.uid = uid.map(str::to_string);
-        dp
-    }
-
-    #[test]
-    fn data_pod_without_path_uses_its_uid() {
-        assert_eq!(data_pod_path(&data_pod(None, Some("u1"))).unwrap(), "/u1");
-        assert_eq!(
-            data_pod_path(&data_pod(Some("/"), Some("u1"))).unwrap(),
-            "/u1"
-        );
-        assert_eq!(
-            data_pod_path(&data_pod(Some(""), Some("u1"))).unwrap(),
-            "/u1"
-        );
-        assert_eq!(
-            data_pod_path(&data_pod(Some("/data"), Some("u1"))).unwrap(),
-            "/data"
-        );
-        assert_eq!(
-            data_pod_path(&data_pod(None, None)).unwrap_err().code(),
-            tonic::Code::Unavailable
-        );
     }
 }
 
@@ -254,5 +216,44 @@ impl Node for NodeService {
         _request: Request<crate::csi::NodeGetVolumeStatsRequest>,
     ) -> Result<Response<crate::csi::NodeGetVolumeStatsResponse>, Status> {
         Err(Status::unimplemented("NodeGetVolumeStats is not supported"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::crd::DataPodSpec;
+
+    fn data_pod(path: Option<&str>, uid: Option<&str>) -> DataPod {
+        let mut dp = DataPod::new(
+            "dp",
+            DataPodSpec {
+                path: path.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        dp.metadata.uid = uid.map(str::to_string);
+        dp
+    }
+
+    #[test]
+    fn data_pod_without_path_uses_its_uid() {
+        assert_eq!(data_pod_path(&data_pod(None, Some("u1"))).unwrap(), "/u1");
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/"), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some(""), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/data"), Some("u1"))).unwrap(),
+            "/data"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(None, None)).unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 }

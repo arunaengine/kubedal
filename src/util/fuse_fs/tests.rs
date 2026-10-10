@@ -817,3 +817,24 @@ async fn callbacks_that_enter_after_shutdown_are_refused() {
     let err = write.await.unwrap().unwrap_err();
     assert_eq!(err, Errno::from(libc::ENOTCONN));
 }
+
+#[tokio::test]
+async fn rename_noreplace_does_not_treat_lookup_errors_as_absent() {
+    let fs = fs_with("a", "a").await;
+    // The lookup of the destination fails with something other than "not found".
+    fs.pause_points().fail_once("noreplace_lookup");
+    let root = OsStr::new("/");
+    let result = fs
+        .rename2(
+            req(),
+            root,
+            OsStr::new("a"),
+            root,
+            OsStr::new("b"),
+            libc::RENAME_NOREPLACE,
+        )
+        .await;
+    assert_eq!(result.unwrap_err(), Errno::from(libc::EACCES));
+    assert!(fs.op.exists("a").await.unwrap());
+    assert!(!fs.op.exists("b").await.unwrap());
+}

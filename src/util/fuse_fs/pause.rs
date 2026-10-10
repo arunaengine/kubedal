@@ -30,9 +30,11 @@ impl Pause {
 }
 
 /// Named pause points. Each armed point stops the next task that hits it once.
+/// Failure points make the next check at a named place report a failure once.
 #[derive(Default)]
 pub struct PausePoints {
     points: Mutex<HashMap<&'static str, Arc<Pause>>>,
+    failures: Mutex<Vec<&'static str>>,
 }
 
 impl PausePoints {
@@ -47,6 +49,26 @@ impl PausePoints {
             .unwrap_or_else(|p| p.into_inner())
             .insert(name, pause.clone());
         pause
+    }
+
+    /// Make the next [`PausePoints::should_fail`] for `name` return true.
+    pub fn fail_once(&self, name: &'static str) {
+        self.failures
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(name);
+    }
+
+    /// True once after [`PausePoints::fail_once`] armed `name`.
+    pub fn should_fail(&self, name: &'static str) -> bool {
+        let mut failures = self.failures.lock().unwrap_or_else(|p| p.into_inner());
+        match failures.iter().position(|f| *f == name) {
+            Some(i) => {
+                failures.remove(i);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Stop here if the point `name` is armed, until the test resumes it.

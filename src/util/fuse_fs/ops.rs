@@ -546,10 +546,19 @@ impl PathFilesystem for Filesystem {
                 // Checked before the rename; not atomic against a file created
                 // at the same moment by another program.
                 let path = PathBuf::from(parent).join(name);
-                if self.spool_size(path.as_os_str()).await.is_some()
-                    || self.stat_entry(&key_of(path.as_os_str())).await.is_ok()
-                {
+                if self.spool_size(path.as_os_str()).await.is_some() {
                     return Err(Errno::from(libc::EEXIST));
+                }
+                // Only "not found" means the name is free; other errors are real.
+                let lookup = if self.states.pause.should_fail("noreplace_lookup") {
+                    Err(opendal::Error::new(ErrorKind::PermissionDenied, "injected"))
+                } else {
+                    self.stat_entry(&key_of(path.as_os_str())).await
+                };
+                match lookup {
+                    Ok(_) => return Err(Errno::from(libc::EEXIST)),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(opendal_error2errno(err)),
                 }
             }
             // RENAME_EXCHANGE, RENAME_WHITEOUT and unknown flags.

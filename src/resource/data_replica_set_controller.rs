@@ -1,6 +1,6 @@
 use super::controller::{Context, Error};
 use crate::resource::crd::{DataNode, DataPod, MountAccess};
-use crate::resource::crd::{DataPodSpec, DataReplicaSet, Ref};
+use crate::resource::crd::{DataPodSpec, DataReplicaSet, DataReplicaSetStatus, Ref};
 use k8s_openapi::api::core::v1::{
     Container, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
@@ -8,7 +8,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{ListParams, PostParams};
+use kube::api::{ListParams, Patch, PatchParams, PostParams};
 use kube::{
     Resource,
     api::{Api, ResourceExt},
@@ -18,6 +18,7 @@ use kube::{
         finalizer::{Event as Finalizer, finalizer},
     },
 };
+use serde_json::json;
 use std::{sync::Arc, time::Duration};
 use tracing::*;
 
@@ -49,11 +50,6 @@ pub fn error_policy_drs(doc: Arc<DataReplicaSet>, error: &Error, _ctx: Arc<Conte
 impl DataReplicaSet {
     // Reconcile (for non-finalizer related changes)
     async fn reconcile(&self, ctx: Arc<Context>) -> Result<Action, Error> {
-        // If the status is already initialized, do nothing
-        if self.status.is_some() {
-            return Ok(Action::requeue(Duration::from_secs(30 * 60)));
-        }
-
         // Eval DataReplicaSet
         let client = ctx.client.clone();
         let drs_name = self.name_any();
@@ -77,12 +73,13 @@ impl DataReplicaSet {
             .await?;
 
         // Create source DataPod replicas with refs to other DataNodes
-        if drs_data_pods.items.len() == drs_replicas {
+        let existing = drs_data_pods.items.len();
+        if existing >= drs_replicas {
             //TODO: Check if metadata/spec has changed and patch if necessary (?)
-
-            // Everything is fine ... Check back in some minutes
+            //TODO: Scale down when there are more replicas than requested.
+            self.patch_status(&ctx, true).await?;
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
-        } else if drs_data_pods.items.len() < drs_replicas {
+        } else {
             let dn_api: Api<DataNode> = Api::namespaced(client.clone(), &drs_ns);
 
             // Fetch source DataPod and its DataNode
@@ -133,11 +130,23 @@ impl DataReplicaSet {
                 }
             }
 
+            if replica_resources.is_empty() {
+                // No other DataNode is free. Do not start a sync pod without replicas.
+                warn!(
+                    "DataReplicaSet {drs_name}: no DataNode available for {} more replicas",
+                    drs_replicas - existing
+                );
+                self.patch_status(&ctx, false).await?;
+                return Ok(Action::requeue(Duration::from_secs(5 * 60)));
+            }
+            let created = replica_resources.len();
+
+            // The sync pod only reads from the source.
             let source_pvc = create_replica_pvc(
                 &source_data_pod,
                 &source_data_node,
                 self,
-                MountAccess::FuseReadWrite,
+                MountAccess::FuseReadOnly,
                 &pvc_api,
             )
             .await?;
@@ -153,41 +162,31 @@ impl DataReplicaSet {
                 &pod_api,
             )
             .await?;
-            info!("Successfully created replica pod: {}", pod.name_any())
+            info!("Successfully created replica pod: {}", pod.name_any());
+            self.patch_status(&ctx, existing + created >= drs_replicas)
+                .await?;
         }
-
-        /* //TODO: DataReplicaSetStatus ?
-        trace!("Patching status for {}", name);
-        let ps = PatchParams::apply("cntrlr").force();
-        let _o = drs_api
-            .patch_status(&name, &ps, &new_status)
-            .await
-            .inspect_err(|e| error!("Failed to patch status: {:?}", e))
-            .map_err(Error::KubeError)?;
-
-        ctx.recorder
-            .publish(
-                &Event {
-                    type_: EventType::Normal,
-                    reason: "Initialized".into(),
-                    note: Some(format!("Init `{}`", self.name_any())),
-                    action: "Initialized".into(),
-                    secondary: None,
-                },
-                &self.object_ref(&()),
-            )
-            .await
-            .map_err(Error::KubeError)?;
-        */
 
         // Patch status and reschedule reconcile in 5 minutes
         Ok(Action::requeue(Duration::from_secs(5 * 60)))
     }
 
+    /// Record whether all requested replicas exist.
+    async fn patch_status(&self, ctx: &Context, available: bool) -> Result<(), Error> {
+        let ns = self
+            .namespace()
+            .ok_or_else(|| Error::ReconcilerError("DataReplicaSet has no namespace".into()))?;
+        let api: Api<DataReplicaSet> = Api::namespaced(ctx.client.clone(), &ns);
+        let patch = Patch::Merge(json!({ "status": DataReplicaSetStatus { available } }));
+        api.patch_status(&self.name_any(), &PatchParams::default(), &patch)
+            .await?;
+        Ok(())
+    }
+
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)
     async fn cleanup(&self, ctx: Arc<Context>) -> Result<Action, Error> {
-        //TODO: Delete all pods spawned from this replica set -> spec.selector
-        // ... or does ownerRef its magic?
+        // DataPods, PVCs and the sync pod carry an owner reference to this
+        // DataReplicaSet, so Kubernetes garbage collection deletes them.
 
         let oref = self.object_ref(&());
         ctx.recorder
@@ -233,6 +232,9 @@ async fn create_replica_data_pod(
             name: Some(format!("{}-replica-{}", drs_uid, index)),
             namespace: Some(drs_ns.clone()),
             owner_references: Some(vec![drs_owner.clone()]),
+            // Without the template labels the selector never counts the replicas,
+            // and every reconcile would create new ones.
+            labels: Some(data_replica_set.spec.template.metadata.labels.clone()),
             ..Default::default()
         },
         spec: DataPodSpec {
@@ -242,7 +244,7 @@ async fn create_replica_data_pod(
                 namespace: data_node.namespace(),
             }),
             data_node_selector: None,
-            request: None, //TODO: ...
+            request: data_replica_set.spec.template.spec.request.clone(),
         },
         status: None,
     };
@@ -355,7 +357,7 @@ async fn create_replica_pod(
     // Add source volume
     let src_pvcsc = PersistentVolumeClaimVolumeSource {
         claim_name: source_pvc.name_any(),
-        read_only: Some(false),
+        read_only: Some(true),
     };
     let mut volumes: Vec<Volume> = vec![Volume {
         name: "source".to_string(),

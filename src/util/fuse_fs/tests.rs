@@ -980,3 +980,17 @@ async fn path_truncate_and_a_writable_open_do_not_interleave() {
     // The open loaded the truncated (empty) object, so no old tail comes back.
     assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"X");
 }
+
+#[tokio::test]
+async fn mkdir_and_rmdir_are_refused_after_shutdown() {
+    let fs = fs_with("dir/a", "a").await;
+    fs.workers().shutdown().await;
+    let root = OsStr::new("/");
+    let err = fs
+        .mkdir(req(), root, OsStr::new("new"), 0o755, 0)
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOTCONN));
+    let err = fs.rmdir(req(), root, OsStr::new("dir")).await.unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOTCONN));
+}

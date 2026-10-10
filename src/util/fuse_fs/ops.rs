@@ -166,6 +166,8 @@ impl PathFilesystem for Filesystem {
         mode: u32,
         _umask: u32,
     ) -> Result<ReplyEntry> {
+        let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("mkdir(parent={parent:?}, name={name:?}, mode=0o{mode:o})");
 
         let mut path = PathBuf::from(parent).join(name);
@@ -198,6 +200,8 @@ impl PathFilesystem for Filesystem {
     }
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("rmdir(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);

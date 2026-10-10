@@ -131,9 +131,16 @@ impl DataReplicaSet {
 
         // A read-only DataNode cannot hold a replica. Such replicas do not count;
         // replacements are created first, and the old ones go only after that.
-        let (on_read_only, mut replicas): (Vec<DataPod>, Vec<DataPod>) = ours
+        let (on_read_only, healthy): (Vec<DataPod>, Vec<DataPod>) = ours
             .into_iter()
             .partition(|dp| on_read_only_node(dp, &all_nodes, &drs_ns));
+        // Scale down: replicas above the desired count go, the highest index first.
+        let (mut replicas, excess) = split_excess(&drs_uid, healthy, drs_replicas);
+        for dp in &excess {
+            info!("Removing replica {} above the desired count", dp.name_any());
+            delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
+            delete_if_present(&dp_api, &dp.name_any()).await?;
+        }
         let need = drs_replicas.saturating_sub(replicas.len());
         if need > 0 {
             let used: Vec<String> = replicas
@@ -171,9 +178,10 @@ impl DataReplicaSet {
         }
         replicas.sort_by_key(|dp| dp.name_any());
         if replicas.is_empty() {
-            // No replica: no sync pod either, also not an old one.
+            // No replica: no sync pod either, also not an old one. With zero
+            // replicas wanted, that is the desired state.
             delete_if_present(&pod_api, &sync_pod_name(self)).await?;
-            self.patch_status(&ctx, false).await?;
+            self.patch_status(&ctx, drs_replicas == 0).await?;
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
         }
 
@@ -546,6 +554,24 @@ fn free_replica_indexes(drs_uid: &str, taken: &[String], count: usize) -> Vec<us
         .collect()
 }
 
+/// Index of a replica DataPod of this set, from its name.
+fn replica_index(drs_uid: &str, name: &str) -> Option<usize> {
+    name.strip_prefix(&format!("{drs_uid}-replica-"))?
+        .parse()
+        .ok()
+}
+
+/// Keep the `desired` replicas with the lowest indexes; return them and the rest.
+fn split_excess(
+    drs_uid: &str,
+    mut replicas: Vec<DataPod>,
+    desired: usize,
+) -> (Vec<DataPod>, Vec<DataPod>) {
+    replicas.sort_by_key(|dp| replica_index(drs_uid, &dp.name_any()).unwrap_or(usize::MAX));
+    let excess = replicas.split_off(desired.min(replicas.len()));
+    (replicas, excess)
+}
+
 /// Replicas on read-only DataNodes are only removed once enough replacements
 /// exist, so the set never has fewer copies than before.
 fn old_replicas_can_go(healthy: usize, desired: usize) -> bool {
@@ -694,6 +720,22 @@ mod tests {
                 .unwrap();
             assert!(verbs.contains("\"delete\""), "{resource}: {verbs}");
         }
+    }
+
+    #[test]
+    fn scaling_down_removes_the_highest_replicas() {
+        let dp = |name: &str| DataPod::new(name, DataPodSpec::default());
+        let all = || vec![dp("u-replica-2"), dp("u-replica-0"), dp("u-replica-10")];
+        let names = |v: &[DataPod]| v.iter().map(|d| d.name_any()).collect::<Vec<_>>();
+        let (keep, excess) = split_excess("u", all(), 1);
+        assert_eq!(names(&keep), vec!["u-replica-0"]);
+        assert_eq!(names(&excess), vec!["u-replica-2", "u-replica-10"]);
+        let (keep, excess) = split_excess("u", all(), 0);
+        assert!(keep.is_empty());
+        assert_eq!(excess.len(), 3);
+        let (keep, excess) = split_excess("u", all(), 5);
+        assert_eq!(keep.len(), 3);
+        assert!(excess.is_empty());
     }
 
     #[test]

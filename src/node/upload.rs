@@ -8,10 +8,11 @@ use crate::util::error::{io_status, opendal_status};
 use bytes::Bytes;
 use futures::TryStreamExt;
 use opendal::Operator;
+use rustix::fs::{AtFlags, CWD, Dir, FileType, Mode, OFlags, openat, statat};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeMap;
-use std::os::unix::fs::MetadataExt;
-use std::path::{Path, PathBuf};
+use std::os::fd::{AsFd, OwnedFd};
+use std::path::Path;
 use std::time::Duration;
 use tokio::io::AsyncReadExt;
 use tonic::Status;
@@ -32,45 +33,111 @@ pub struct FileStamp {
 /// The state of a volume right after it was prepared, used to find changed files.
 pub type Baseline = BTreeMap<String, FileStamp>;
 
+fn open_dir_at<Fd: AsFd>(dir: Fd, name: &str) -> std::io::Result<OwnedFd> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC;
+    Ok(openat(dir, name, flags, Mode::empty())?)
+}
+
+/// Open the folder `folder` inside `volume` without following any symlink in
+/// `folder`. `volume` itself is a directory created by kubedal.
+/// Returns `None` if the folder does not exist.
+pub fn open_upload_root(volume: &Path, folder: &str) -> Result<Option<OwnedFd>, Status> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let mut dir = match openat(CWD, volume, flags, Mode::empty()) {
+        Ok(fd) => fd,
+        Err(rustix::io::Errno::NOENT) => return Ok(None),
+        Err(err) => return Err(io_status(err.into(), "open volume folder")),
+    };
+    if !folder.trim_matches('/').is_empty() {
+        let folder = paths::safe_relative(folder).map_err(|e| {
+            Status::invalid_argument(format!("invalid upload folder {folder:?}: {e}"))
+        })?;
+        for part in folder.split('/') {
+            dir = match open_dir_at(&dir, part) {
+                Ok(fd) => fd,
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+                Err(_) => {
+                    return Err(Status::permission_denied(format!(
+                        "upload folder {folder:?} is not a plain folder (a symlink or a file)"
+                    )));
+                }
+            };
+        }
+    }
+    Ok(Some(dir))
+}
+
 /// Walk a directory without following symlinks.
 /// Returns regular files and directories with their stamps.
 pub fn snapshot(root: &Path) -> std::io::Result<Baseline> {
+    let flags = OFlags::RDONLY | OFlags::DIRECTORY | OFlags::CLOEXEC;
+    let fd = openat(CWD, root, flags, Mode::empty())?;
+    snapshot_fd(&fd)
+}
+
+/// Like [`snapshot`], on an open directory. Every entry is opened relative to its
+/// parent with `O_NOFOLLOW`, so a symlink can never lead out of the tree.
+pub fn snapshot_fd(root: &OwnedFd) -> std::io::Result<Baseline> {
     let mut out = Baseline::new();
-    let mut stack = vec![(root.to_path_buf(), String::new())];
+    let mut stack = vec![(root.try_clone()?, String::new())];
     while let Some((dir, prefix)) = stack.pop() {
-        for entry in std::fs::read_dir(&dir)? {
+        for entry in Dir::read_from(&dir)? {
             let entry = entry?;
-            let Some(name) = entry.file_name().to_str().map(str::to_string) else {
-                tracing::warn!("skipping file with a non UTF-8 name in {dir:?}");
+            let name_bytes = entry.file_name().to_bytes();
+            if name_bytes == b"." || name_bytes == b".." {
+                continue;
+            }
+            let Ok(name) = std::str::from_utf8(name_bytes).map(str::to_string) else {
+                tracing::warn!("skipping file with a non UTF-8 name in {prefix:?}");
                 continue;
             };
             let relative = format!("{prefix}{name}");
-            let file_type = entry.file_type()?;
-            if file_type.is_dir() {
-                out.insert(
-                    relative.clone(),
-                    FileStamp {
-                        size: 0,
-                        mtime_ns: 0,
-                        dir: true,
-                    },
-                );
-                stack.push((entry.path(), format!("{relative}/")));
-            } else if file_type.is_file() {
-                let meta = entry.metadata()?;
-                out.insert(
-                    relative,
-                    FileStamp {
-                        size: meta.len(),
-                        mtime_ns: i128::from(meta.mtime()) * 1_000_000_000
-                            + i128::from(meta.mtime_nsec()),
-                        dir: false,
-                    },
-                );
+            let stat = statat(&dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
+            match FileType::from_raw_mode(stat.st_mode) {
+                FileType::Directory => {
+                    out.insert(
+                        relative.clone(),
+                        FileStamp {
+                            size: 0,
+                            mtime_ns: 0,
+                            dir: true,
+                        },
+                    );
+                    let child = open_dir_at(&dir, &name)?;
+                    stack.push((child, format!("{relative}/")));
+                }
+                FileType::RegularFile => {
+                    out.insert(
+                        relative,
+                        FileStamp {
+                            size: stat.st_size as u64,
+                            mtime_ns: i128::from(stat.st_mtime) * 1_000_000_000
+                                + i128::from(stat.st_mtime_nsec),
+                            dir: false,
+                        },
+                    );
+                }
+                _ => {}
             }
         }
     }
     Ok(out)
+}
+
+/// Open a regular file below `root` without following symlinks.
+fn open_file_in(root: &OwnedFd, relative: &str) -> std::io::Result<std::fs::File> {
+    let mut parts: Vec<&str> = relative.split('/').collect();
+    let name = parts.pop().unwrap_or_default();
+    let mut dir = root.try_clone()?;
+    for part in parts {
+        dir = open_dir_at(&dir, part)?;
+    }
+    let flags = OFlags::RDONLY | OFlags::NOFOLLOW | OFlags::CLOEXEC | OFlags::NONBLOCK;
+    let fd = openat(&dir, name, flags, Mode::empty())?;
+    if FileType::from_raw_mode(rustix::fs::fstat(&fd)?.st_mode) != FileType::RegularFile {
+        return Err(std::io::Error::other("not a regular file"));
+    }
+    Ok(std::fs::File::from(fd))
 }
 
 pub fn save_baseline(path: &Path, baseline: &Baseline) -> Result<(), Status> {
@@ -113,24 +180,26 @@ pub struct UploadReport {
     pub skipped: usize,
 }
 
-/// Upload everything below `local` to `prefix` in the operator.
+/// Upload everything below `folder` in `volume` to `prefix` in the operator.
 ///
 /// With a baseline, files with the same size and modification time as in the
 /// baseline are skipped. Empty directories are created as directory objects.
 /// Files that were deleted locally are not deleted in storage.
 pub async fn upload_tree(
     op: &Operator,
-    local: &Path,
+    volume: &Path,
+    folder: &str,
     prefix: &str,
     baseline: Option<&Baseline>,
     retry: RetryPolicy,
 ) -> Result<UploadReport, Status> {
     let mut report = UploadReport::default();
-    if !local.is_dir() {
+    let Some(root) = open_upload_root(volume, folder)? else {
         return Ok(report);
-    }
-    let root = local.to_path_buf();
-    let current = tokio::task::spawn_blocking(move || snapshot(&root))
+    };
+    let root = std::sync::Arc::new(root);
+    let walk_root = root.clone();
+    let current = tokio::task::spawn_blocking(move || snapshot_fd(&walk_root))
         .await
         .map_err(|e| Status::internal(format!("walk task failed: {e}")))?
         .map_err(|e| io_status(e, "walk volume content"))?;
@@ -161,8 +230,12 @@ pub async fn upload_tree(
             }
             continue;
         }
-        let path: PathBuf = local.join(relative);
-        let bytes = with_retry(retry, &key, || upload_file(op, &path, &key)).await?;
+        let bytes = with_retry(retry, &key, || async {
+            let file = open_file_in(&root, relative)
+                .map_err(|e| io_status(e, &format!("open {relative}")))?;
+            upload_file(op, tokio::fs::File::from_std(file), relative, &key).await
+        })
+        .await?;
         report.files += 1;
         report.bytes += bytes;
     }
@@ -193,11 +266,14 @@ where
     }
 }
 
-/// Stream one local file to object storage. Returns the number of bytes.
-pub async fn upload_file(op: &Operator, path: &Path, key: &str) -> Result<u64, Status> {
-    let mut file = tokio::fs::File::open(path)
-        .await
-        .map_err(|e| io_status(e, &format!("open {}", path.display())))?;
+/// Stream one open local file to object storage. Returns the number of bytes.
+/// `name` is only used in error messages.
+pub async fn upload_file(
+    op: &Operator,
+    mut file: tokio::fs::File,
+    name: &str,
+    key: &str,
+) -> Result<u64, Status> {
     let mut writer = op
         .writer_with(key)
         .chunk(CHUNK_SIZE)
@@ -212,7 +288,7 @@ pub async fn upload_file(op: &Operator, path: &Path, key: &str) -> Result<u64, S
                 .take(CHUNK_SIZE as u64)
                 .read_to_end(&mut buf)
                 .await
-                .map_err(|e| io_status(e, &format!("read {}", path.display())))?;
+                .map_err(|e| io_status(e, &format!("read {name}")))?;
             if n == 0 {
                 return Ok(());
             }
@@ -249,15 +325,6 @@ pub async fn list_keys(op: &Operator, prefix: &str) -> Result<Vec<String>, Statu
         .map_err(|e| opendal_status(e, "list"))?;
     keys.sort();
     Ok(keys)
-}
-
-/// Check that a folder inside a volume is a safe relative path ("" is the whole volume).
-pub fn local_folder(volume: &Path, folder: &str) -> Result<PathBuf, Status> {
-    if folder.trim_matches('/').is_empty() {
-        return Ok(volume.to_path_buf());
-    }
-    paths::join_safe(volume, folder)
-        .map_err(|e| Status::invalid_argument(format!("invalid upload folder {folder:?}: {e}")))
 }
 
 #[cfg(test)]
@@ -297,7 +364,7 @@ mod tests {
         write(&dir.path().join("sub/b.txt"), "bb");
         std::fs::create_dir_all(dir.path().join("empty")).unwrap();
         let op = Operator::new(Memory::default()).unwrap();
-        let report = upload_tree(&op, dir.path(), "out/", None, fast())
+        let report = upload_tree(&op, dir.path(), "", "out/", None, fast())
             .await
             .unwrap();
         assert_eq!(report.files, 2);
@@ -319,7 +386,7 @@ mod tests {
         write(&dir.path().join("changed.txt"), "newer");
         write(&dir.path().join("new.txt"), "n");
         let op = Operator::new(Memory::default()).unwrap();
-        let report = upload_tree(&op, dir.path(), "", Some(&baseline), fast())
+        let report = upload_tree(&op, dir.path(), "", "", Some(&baseline), fast())
             .await
             .unwrap();
         assert_eq!(report.files, 2);
@@ -335,9 +402,10 @@ mod tests {
         let big = vec![7u8; CHUNK_SIZE + 123];
         std::fs::write(dir.path().join("big.bin"), &big).unwrap();
         let op = Operator::new(Memory::default()).unwrap();
-        let n = upload_file(&op, &dir.path().join("big.bin"), "big.bin")
+        let file = tokio::fs::File::open(dir.path().join("big.bin"))
             .await
             .unwrap();
+        let n = upload_file(&op, file, "big.bin", "big.bin").await.unwrap();
         assert_eq!(n, big.len() as u64);
         assert_eq!(op.read("big.bin").await.unwrap().to_vec(), big);
     }
@@ -354,10 +422,55 @@ mod tests {
     }
 
     #[test]
-    fn local_folder_stays_in_volume() {
-        let vol = Path::new("/v");
-        assert_eq!(local_folder(vol, "").unwrap(), PathBuf::from("/v"));
-        assert_eq!(local_folder(vol, "out/").unwrap(), PathBuf::from("/v/out"));
-        assert!(local_folder(vol, "../x").is_err());
+    fn upload_root_stays_in_volume() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(dir.path().join("out")).unwrap();
+        assert!(open_upload_root(dir.path(), "").unwrap().is_some());
+        assert!(open_upload_root(dir.path(), "out/").unwrap().is_some());
+        assert!(open_upload_root(dir.path(), "missing").unwrap().is_none());
+        assert!(open_upload_root(dir.path(), "../x").is_err());
+    }
+
+    #[tokio::test]
+    async fn symlinked_upload_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        write(&secret.path().join("token"), "secret");
+        std::os::unix::fs::symlink(secret.path(), dir.path().join("out")).unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let err = upload_tree(&op, dir.path(), "out", "", None, fast())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(list_keys(&op, "").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn symlinked_parent_of_upload_root_is_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        write(&secret.path().join("out/token"), "secret");
+        std::os::unix::fs::symlink(secret.path(), dir.path().join("work")).unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let err = upload_tree(&op, dir.path(), "work/out", "", None, fast())
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::PermissionDenied);
+        assert!(list_keys(&op, "").await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn symlinks_inside_the_tree_are_not_uploaded() {
+        let dir = tempfile::tempdir().unwrap();
+        let secret = tempfile::tempdir().unwrap();
+        write(&secret.path().join("token"), "secret");
+        write(&dir.path().join("a.txt"), "a");
+        std::os::unix::fs::symlink(secret.path(), dir.path().join("linkdir")).unwrap();
+        std::os::unix::fs::symlink(secret.path().join("token"), dir.path().join("link")).unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        upload_tree(&op, dir.path(), "", "", None, fast())
+            .await
+            .unwrap();
+        assert_eq!(list_keys(&op, "").await.unwrap(), vec!["a.txt"]);
     }
 }

@@ -36,6 +36,7 @@ schemars = "1.2"
 serde_yaml = "0.9.34"
 thiserror = "2.0.12"
 sha2 = "0.10"
+rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"

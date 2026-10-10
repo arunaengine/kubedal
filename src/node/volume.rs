@@ -454,13 +454,20 @@ impl VolumeManager {
         let resolved = self.cluster.resolve(&plan.data_node, &record.pod).await?;
         resolved.require_writable()?;
         let op = resolved.operator("")?;
-        let local = upload::local_folder(&self.data_dir(id), &plan.local_path)?;
         let baseline = if plan.only_changed {
             upload::load_baseline(&self.baseline_path(id))?
         } else {
             None
         };
-        upload::upload_tree(&op, &local, &plan.prefix, baseline.as_ref(), self.retry).await
+        upload::upload_tree(
+            &op,
+            &self.data_dir(id),
+            &plan.local_path,
+            &plan.prefix,
+            baseline.as_ref(),
+            self.retry,
+        )
+        .await
     }
 }
 

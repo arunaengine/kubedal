@@ -77,6 +77,26 @@ impl DataReplicaSet {
         let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
 
         // Fetch source DataPod and its DataNode
+        // The node plugin only mounts DataPods of the pod's own namespace, so the
+        // source must be in the namespace of the set.
+        if let Some(message) = source_namespace_error(&drs_ns, &self.spec.source_pod) {
+            warn!("DataReplicaSet {drs_name}: {message}");
+            ctx.recorder
+                .publish(
+                    &Event {
+                        type_: EventType::Warning,
+                        reason: "InvalidSource".into(),
+                        note: Some(message),
+                        action: "Reconcile".into(),
+                        secondary: None,
+                    },
+                    &self.object_ref(&()),
+                )
+                .await
+                .map_err(Error::KubeError)?;
+            self.patch_status(&ctx, false).await?;
+            return Ok(Action::requeue(Duration::from_secs(5 * 60)));
+        }
         let source_data_pod = dp_api.get(&self.spec.source_pod.name).await?;
         // The DataPod reference names the DataNode, also in another namespace
         // (where no owner reference exists).
@@ -569,6 +589,18 @@ fn on_read_only_node(replica: &DataPod, nodes: &[DataNode], ns: &str) -> bool {
     })
 }
 
+/// An error message if the source DataPod reference points to another namespace.
+fn source_namespace_error(drs_namespace: &str, source: &Ref) -> Option<String> {
+    match source.namespace.as_deref() {
+        Some(ns) if !ns.is_empty() && ns != drs_namespace => Some(format!(
+            "sourceDataPodRef {ns}/{} must be in namespace {drs_namespace}, \
+             the namespace of the DataReplicaSet",
+            source.name
+        )),
+        _ => None,
+    }
+}
+
 /// The DataNode of the source DataPod, with its namespace filled in.
 fn source_node_ref(source: &DataPod, default_namespace: &str) -> Result<Ref, Error> {
     let node_ref = source.spec.data_node_ref.as_ref().ok_or_else(|| {
@@ -691,6 +723,25 @@ mod tests {
         assert!(on_read_only_node(&replica("ro"), &nodes, "team"));
         assert!(!on_read_only_node(&replica("rw"), &nodes, "team"));
         assert!(!on_read_only_node(&replica("missing"), &nodes, "team"));
+    }
+
+    #[test]
+    fn source_data_pod_must_be_in_the_same_namespace() {
+        let local = Ref {
+            name: "src".into(),
+            namespace: None,
+        };
+        assert!(source_namespace_error("team", &local).is_none());
+        let same = Ref {
+            name: "src".into(),
+            namespace: Some("team".into()),
+        };
+        assert!(source_namespace_error("team", &same).is_none());
+        let other = Ref {
+            name: "src".into(),
+            namespace: Some("other".into()),
+        };
+        assert!(source_namespace_error("team", &other).is_some());
     }
 
     #[test]

@@ -178,6 +178,7 @@ log "FUSE file system behaviour with a kernel mount"
 inline_pod fuse-ops "dataNode: store
 path: results/fuse-ops
 mount: fuse-read-write" '
+set -x
 cd /vol
 # Two handles append to the same file.
 printf x > two.txt

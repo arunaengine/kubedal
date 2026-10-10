@@ -76,6 +76,24 @@ impl DataReplicaSet {
         let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &drs_ns);
         let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
 
+        // Zero replicas need no source at all: remove every replica and the sync
+        // pod, even if the source is gone or invalid.
+        if drs_replicas == 0 {
+            let uid = self.metadata.uid.clone().unwrap_or_default();
+            let prefix = format!("{uid}-replica-");
+            for dp in drs_data_pods
+                .items
+                .iter()
+                .filter(|dp| dp.name_any().starts_with(&prefix))
+            {
+                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
+                delete_if_present(&dp_api, &dp.name_any()).await?;
+            }
+            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
+            self.patch_status(&ctx, true).await?;
+            return Ok(Action::requeue(Duration::from_secs(5 * 60)));
+        }
+
         // Fetch source DataPod and its DataNode
         // The node plugin only mounts DataPods of the pod's own namespace, so the
         // source must be in the namespace of the set.

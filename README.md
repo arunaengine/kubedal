@@ -303,8 +303,17 @@ the cache. The least recently used files are removed when the cache grows over
   and rename see the spool content. The whole file is uploaded on every `close`
   and `fsync`, and upload errors are returned there. If the upload keeps failing,
   the spool file stays on the node and is uploaded before the next mount or on
-  unpublish (also after a restart of the driver). Every upload sends the whole
-  file, so use `cache-read-write` for programs that write a lot.
+  unpublish (also after a restart of the driver), but only to the same DataNode
+  object it was written for. Every upload sends the whole file, so use
+  `cache-read-write` for programs that write a lot.
+- Spool files on a node may use at most `node.fuseSpoolSize`. Writes past it fail
+  with "no space left on device". Content that is not uploaded is never deleted.
+- A reader keeps the file it opened: the shared spool if the file was being
+  written, or else the object version it saw (on backends with ETags). If that
+  object is replaced, further reads fail with ESTALE.
+- Renaming a closed file on S3, GCS or Azure Blob copies the object and removes the
+  old one. Renaming a folder there fails with EXDEV, so tools like `mv` copy the
+  files instead.
 - Write-back uploads new and changed files (compared by size, modification time,
   change time and inode). For pods with `fsGroup`, kubelet changes the owner of
   all files, which changes their change time, so all files are uploaded again.

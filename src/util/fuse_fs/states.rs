@@ -199,6 +199,8 @@ pub struct StateData {
     complete: bool,
     /// Bytes charged to the budget for this spool file.
     charged: u64,
+    /// The spool data file was removed from disk.
+    data_removed: bool,
     budget: Arc<SpoolBudget>,
 }
 
@@ -332,10 +334,16 @@ impl StateData {
     /// readable for handles that still hold the state.
     fn remove_files(&mut self) {
         for path in [&self.data_path, &self.meta_path] {
-            if let Err(err) = std::fs::remove_file(path)
-                && err.kind() != std::io::ErrorKind::NotFound
-            {
-                tracing::warn!("cannot remove {path:?}: {err}");
+            match std::fs::remove_file(path) {
+                Ok(()) => {}
+                Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+                Err(err) => {
+                    tracing::warn!("cannot remove {path:?}: {err}");
+                    continue;
+                }
+            }
+            if path == &self.data_path {
+                self.data_removed = true;
             }
         }
         self.complete = false;
@@ -347,7 +355,12 @@ impl Drop for StateData {
     /// drops the state, because an unlinked file keeps its disk space while it
     /// is open. Only then the space goes back to the budget.
     fn drop(&mut self) {
-        self.budget.release(self.charged);
+        // A spool file that is still on disk waits for a replay, which gives its
+        // space back when it removes the file. Giving it back here too would
+        // count it twice.
+        if self.data_removed {
+            self.budget.release(self.charged);
+        }
     }
 }
 
@@ -509,6 +522,7 @@ impl States {
                 closed: false,
                 complete: false,
                 charged: 0,
+                data_removed: false,
                 budget: self.budget.clone(),
             }),
         });
@@ -970,6 +984,29 @@ mod tests {
         assert_eq!(budget.used(), 4);
         drop(reader);
         assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn spool_space_is_never_given_back_twice() {
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = Arc::new(SpoolBudget::new(100));
+        let dir1 = tempfile::tempdir().unwrap();
+        let dir2 = tempfile::tempdir().unwrap();
+        let vol1 = States::new(dir1.path().to_path_buf(), budget.clone());
+        let vol2 = States::new(dir2.path().to_path_buf(), budget.clone());
+        let a = vol1.open_write(&op, "a", false).await.unwrap();
+        a.lock().await.write_at(&[1u8; 60], 0).unwrap();
+        let b = vol2.open_write(&op, "b", false).await.unwrap();
+        b.lock().await.write_at(&[2u8; 40], 0).unwrap();
+        // Volume 1 goes away without uploading (unmount), then its spool replays.
+        drop(a);
+        drop(vol1);
+        assert_eq!(budget.used(), 100);
+        upload_pending(&op, dir1.path(), &budget).await.unwrap();
+        assert_eq!(budget.used(), 40);
+        // The limit still holds for the other volume.
+        let err = b.lock().await.write_at(&[2u8; 61], 40).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
     }
 
     #[tokio::test]

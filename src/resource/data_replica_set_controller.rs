@@ -96,8 +96,16 @@ impl DataReplicaSet {
         // Create missing replica DataPods on DataNodes that hold no copy yet.
         //TODO: Scale down when there are more replicas than requested.
         //TODO: Update the sync pod when the set of replicas changes.
-        let mut replicas = drs_data_pods.items;
-        if replicas.len() < drs_replicas {
+        let drs_uid = self.metadata.uid.clone().ok_or_else(|| {
+            Error::ReconcilerError(format!("DataReplicaSet {drs_name} has no uid"))
+        })?;
+        let existing: Vec<DataPod> = drs_data_pods.items;
+        let missing = missing_replica_indexes(&drs_uid, drs_replicas, &existing);
+        let mut replicas: Vec<DataPod> = existing
+            .into_iter()
+            .filter(|dp| (0..drs_replicas).any(|i| replica_name(&drs_uid, i) == dp.name_any()))
+            .collect();
+        if !missing.is_empty() {
             let used: Vec<String> = replicas
                 .iter()
                 .filter_map(|dp| dp.spec.data_node_ref.as_ref().map(|r| r.name.clone()))
@@ -109,7 +117,7 @@ impl DataReplicaSet {
                 .filter(|node| node.metadata.uid != source_data_node.metadata.uid)
                 .filter(|node| !used.contains(&node.name_any()))
                 .collect::<Vec<_>>();
-            for index in replicas.len()..drs_replicas {
+            for index in missing {
                 let Some(replica_data_node) = available_data_nodes.pop() else {
                     warn!("DataReplicaSet {drs_name}: no free DataNode for replica {index}");
                     break;
@@ -118,6 +126,7 @@ impl DataReplicaSet {
                     .push(create_replica_data_pod(index, self, &replica_data_node, &dp_api).await?);
             }
         }
+        replicas.sort_by_key(|dp| dp.name_any());
         if replicas.is_empty() {
             // Do not start a sync pod without replicas.
             self.patch_status(&ctx, false).await?;
@@ -469,6 +478,17 @@ fn replica_path(drs_uid: &str, index: usize) -> String {
     format!("/{drs_uid}/replica-{index}")
 }
 
+/// Indexes of replica DataPods that should exist but do not. Names, not counts,
+/// decide this, so a deleted replica in the middle is created again.
+fn missing_replica_indexes(drs_uid: &str, desired: usize, existing: &[DataPod]) -> Vec<usize> {
+    (0..desired)
+        .filter(|i| {
+            let name = replica_name(drs_uid, *i);
+            !existing.iter().any(|dp| dp.name_any() == name)
+        })
+        .collect()
+}
+
 /// Name of the sync pod of this set.
 fn sync_pod_name(data_replica_set: &DataReplicaSet) -> String {
     format!("{}-sync", data_replica_set.name_any())
@@ -482,6 +502,16 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn missing_replicas_are_found_by_name() {
+        let dp = |name: &str| DataPod::new(name, DataPodSpec::default());
+        // replica-0 was deleted while replica-1 still exists.
+        let existing = vec![dp("u-replica-1"), dp("unrelated")];
+        assert_eq!(missing_replica_indexes("u", 2, &existing), vec![0]);
+        assert_eq!(missing_replica_indexes("u", 3, &existing), vec![0, 2]);
+        assert!(missing_replica_indexes("u", 0, &existing).is_empty());
+    }
 
     #[test]
     fn replica_folders_differ_between_sets() {

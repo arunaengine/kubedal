@@ -14,7 +14,10 @@ use tonic::Status;
 
 /// Read and check a manifest object.
 pub async fn read_manifest(op: &Operator, key: &str) -> Result<FilePlan, Status> {
-    let key = key.trim_start_matches('/');
+    // Check the key before any storage access, so ".." cannot leave the DataNode root.
+    let key = crate::node::paths::safe_relative(key.trim_start_matches('/'))
+        .map_err(|e| Status::invalid_argument(format!("invalid manifest path: {e}")))?;
+    let key = key.as_str();
     let meta = op
         .stat(key)
         .await
@@ -208,6 +211,16 @@ async fn place_file(
 mod tests {
     use super::*;
     use opendal::services::Memory;
+
+    #[tokio::test]
+    async fn manifest_path_must_stay_in_the_data_node() {
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("private/token.json", "{}").await.unwrap();
+        for key in ["../private/token.json", "a/../../private/token.json", ""] {
+            let err = read_manifest(&op, key).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key}");
+        }
+    }
 
     #[tokio::test]
     async fn manifest_read_is_limited() {

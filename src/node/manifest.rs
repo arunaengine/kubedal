@@ -142,8 +142,16 @@ fn check_digest(value: &str) -> Result<String, Status> {
 
 /// Parse and check a manifest.
 pub fn parse(data: &[u8]) -> Result<FilePlan, Status> {
-    let manifest: Manifest =
-        serde_json::from_slice(data).map_err(|e| invalid(format!("not valid JSON: {e}")))?;
+    // The error must not repeat object content: a wrong manifest path could point
+    // to a secret. Only the kind of error and its position are reported.
+    let manifest: Manifest = serde_json::from_slice(data).map_err(|e| {
+        invalid(format!(
+            "not a valid version 1 manifest ({:?} error at line {}, column {})",
+            e.classify(),
+            e.line(),
+            e.column()
+        ))
+    })?;
     plan(manifest)
 }
 
@@ -307,6 +315,19 @@ mod tests {
         let plan = parse_str(r#"{"version": 1}"#).unwrap();
         assert!(plan.files.is_empty());
         assert!(plan.upload.is_none());
+    }
+
+    #[test]
+    fn parse_errors_do_not_repeat_content() {
+        for data in [
+            r#"{"version": 1, "secret-key": "hunter2"}"#,
+            r#"{"version": "hunter2"}"#,
+            r#"{"files": [{"path": 5, "source": "hunter2"}], "version": 1}"#,
+        ] {
+            let err = parse(data.as_bytes()).unwrap_err();
+            assert!(!err.message().contains("hunter2"), "{}", err.message());
+            assert!(!err.message().contains("secret-key"), "{}", err.message());
+        }
     }
 
     #[test]

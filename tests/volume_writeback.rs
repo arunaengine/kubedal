@@ -199,3 +199,34 @@ async fn output_is_never_sent_to_a_replaced_data_node() {
         "VolumeUploadFailed"
     );
 }
+
+#[tokio::test]
+async fn fuse_spool_is_kept_when_the_data_node_was_replaced() {
+    let env = Env::new();
+    env.add_store(None, false);
+    let target = env.target("p1");
+    env.manager
+        .publish(tree_request("vol-1", &target, "data", TreeMode::Fuse, true))
+        .await
+        .unwrap();
+    let id = publish_id("vol-1", &target.to_string_lossy());
+    let spool = env.manager.spool_dir(&id);
+    write(&spool.join("1.data"), "pending output");
+    write(&spool.join("1.json"), r#"{"key": "out.txt"}"#);
+
+    let other = env.dir.path().join("other-storage");
+    env.cluster.remove_node("team", "store");
+    env.cluster.add_node(
+        "team",
+        "store",
+        FakeNode {
+            root: other.clone(),
+            limit: None,
+            read_only: false,
+        },
+    );
+    let err = env.manager.unpublish("vol-1", &target).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(spool.join("1.json").exists());
+    assert!(!other.join("data/out.txt").exists());
+}

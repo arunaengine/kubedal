@@ -63,6 +63,19 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
+    /// Stat a path. Object stores often have no object for a folder, so a missing
+    /// path is tried again as a folder (with a trailing slash).
+    async fn stat_entry(&self, path: &str) -> opendal::Result<Metadata> {
+        match self.op.stat(path).await {
+            Err(err) if err.kind() == ErrorKind::NotFound && !path.ends_with('/') => {
+                let dir = format!("{}/", path.trim_end_matches('/'));
+                let meta = self.op.stat(&dir).await?;
+                if meta.is_dir() { Ok(meta) } else { Err(err) }
+            }
+            other => other,
+        }
+    }
+
     /// Create a new filesystem with given operator, uid and gid.
     pub fn new(op: Operator, uid: u32, gid: u32) -> Self {
         Self {

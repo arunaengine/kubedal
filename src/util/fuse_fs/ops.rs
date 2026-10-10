@@ -33,8 +33,7 @@ impl PathFilesystem for Filesystem {
 
         let path = PathBuf::from(parent).join(name);
         let metadata = self
-            .op
-            .stat(&path.to_string_lossy())
+            .stat_entry(&path.to_string_lossy())
             .await
             .map_err(opendal_error2errno)?;
 
@@ -70,8 +69,7 @@ impl PathFilesystem for Filesystem {
         };
 
         let metadata = self
-            .op
-            .stat(&file_path.unwrap_or_default().to_string_lossy())
+            .stat_entry(&file_path.unwrap_or_default().to_string_lossy())
             .await
             .map_err(opendal_error2errno)?;
 
@@ -370,8 +368,7 @@ impl PathFilesystem for Filesystem {
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<()> {
         tracing::debug!("access(path={path:?}, mask=0x{mask:x})");
 
-        self.op
-            .stat(&path.to_string_lossy())
+        self.stat_entry(&path.to_string_lossy())
             .await
             .map_err(opendal_error2errno)?;
 

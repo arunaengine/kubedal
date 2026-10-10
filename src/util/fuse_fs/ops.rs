@@ -153,6 +153,7 @@ impl PathFilesystem for Filesystem {
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("setattr(path={path:?}, fh={fh:?}, set_attr={set_attr:?})");
 
         if let Some(size) = set_attr.size {
@@ -186,6 +187,7 @@ impl PathFilesystem for Filesystem {
 
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("unlink(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
@@ -220,6 +222,7 @@ impl PathFilesystem for Filesystem {
         name: &OsStr,
     ) -> Result<()> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!(
             "rename(p={origin_parent:?}, name={origin_name:?}, newp={parent:?}, newname={name:?})"
         );
@@ -389,6 +392,7 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyWrite> {
         self.states.pause.hit("before_enter").await;
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!(
             "write(path={:?}, fh={}, offset={}, data_len={}, flags=0x{:x})",
             path,
@@ -458,6 +462,7 @@ impl PathFilesystem for Filesystem {
         lock_owner: u64,
     ) -> Result<()> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
         self.upload_open_file(path, fh).await
     }
@@ -470,6 +475,7 @@ impl PathFilesystem for Filesystem {
         datasync: bool,
     ) -> Result<()> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!("fsync(path={path:?}, fh={fh}, datasync={datasync})");
         self.upload_open_file(path, fh).await
     }
@@ -504,6 +510,7 @@ impl PathFilesystem for Filesystem {
         flags: u32,
     ) -> Result<ReplyCreated> {
         let _running = self.enter()?;
+        self.check_writable()?;
         tracing::debug!(
             "create(parent={parent:?}, name={name:?}, mode=0o{mode:o}, flags=0x{flags:x})"
         );

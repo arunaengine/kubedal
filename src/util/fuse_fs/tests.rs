@@ -853,3 +853,58 @@ async fn reader_getattr_survives_a_rename_of_its_file() {
         .unwrap();
     assert_eq!(attr.attr.size, 5);
 }
+
+#[tokio::test]
+async fn a_failed_folder_sync_during_rename_stops_all_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let pa = Some(OsStr::new("/a"));
+    let w = create(&fs, "a").await;
+    fs.write(req(), pa, w, 0, b"source", 0, 0).await.unwrap();
+    // The journal was replaced, but syncing the folder fails.
+    fs.pause_points().fail_once("dir_fsync");
+    let root = OsStr::new("/");
+    let err = fs
+        .rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::EIO));
+    // The file system stops: no more changes and no uploads from memory.
+    assert_eq!(
+        fs.write(req(), pa, w, 0, b"x", 0, 0).await.unwrap_err(),
+        Errno::from(libc::EIO)
+    );
+    assert_eq!(
+        fs.flush(req(), pa, w, 0).await.unwrap_err(),
+        Errno::from(libc::EIO)
+    );
+    assert!(fs.release(req(), pa, w, 0, 0, false).await.is_err());
+    assert!(!op.exists("a").await.unwrap() && !op.exists("b").await.unwrap());
+    // The spool is left for the replay, which follows the newest journal.
+    drop(fs);
+    states::upload_pending(&op, &dir.path().join("spool"), &SpoolBudget::new(u64::MAX))
+        .await
+        .unwrap();
+    assert_eq!(op.read("b").await.unwrap().to_vec(), b"source");
+}
+
+#[tokio::test]
+async fn a_failed_folder_sync_during_unlink_stops_all_changes() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, _op) = fs_in(dir.path()).await;
+    let p = Some(OsStr::new("/f"));
+    let w = create(&fs, "f").await;
+    fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+    fs.pause_points().fail_once("dir_fsync");
+    assert!(
+        fs.unlink(req(), OsStr::new("/"), OsStr::new("f"))
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        fs.create(req(), OsStr::new("/"), OsStr::new("g"), 0o644, WRITE_FLAGS)
+            .await
+            .unwrap_err(),
+        Errno::from(libc::EIO)
+    );
+}

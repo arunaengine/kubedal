@@ -222,6 +222,10 @@ pub struct StateData {
     charged: u64,
     /// Per-volume journal generation counter (the next free number).
     generations: Arc<AtomicU64>,
+    /// Set when a local disk step failed in the middle of a change.
+    broken: Arc<AtomicBool>,
+    /// Pause and failure points for tests.
+    hooks: Arc<super::pause::PausePoints>,
     /// The spool data file was removed from disk.
     data_removed: bool,
     /// Test hook: the next write writes this many bytes and then fails.
@@ -268,11 +272,30 @@ impl StateData {
         file.write_all(&data)?;
         file.sync_all()?;
         std::fs::rename(&tmp, &self.meta_path)?;
-        if let Some(dir) = self.meta_path.parent() {
-            File::open(dir)?.sync_all()?;
-        }
+        // From here on the journal may have changed. If the folder sync fails,
+        // nobody can tell which journal is current: fail closed.
+        self.sync_dir()?;
         self.complete = true;
         Ok(())
+    }
+
+    /// Sync the spool folder. A failure marks the file system as broken.
+    fn sync_dir(&self) -> std::io::Result<()> {
+        let result = if self.hooks.should_fail("dir_fsync") {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            match self.meta_path.parent() {
+                Some(dir) => File::open(dir).and_then(|d| d.sync_all()),
+                None => Ok(()),
+            }
+        };
+        if let Err(err) = &result {
+            mark_broken(
+                &self.broken,
+                &format!("syncing the spool folder failed: {err}"),
+            );
+        }
+        result
     }
 
     /// Change the space charged for this spool file to `bytes`.
@@ -416,13 +439,26 @@ fn retire(state: &FileState, data: &mut StateData) -> std::io::Result<()> {
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    if let Some(dir) = data.meta_path.parent() {
-        File::open(dir)?.sync_all()?;
-    }
+    data.sync_dir()?;
     data.complete = false;
     data.dirty = false;
     state.unlinked.store(true, Ordering::SeqCst);
     Ok(())
+}
+
+/// Mark a file system as broken after a local disk step failed in the middle of
+/// a change. From then on it refuses changes and uploads; the spool folder is
+/// left as it is for the replay at unpublish or remount.
+fn mark_broken(broken: &AtomicBool, why: &str) {
+    if !broken.swap(true, Ordering::SeqCst) {
+        tracing::error!(
+            "FUSE file system stops accepting changes: {why}; its spool is replayed at unpublish"
+        );
+    }
+}
+
+fn broken_status() -> Status {
+    Status::internal("the FUSE file system stopped after a local disk error")
 }
 
 /// Remove a spool data file and give its space back.
@@ -462,6 +498,8 @@ pub struct States {
     next_id: AtomicU64,
     /// Next journal generation. It starts above every journal already on disk.
     generations: Arc<AtomicU64>,
+    /// Set when a local disk step failed in the middle of a change.
+    broken: Arc<AtomicBool>,
     map: std::sync::Mutex<HashMap<String, Arc<FileState>>>,
 }
 
@@ -476,6 +514,7 @@ impl States {
             budget,
             next_id: AtomicU64::new(1),
             generations,
+            broken: Arc::default(),
             map: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -497,6 +536,18 @@ impl States {
         if map.get(key).is_some_and(|s| Arc::ptr_eq(s, state)) {
             map.remove(key);
         }
+    }
+
+    /// True after a local disk error in the middle of a change.
+    pub fn is_broken(&self) -> bool {
+        self.broken.load(Ordering::SeqCst)
+    }
+
+    fn check_broken(&self) -> Result<(), Status> {
+        if self.is_broken() {
+            return Err(broken_status());
+        }
+        Ok(())
     }
 
     /// Take the namespace lock.
@@ -529,6 +580,7 @@ impl States {
         keep: bool,
     ) -> Result<Arc<FileState>, Status> {
         let ns = self.lock_namespace().await;
+        self.check_broken()?;
         if let Some(state) = self.live(&ns, key).await {
             let mut data = state.lock().await;
             if !keep {
@@ -572,6 +624,8 @@ impl States {
                 fail_after: None,
                 budget: self.budget.clone(),
                 generations: self.generations.clone(),
+                broken: self.broken.clone(),
+                hooks: self.pause.clone(),
             }),
         });
         // The caller holds the namespace lock, so nobody else adds this key now.
@@ -596,6 +650,10 @@ impl States {
                 .map_err(|e| io_status(e, "write spool metadata"))
         });
         if let Err(err) = loaded {
+            if self.is_broken() {
+                // The journal may exist; leave the spool for the replay.
+                return Err(broken_status());
+            }
             data.remove_files();
             data.closed = true;
             self.unmap(key, &state);
@@ -627,6 +685,7 @@ impl States {
             return Ok(());
         }
         self.fence.check()?;
+        self.check_broken()?;
         data.upload(op).await
     }
 
@@ -642,6 +701,10 @@ impl States {
         data.handles = data.handles.saturating_sub(1);
         if data.closed {
             return (Ok(()), false);
+        }
+        if self.is_broken() {
+            // Nothing is uploaded or removed from memory any more.
+            return (Err(broken_status()), false);
         }
         let result = if state.is_unlinked() {
             Ok(())
@@ -686,7 +749,7 @@ impl States {
         if data.closed || data.handles > 0 {
             return true;
         }
-        if self.fence.is_closing() {
+        if self.fence.is_closing() || self.is_broken() {
             return true;
         }
         if !state.is_unlinked() && data.upload(op).await.is_err() {
@@ -729,6 +792,7 @@ impl States {
         Fut: std::future::Future<Output = Result<(), Status>>,
     {
         let ns = self.lock_namespace().await;
+        self.check_broken()?;
         let Some(state) = self.live(&ns, key).await else {
             return Ok(false);
         };
@@ -772,9 +836,13 @@ impl States {
         self.pause.hit("rename_locked").await;
         // Write-ahead: first the journal points to the new key. If that fails,
         // nothing changed at all.
-        src_data
-            .write_meta_for(to)
-            .map_err(|e| io_status(e, "write spool metadata"))?;
+        self.check_broken()?;
+        if let Err(err) = src_data.write_meta_for(to) {
+            if self.is_broken() {
+                return Err(broken_status());
+            }
+            return Err(io_status(err, "write spool metadata"));
+        }
         let undo = |data: &mut StateData| {
             if let Err(err) = data.write_meta_for(from) {
                 tracing::error!("cannot restore the journal of {from}: {err}");

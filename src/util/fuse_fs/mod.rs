@@ -260,6 +260,14 @@ impl Filesystem {
     }
 
     /// Count a running FUSE callback, so shutdown can wait for it.
+    /// After a local disk error in the middle of a change, changes fail with EIO.
+    fn check_writable(&self) -> Result<()> {
+        if self.states.is_broken() {
+            return Err(Errno::from(libc::EIO));
+        }
+        Ok(())
+    }
+
     /// After shutdown started, callbacks fail with ENOTCONN.
     fn enter(&self) -> Result<states::FenceGuard> {
         self.states

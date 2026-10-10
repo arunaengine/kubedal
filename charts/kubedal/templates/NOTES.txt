@@ -1,0 +1,17 @@
+kubedal {{ .Chart.AppVersion }} is installed as CSI driver {{ .Values.driverName }}.
+
+Next steps:
+1. Create a DataNode that points to your object storage (see the README).
+2. Use it from a pod with an inline volume:
+
+     volumes:
+       - name: data
+         csi:
+           driver: {{ .Values.driverName }}
+           volumeAttributes:
+             dataNode: <name of the DataNode>
+             path: <prefix inside the DataNode>
+             mount: cache-read-only
+
+Check the node plugin with:
+  kubectl -n {{ .Release.Namespace }} get pods -l app.kubernetes.io/component=node

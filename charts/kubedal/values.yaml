@@ -1,0 +1,63 @@
+# Name of the CSI driver. Pods and StorageClasses refer to it.
+driverName: kubedal.arunaengine.org
+
+image:
+  repository: harbor.computational.bio.uni-giessen.de/aruna/kubedal
+  # Defaults to the chart appVersion.
+  tag: ""
+  pullPolicy: IfNotPresent
+
+imagePullSecrets: []
+
+# Log level of kubedal, passed as RUST_LOG (for example "info", "debug" or "kubedal=debug").
+logLevel: info
+
+# Path of the kubelet directory on the nodes. Some distributions use another path.
+kubeletDir: /var/lib/kubelet
+
+sidecars:
+  provisioner:
+    image: registry.k8s.io/sig-storage/csi-provisioner:v5.3.0
+    resources: {}
+  nodeDriverRegistrar:
+    image: registry.k8s.io/sig-storage/csi-node-driver-registrar:v2.15.0
+    resources: {}
+
+controller:
+  replicas: 1
+  resources: {}
+  nodeSelector: {}
+  tolerations: []
+  affinity: {}
+  podAnnotations: {}
+
+node:
+  # Where volume data, state and the content cache live on each node.
+  # It must be below kubeletDir, so bind mounts reach the pods.
+  # Empty means <kubeletDir>/plugins/<driverName>.
+  dataDir: ""
+  # Size limit of the content cache for file-list volumes.
+  contentCacheSize: 10Gi
+  resources: {}
+  nodeSelector: {}
+  # The node plugin must run on every node that runs pods with kubedal volumes.
+  tolerations:
+    - operator: Exists
+  affinity: {}
+  podAnnotations: {}
+
+storageClass:
+  create: true
+  name: kubedal
+  isDefault: false
+  reclaimPolicy: Delete
+  volumeBindingMode: Immediate
+  # Default mount mode for PVCs without the kubedal.arunaengine.org/mount annotation
+  # is cache-read-only. Extra StorageClass parameters can be set here.
+  parameters: {}
+
+serviceAccount:
+  controller:
+    name: ""
+  node:
+    name: ""

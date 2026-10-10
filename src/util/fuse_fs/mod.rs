@@ -48,6 +48,43 @@ use states::{FileState, SpoolBudget, States};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
+/// Background tasks of one FUSE file system.
+#[derive(Default)]
+pub struct Workers {
+    tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+}
+
+impl Workers {
+    fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        // Forget tasks that are done.
+        while tasks.try_join_next().is_some() {}
+        tasks.spawn(task);
+    }
+
+    /// Stop all tasks and wait until they are gone. Their spool files stay on
+    /// disk, so nothing is lost; the next replay uploads them.
+    pub async fn shutdown(&self) {
+        let mut tasks = {
+            let mut guard = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+            std::mem::take(&mut *guard)
+        };
+        tasks.abort_all();
+        while tasks.join_next().await.is_some() {}
+    }
+
+    /// Number of tasks that still run.
+    pub fn len(&self) -> usize {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
+        while tasks.try_join_next().is_some() {}
+        tasks.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+}
+
 /// `Filesystem` implements [`PathFilesystem`] on top of an OpenDAL [`Operator`].
 ///
 /// This code is vendored from the `fuse3_opendal` crate (Apache-2.0), because that
@@ -64,6 +101,8 @@ pub struct Filesystem {
     uid: u32,
     /// Shared states of files that are open for writing.
     states: Arc<States>,
+    /// Background upload retries, so they can be stopped with the mount.
+    workers: Arc<Workers>,
 
     opened_files: Slab<OpenedFile>,
 }
@@ -145,6 +184,7 @@ impl Filesystem {
             op,
             uid,
             gid,
+            workers: Arc::new(Workers::default()),
             states: Arc::new(States::new(spool_dir, Arc::new(SpoolBudget::new(u64::MAX)))),
             opened_files: Slab::new(),
         }
@@ -192,11 +232,17 @@ impl Filesystem {
         upload_errno(result)
     }
 
+    /// The background workers of this file system. Stop them with
+    /// [`Workers::shutdown`] before anything else uploads its spool files.
+    pub fn workers(&self) -> Arc<Workers> {
+        self.workers.clone()
+    }
+
     /// Retry the upload of a closed file a few times in the background.
     fn retry_upload(&self, state: Arc<FileState>) {
         let op = self.op.clone();
         let states = self.states.clone();
-        tokio::spawn(async move {
+        self.workers.spawn(async move {
             for attempt in 0..5u32 {
                 tokio::time::sleep(Duration::from_secs(2u64 << attempt)).await;
                 if states.retry(&op, &state).await {

@@ -363,3 +363,39 @@ async fn readers_keep_the_file_they_opened() {
     fs.release(req(), p, w2, 0, 0, false).await.unwrap();
     assert_eq!(read_all(&fs, "/f.txt", r).await, b"xA");
 }
+
+#[tokio::test]
+async fn stopped_retry_workers_never_upload_late() {
+    let dir = tempfile::tempdir().unwrap();
+    let root = dir.path().join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let make_op =
+        || Operator::new(opendal::services::Fs::default().root(&root.to_string_lossy())).unwrap();
+    let spool_dir = dir.path().join("spool");
+    let fs = Filesystem::new(make_op(), 0, 0, spool_dir.clone());
+    let w = create(&fs, "f.txt").await;
+    let p = Some(OsStr::new("/f.txt"));
+    fs.write(req(), p, w, 0, b"old", 0, 0).await.unwrap();
+    // The upload fails, so a retry worker starts.
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, "not a folder").unwrap();
+    assert!(fs.release(req(), p, w, 0, 0, false).await.is_err());
+    let workers = fs.workers();
+    assert_eq!(workers.len(), 1);
+
+    // Unpublish stops the workers first, then replays the spool files.
+    workers.shutdown().await;
+    assert!(workers.is_empty());
+    std::fs::remove_file(&root).unwrap();
+    std::fs::create_dir_all(&root).unwrap();
+    assert_eq!(
+        states::upload_pending(&make_op(), &spool_dir)
+            .await
+            .unwrap(),
+        1
+    );
+    // A newer version written afterwards is never overwritten by the old retry.
+    std::fs::write(root.join("f.txt"), "newer").unwrap();
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"newer");
+}

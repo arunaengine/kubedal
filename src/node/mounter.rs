@@ -1,7 +1,7 @@
 //! Mount operations. A trait keeps them replaceable, so tests can run without root.
 
 use crate::util::error::io_status;
-use crate::util::fuse_fs::Filesystem;
+use crate::util::fuse_fs::{Filesystem, Workers};
 use crate::util::mountinfo;
 use fuse3::MountOptions;
 use fuse3::raw::MountHandle;
@@ -10,6 +10,7 @@ use std::collections::HashMap;
 use std::ffi::CString;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use tokio::sync::Mutex;
 use tonic::Status;
 
@@ -44,7 +45,7 @@ pub trait Mounter: Send + Sync {
 /// Real mounts through the Linux mount system calls.
 #[derive(Default)]
 pub struct SystemMounter {
-    fuse_sessions: Mutex<HashMap<PathBuf, MountHandle>>,
+    fuse_sessions: Mutex<HashMap<PathBuf, (MountHandle, Arc<Workers>)>>,
 }
 
 fn c_path(path: &Path) -> Result<CString, Status> {
@@ -159,21 +160,27 @@ impl Mounter for SystemMounter {
             .fs_name("kubedal")
             .allow_other(true)
             .read_only(read_only);
+        let fs = Filesystem::new(op, 0, 0, spool_dir.to_path_buf());
+        let workers = fs.workers();
         let handle = fuse3::path::Session::new(options)
-            .mount(Filesystem::new(op, 0, 0, spool_dir.to_path_buf()), target)
+            .mount(fs, target)
             .await
             .map_err(|e| io_status(e, "mount FUSE file system"))?;
         self.fuse_sessions
             .lock()
             .await
-            .insert(target.to_path_buf(), handle);
+            .insert(target.to_path_buf(), (handle, workers));
         Ok(())
     }
 
     async fn unmount(&self, target: &Path) -> Result<(), Status> {
         let session = self.fuse_sessions.lock().await.remove(target);
-        if let Some(handle) = session {
-            match handle.unmount().await {
+        if let Some((handle, workers)) = session {
+            let result = handle.unmount().await;
+            // Stop upload retries before the caller replays the spool files, so an
+            // old upload can never finish after a newer one.
+            workers.shutdown().await;
+            match result {
                 Ok(()) => return Ok(()),
                 Err(err) => tracing::warn!("FUSE unmount of {target:?} failed: {err}"),
             }

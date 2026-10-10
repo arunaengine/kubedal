@@ -1,0 +1,149 @@
+//! Mount operations. A trait keeps them replaceable, so tests can run without root.
+
+use crate::util::error::io_status;
+use crate::util::fuse_fs::Filesystem;
+use crate::util::mountinfo;
+use fuse3::MountOptions;
+use fuse3::raw::MountHandle;
+use opendal::Operator;
+use std::collections::HashMap;
+use std::ffi::CString;
+use std::os::unix::ffi::OsStrExt;
+use std::path::{Path, PathBuf};
+use tokio::sync::Mutex;
+use tonic::Status;
+
+// async_trait adds `#[must_use]` to methods that return a Future.
+#[allow(clippy::double_must_use)]
+#[tonic::async_trait]
+pub trait Mounter: Send + Sync {
+    /// Bind mount `source` at `target`. `target` must exist.
+    async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status>;
+
+    /// Serve `op` as a FUSE file system at `target`. `target` must exist.
+    async fn mount_fuse(&self, op: Operator, target: &Path, read_only: bool) -> Result<(), Status>;
+
+    /// Unmount `target`. Unmounting a path that is not mounted is not an error.
+    async fn unmount(&self, target: &Path) -> Result<(), Status>;
+
+    /// Is `target` a mount point right now?
+    fn is_mounted(&self, target: &Path) -> bool;
+
+    /// Does this process serve a FUSE file system at `target`?
+    async fn has_fuse_session(&self, target: &Path) -> bool;
+}
+
+/// Real mounts through the Linux mount system calls.
+#[derive(Default)]
+pub struct SystemMounter {
+    fuse_sessions: Mutex<HashMap<PathBuf, MountHandle>>,
+}
+
+fn c_path(path: &Path) -> Result<CString, Status> {
+    CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| Status::invalid_argument(format!("path {path:?} contains a NUL byte")))
+}
+
+fn sys_mount(
+    source: Option<&CString>,
+    target: &CString,
+    flags: libc::c_ulong,
+) -> std::io::Result<()> {
+    let source_ptr = source.map_or(std::ptr::null(), |s| s.as_ptr());
+    // SAFETY: all pointers are valid NUL terminated strings or null, as mount(2) allows.
+    let rc = unsafe {
+        libc::mount(
+            source_ptr,
+            target.as_ptr(),
+            std::ptr::null(),
+            flags,
+            std::ptr::null(),
+        )
+    };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+fn sys_umount(target: &CString, flags: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: target is a valid NUL terminated string.
+    let rc = unsafe { libc::umount2(target.as_ptr(), flags) };
+    if rc == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[tonic::async_trait]
+impl Mounter for SystemMounter {
+    async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status> {
+        let source = c_path(source)?;
+        let target_c = c_path(target)?;
+        tokio::task::spawn_blocking(move || {
+            sys_mount(Some(&source), &target_c, libc::MS_BIND)
+                .map_err(|e| io_status(e, "bind mount"))?;
+            if read_only {
+                // A bind mount ignores MS_RDONLY. A second remount call makes it read-only.
+                let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
+                if let Err(err) = sys_mount(None, &target_c, flags) {
+                    let _ = sys_umount(&target_c, libc::MNT_DETACH);
+                    return Err(io_status(err, "remount read-only"));
+                }
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| Status::internal(format!("mount task failed: {e}")))?
+    }
+
+    async fn mount_fuse(&self, op: Operator, target: &Path, read_only: bool) -> Result<(), Status> {
+        let mut options = MountOptions::default();
+        options
+            .fs_name("kubedal")
+            .allow_other(true)
+            .read_only(read_only);
+        let handle = fuse3::path::Session::new(options)
+            .mount(Filesystem::new(op, 0, 0), target)
+            .await
+            .map_err(|e| io_status(e, "mount FUSE file system"))?;
+        self.fuse_sessions
+            .lock()
+            .await
+            .insert(target.to_path_buf(), handle);
+        Ok(())
+    }
+
+    async fn unmount(&self, target: &Path) -> Result<(), Status> {
+        let session = self.fuse_sessions.lock().await.remove(target);
+        if let Some(handle) = session {
+            match handle.unmount().await {
+                Ok(()) => return Ok(()),
+                Err(err) => tracing::warn!("FUSE unmount of {target:?} failed: {err}"),
+            }
+        }
+        if !self.is_mounted(target) {
+            return Ok(());
+        }
+        let target_c = c_path(target)?;
+        tokio::task::spawn_blocking(move || match sys_umount(&target_c, 0) {
+            Ok(()) => Ok(()),
+            Err(err) if err.raw_os_error() == Some(libc::EINVAL) => Ok(()),
+            // A dead FUSE mount or a busy mount: detach it from the tree.
+            Err(_) => sys_umount(&target_c, libc::MNT_DETACH)
+                .map_err(|e| io_status(e, "unmount target path")),
+        })
+        .await
+        .map_err(|e| Status::internal(format!("unmount task failed: {e}")))?
+    }
+
+    fn is_mounted(&self, target: &Path) -> bool {
+        mountinfo::is_mount_point(target)
+    }
+
+    async fn has_fuse_session(&self, target: &Path) -> bool {
+        self.fuse_sessions.lock().await.contains_key(target)
+    }
+}

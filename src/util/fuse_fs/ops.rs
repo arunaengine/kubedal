@@ -59,6 +59,23 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyAttr> {
         tracing::debug!("getattr(path={path:?}, fh={fh:?}, flags={flags:?})");
 
+        // A handle with a state answers from that state: it keeps working after
+        // unlink and never shows a newer file that got the same name.
+        let handle_state = fh.and_then(|fh| {
+            self.opened_files
+                .get(FileKey::try_from(fh).ok()?.0)
+                .and_then(|f| f.write.clone().or_else(|| f.read_state.clone()))
+        });
+        if let Some(state) = handle_state {
+            let size = state.lock().await.len;
+            let attr =
+                dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr { size, ..attr },
+            });
+        }
+
         // A file that is being written may not be uploaded yet; its size is local.
         let fh_path = fh.and_then(|fh| {
             self.opened_files

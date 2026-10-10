@@ -540,3 +540,24 @@ async fn rename2_honors_its_flags() {
     .unwrap();
     assert_eq!(fs.op.read("c").await.unwrap().to_vec(), b"a");
 }
+
+#[tokio::test]
+async fn getattr_with_a_handle_uses_the_handle_state() {
+    let fs = fs_with("other", "").await;
+    let p = Some(OsStr::new("/f"));
+    let w = create(&fs, "f").await;
+    fs.write(req(), p, w, 0, b"abc", 0, 0).await.unwrap();
+    fs.unlink(req(), OsStr::new("/"), OsStr::new("f"))
+        .await
+        .unwrap();
+    // After unlink, the handle still has attributes.
+    let attr = fs.getattr(req(), p, Some(w), 0).await.unwrap();
+    assert_eq!(attr.attr.size, 3);
+    // A new file with the same name does not change what the old handle sees.
+    let w2 = create(&fs, "f").await;
+    fs.write(req(), p, w2, 0, b"longer content", 0, 0)
+        .await
+        .unwrap();
+    let attr = fs.getattr(req(), p, Some(w), 0).await.unwrap();
+    assert_eq!(attr.attr.size, 3);
+}

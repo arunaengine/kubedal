@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod kube;
+pub mod manifest;
 pub mod mounter;
 pub mod paths;
 pub mod reconcile;

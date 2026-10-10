@@ -32,12 +32,19 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("lookup(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
+        let now = SystemTime::now();
+        // A file that is being written may not be uploaded yet.
+        if let Some(size) = self.spool_size(path.as_os_str()).await {
+            let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
+            return Ok(ReplyEntry {
+                ttl: TTL,
+                attr: FileAttr { size, ..attr },
+            });
+        }
         let metadata = self
             .stat_entry(&path.to_string_lossy())
             .await
             .map_err(opendal_error2errno)?;
-
-        let now = SystemTime::now();
         let attr = metadata2file_attr(&metadata, now, self.uid, self.gid);
 
         Ok(ReplyEntry { ttl: TTL, attr })
@@ -53,13 +60,17 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("getattr(path={path:?}, fh={fh:?}, flags={flags:?})");
 
         // A file that is being written may not be uploaded yet; its size is local.
-        let writer = fh.and_then(|fh| {
+        let fh_path = fh.and_then(|fh| {
             self.opened_files
                 .get(FileKey::try_from(fh).ok()?.0)
-                .and_then(|f| f.inner_writer.clone())
+                .map(|f| f.path.clone())
         });
-        if let Some(writer) = writer {
-            let size = writer.lock().await.written;
+        let spool_path = path.map(OsStr::to_os_string).or(fh_path);
+        let spool_size = match &spool_path {
+            Some(p) => self.spool_size(p).await,
+            None => None,
+        };
+        if let Some(size) = spool_size {
             let attr =
                 dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
             return Ok(ReplyAttr {
@@ -137,12 +148,13 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("unlink(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
-        self.op
-            .delete(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        Ok(())
+        // Open handles keep their content, but it must never be uploaded again.
+        let had_state = self.forget_state(path.as_os_str()).await;
+        match self.op.delete(&path.to_string_lossy()).await {
+            Ok(()) => Ok(()),
+            Err(err) if had_state && err.kind() == ErrorKind::NotFound => Ok(()),
+            Err(err) => Err(opendal_error2errno(err)),
+        }
     }
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
@@ -169,13 +181,21 @@ impl PathFilesystem for Filesystem {
             "rename(p={origin_parent:?}, name={origin_name:?}, newp={parent:?}, newname={name:?})"
         );
 
-        if !self.op.info().capability().rename {
-            Err(Errno::from(libc::ENOTSUP))?;
-        }
-
         let origin_path = PathBuf::from(origin_parent).join(origin_name);
         let path = PathBuf::from(parent).join(name);
 
+        // A file with a spool holds its whole content, so the rename only moves
+        // the spool to the new key and removes the old object.
+        if self
+            .rename_state(origin_path.as_os_str(), path.as_os_str())
+            .await?
+        {
+            return Ok(());
+        }
+
+        if !self.op.info().capability().rename {
+            Err(Errno::from(libc::ENOTSUP))?;
+        }
         self.op
             .rename(&origin_path.to_string_lossy(), &path.to_string_lossy())
             .await
@@ -192,30 +212,15 @@ impl PathFilesystem for Filesystem {
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         tracing::debug!("open(path={path:?}, flags=0x{flags:x})");
 
-        let (is_read, is_trunc, is_append) = self.check_flags(flags)?;
-
-        let inner_writer = if is_trunc || is_append {
-            let writer = self.new_writer()?;
-            if is_append {
-                // Start from the current content, so appends keep it.
-                let data = self
-                    .op
-                    .read(&path.to_string_lossy())
-                    .await
-                    .map_err(opendal_error2errno)?
-                    .to_bytes();
-                let mut inner = writer.lock().await;
-                std::os::unix::fs::FileExt::write_all_at(&inner.spool, &data, 0)
-                    .map_err(io_errno)?;
-                inner.written = data.len() as u64;
-                inner.dirty = false;
-            }
-            Some(writer)
+        let (is_read, is_write, is_append) = self.check_flags(flags)?;
+        let write = if is_write {
+            let truncate = flags & libc::O_TRUNC as u32 != 0;
+            Some(self.open_write(path, !truncate).await?)
         } else {
             None
         };
 
-        let size = if is_read && inner_writer.is_none() {
+        let size = if write.is_none() && self.spool_size(path).await.is_none() {
             let meta = self
                 .op
                 .stat(&path.to_string_lossy())
@@ -231,7 +236,8 @@ impl PathFilesystem for Filesystem {
             .insert(OpenedFile {
                 path: path.into(),
                 is_read,
-                inner_writer,
+                write,
+                append: is_append,
                 size,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
@@ -252,13 +258,26 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyData> {
         tracing::debug!("read(path={path:?}, fh={fh}, offset={offset}, size={size})");
 
-        let (file_path, file_size) = {
+        let (file_path, file_size, own_state) = {
             let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
             if !file.is_read {
                 Err(Errno::from(libc::EACCES))?;
             }
-            (file.path.to_string_lossy().to_string(), file.size)
+            (
+                file.path.to_string_lossy().to_string(),
+                file.size,
+                file.write.clone(),
+            )
         };
+
+        // Content that is being written is read from the shared spool: the state
+        // of this handle (it stays readable after unlink), or the state of
+        // another handle that writes the same file.
+        let state = own_state.or_else(|| self.spool.get(&key_of(OsStr::new(&file_path))));
+        if let Some(state) = state {
+            let data = state.lock().await.read_at(offset, size).map_err(io_errno)?;
+            return Ok(ReplyData { data: data.into() });
+        }
 
         let mut end = offset.saturating_add(u64::from(size));
         if let Some(file_size) = file_size {
@@ -297,18 +316,19 @@ impl PathFilesystem for Filesystem {
             flags
         );
 
-        let Some(inner_writer) = ({
-            self.get_opened_file(FileKey::try_from(fh)?, path)?
-                .inner_writer
-                .clone()
-        }) else {
-            Err(Errno::from(libc::EACCES))?
+        let (state, append) = {
+            let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
+            match file.write.clone() {
+                Some(state) => (state, file.append),
+                None => Err(Errno::from(libc::EACCES))?,
+            }
         };
 
-        let mut inner = inner_writer.lock().await;
-        std::os::unix::fs::FileExt::write_all_at(&inner.spool, data, offset).map_err(io_errno)?;
-        inner.written = inner.written.max(offset + data.len() as u64);
-        inner.dirty = true;
+        let mut state = state.lock().await;
+        // With O_APPEND every write goes to the current end, also when other
+        // handles made the file longer since the kernel last asked for its size.
+        let offset = if append { state.len } else { offset };
+        state.write_at(data, offset).map_err(io_errno)?;
 
         Ok(ReplyWrite {
             written: data.len() as _,
@@ -335,8 +355,8 @@ impl PathFilesystem for Filesystem {
 
         // Release comes once, after the last file descriptor is closed. Its result
         // does not reach the program, so this upload is only a last attempt.
-        if let Some(inner_writer) = file.inner_writer {
-            self.upload_writer(&file.path, &inner_writer).await?;
+        if let Some(state) = file.write {
+            self.release_state(state).await?;
         }
         Ok(())
     }
@@ -399,15 +419,13 @@ impl PathFilesystem for Filesystem {
             "create(parent={parent:?}, name={name:?}, mode=0o{mode:o}, flags=0x{flags:x})"
         );
 
-        let (is_read, is_trunc, is_append) = self.check_flags(flags | libc::O_CREAT as u32)?;
+        let (is_read, _, is_append) = self.check_flags(flags | libc::O_CREAT as u32)?;
 
         let path = PathBuf::from(parent).join(name);
 
-        let inner_writer = if is_trunc || is_append {
-            Some(self.new_writer()?)
-        } else {
-            None
-        };
+        let (is_read, is_append) = (is_read, is_append);
+        // A new name: start empty (O_EXCL and a missing file both mean that).
+        let write = Some(self.open_write(path.as_os_str(), false).await?);
 
         let now = SystemTime::now();
         let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
@@ -417,7 +435,8 @@ impl PathFilesystem for Filesystem {
             .insert(OpenedFile {
                 path: path.into(),
                 is_read,
-                inner_writer,
+                write,
+                append: is_append,
                 size: None,
             })
             .ok_or(Errno::from(libc::EBUSY))?;

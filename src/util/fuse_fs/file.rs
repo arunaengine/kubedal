@@ -21,6 +21,8 @@ use std::sync::Arc;
 use fuse3::Errno;
 use tokio::sync::Mutex;
 
+use super::spool::WriteState;
+
 /// Opened file represents file that opened in memory.
 ///
 /// # FIXME
@@ -29,22 +31,13 @@ use tokio::sync::Mutex;
 pub struct OpenedFile {
     pub path: OsString,
     pub is_read: bool,
-    pub inner_writer: Option<Arc<Mutex<InnerWriter>>>,
+    /// Shared write state, if the file is open for writing.
+    pub write: Option<Arc<Mutex<WriteState>>>,
+    /// Opened with O_APPEND: writes go to the end of the file.
+    pub append: bool,
     /// Size of the file when it was opened for reading. Reads are limited to it,
     /// because some backends fail when a range reaches past the end.
     pub size: Option<u64>,
-}
-
-/// Content of a file opened for writing.
-///
-/// Writes go to a local spool file. `flush`, `fsync` and `release` upload the
-/// whole spool file as one object, so an upload error reaches `close` or `fsync`.
-pub struct InnerWriter {
-    pub spool: std::fs::File,
-    /// Size of the file content.
-    pub written: u64,
-    /// The spool file has content that is not uploaded yet.
-    pub dirty: bool,
 }
 
 /// File key is the key of opened file.

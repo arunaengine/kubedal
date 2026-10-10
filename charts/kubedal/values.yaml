@@ -38,6 +38,9 @@ node:
   dataDir: ""
   # Size limit of the content cache for file-list volumes.
   contentCacheSize: 10Gi
+  # Space limit for FUSE files that are written but not uploaded yet. Writes past
+  # it fail with "no space left on device". Content is never deleted to make room.
+  fuseSpoolSize: 10Gi
   resources: {}
   nodeSelector: {}
   # The node plugin must run on every node that runs pods with kubedal volumes.

@@ -60,6 +60,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .value_parser(clap::value_parser!(PathBuf)),
         )
         .arg(
+            Arg::new("fuse-spool-size")
+                .long("fuse-spool-size")
+                .help("Space limit for FUSE files that are written but not uploaded yet, like 10Gi")
+                .default_value("10Gi")
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
             Arg::new("content-cache-size")
                 .long("content-cache-size")
                 .help("Size limit of the node content cache for file-list volumes, like 10Gi")
@@ -142,7 +149,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Is a csi driver noder
         let cluster = Arc::new(KubeCluster::new(client.clone(), &node_id));
-        let mounter = Arc::new(SystemMounter::default());
+        let spool_size = matches
+            .get_one::<String>("fuse-spool-size")
+            .map(|s| kubedal::util::quantity::parse_bytes(s))
+            .transpose()
+            .map_err(|e| format!("invalid --fuse-spool-size: {e}"))?
+            .unwrap_or(u64::MAX);
+        let mounter = Arc::new(SystemMounter::with_spool_limit(spool_size));
         let cache_size = matches
             .get_one::<String>("content-cache-size")
             .map(|s| kubedal::util::quantity::parse_bytes(s))

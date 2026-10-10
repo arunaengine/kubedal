@@ -70,6 +70,7 @@ Useful values (see `charts/kubedal/values.yaml` for all of them):
 | `kubeletDir` | `/var/lib/kubelet` | kubelet directory on the nodes |
 | `node.dataDir` | `<kubeletDir>/plugins/<driverName>` | volume data and state on the nodes |
 | `node.contentCacheSize` | `10Gi` | size limit of the content cache |
+| `node.fuseSpoolSize` | `10Gi` | space limit for FUSE files that are written but not uploaded yet |
 | `node.tolerations` | tolerate everything | where the node plugin runs |
 | `controller.replicas` | `1` | more than 1 turns on leader election |
 | `storageClass.create` | `true` | create the `kubedal` StorageClass |

@@ -57,6 +57,7 @@ spec:
             - --node-id=$(NODE_ID)
             - --data-dir={{ include "kubedal.dataDir" . }}
             - --content-cache-size={{ .Values.node.contentCacheSize }}
+            - --fuse-spool-size={{ .Values.node.fuseSpoolSize }}
           env:
             - name: NODE_ID
               valueFrom:

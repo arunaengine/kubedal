@@ -399,3 +399,15 @@ async fn stopped_retry_workers_never_upload_late() {
     tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"newer");
 }
+
+#[tokio::test]
+async fn writes_past_the_spool_limit_fail_with_enospc() {
+    let op = Operator::new(Memory::default()).unwrap();
+    let fs = Filesystem::new(op, 0, 0, tempfile::tempdir().unwrap().keep())
+        .with_spool_budget(Arc::new(SpoolBudget::new(4)));
+    let w = create(&fs, "f.txt").await;
+    let p = Some(OsStr::new("/f.txt"));
+    fs.write(req(), p, w, 0, b"1234", 0, 0).await.unwrap();
+    let err = fs.write(req(), p, w, 4, b"5", 0, 0).await.unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOSPC));
+}

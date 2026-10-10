@@ -1,7 +1,7 @@
 //! Mount operations. A trait keeps them replaceable, so tests can run without root.
 
 use crate::util::error::io_status;
-use crate::util::fuse_fs::{Filesystem, Workers};
+use crate::util::fuse_fs::{Filesystem, SpoolBudget, Workers};
 use crate::util::mountinfo;
 use fuse3::MountOptions;
 use fuse3::raw::MountHandle;
@@ -46,6 +46,18 @@ pub trait Mounter: Send + Sync {
 #[derive(Default)]
 pub struct SystemMounter {
     fuse_sessions: Mutex<HashMap<PathBuf, (MountHandle, Arc<Workers>)>>,
+    /// Space limit for FUSE spool files on this node. None means no limit.
+    spool_budget: Option<Arc<SpoolBudget>>,
+}
+
+impl SystemMounter {
+    /// A mounter whose FUSE spool files may use at most `bytes` on this node.
+    pub fn with_spool_limit(bytes: u64) -> Self {
+        Self {
+            spool_budget: Some(Arc::new(SpoolBudget::new(bytes))),
+            ..Default::default()
+        }
+    }
 }
 
 fn c_path(path: &Path) -> Result<CString, Status> {
@@ -160,7 +172,10 @@ impl Mounter for SystemMounter {
             .fs_name("kubedal")
             .allow_other(true)
             .read_only(read_only);
-        let fs = Filesystem::new(op, 0, 0, spool_dir.to_path_buf());
+        let mut fs = Filesystem::new(op, 0, 0, spool_dir.to_path_buf());
+        if let Some(budget) = &self.spool_budget {
+            fs = fs.with_spool_budget(budget.clone());
+        }
         let workers = fs.workers();
         let handle = fuse3::path::Session::new(options)
             .mount(fs, target)

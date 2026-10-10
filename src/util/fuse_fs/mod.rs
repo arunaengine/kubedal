@@ -44,7 +44,8 @@ use sharded_slab::Slab;
 
 use file::FileKey;
 use file::OpenedFile;
-use states::{FileState, SpoolBudget, States};
+pub use states::SpoolBudget;
+use states::{FileState, States};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -101,6 +102,7 @@ pub struct Filesystem {
     uid: u32,
     /// Shared states of files that are open for writing.
     states: Arc<States>,
+    spool_dir: PathBuf,
     /// Background upload retries, so they can be stopped with the mount.
     workers: Arc<Workers>,
 
@@ -185,6 +187,7 @@ impl Filesystem {
             uid,
             gid,
             workers: Arc::new(Workers::default()),
+            spool_dir: spool_dir.clone(),
             states: Arc::new(States::new(spool_dir, Arc::new(SpoolBudget::new(u64::MAX)))),
             opened_files: Slab::new(),
         }
@@ -232,6 +235,13 @@ impl Filesystem {
         upload_errno(result)
     }
 
+    /// Limit the space of the spool files (shared by all file systems of a node).
+    /// Writes past the limit fail with ENOSPC.
+    pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
+        self.states = Arc::new(States::new(self.spool_dir.clone(), budget));
+        self
+    }
+
     /// The background workers of this file system. Stop them with
     /// [`Workers::shutdown`] before anything else uploads its spool files.
     pub fn workers(&self) -> Arc<Workers> {
@@ -250,7 +260,8 @@ impl Filesystem {
                 }
             }
             tracing::error!(
-                "upload of FUSE file {} keeps failing; the content stays on the node until unpublish",
+                "upload of FUSE file {} keeps failing; the content stays on the node and is \
+                 uploaded before the next mount or on unpublish",
                 state.id
             );
         });

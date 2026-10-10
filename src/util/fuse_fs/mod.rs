@@ -135,6 +135,9 @@ impl Filesystem {
                 }
             }
         }
+        // The namespace lock covers the state lookup and the storage fallback,
+        // so no writable open can load the old content in between.
+        let _ns = self.states.lock_namespace().await;
         // Another handle writes this file: truncate the shared content. A state
         // that closed meanwhile is skipped; its content is in storage then.
         if let Some(path) = path
@@ -146,6 +149,7 @@ impl Filesystem {
         {
             return Ok(());
         }
+        self.states.pause.hit("truncate_fallback").await;
         let path = match (path, fh) {
             (Some(path), _) => path.to_string_lossy().to_string(),
             (None, Some(fh)) => self

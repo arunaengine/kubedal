@@ -959,3 +959,24 @@ async fn a_file_handle_keeps_working_after_its_file_is_renamed() {
     fs.release(req(), pb, w, 0, 0, false).await.unwrap();
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"one two");
 }
+
+#[tokio::test]
+async fn path_truncate_and_a_writable_open_do_not_interleave() {
+    let fs = fs_with("f", "old content").await;
+    let p = Some(OsStr::new("/f"));
+    // The truncate found no open state and is about to empty the object in
+    // storage, while a writable open (without O_TRUNC) wants to load it.
+    let (truncated, opened) = forced(
+        &fs,
+        "truncate_fallback",
+        fs.setattr(req(), p, None, size(0)),
+        fs.open(req(), OsStr::new("/f"), libc::O_WRONLY as u32),
+    )
+    .await;
+    truncated.unwrap();
+    let w = opened.unwrap().fh;
+    fs.write(req(), p, w, 0, b"X", 0, 0).await.unwrap();
+    fs.release(req(), p, w, 0, 0, false).await.unwrap();
+    // The open loaded the truncated (empty) object, so no old tail comes back.
+    assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"X");
+}

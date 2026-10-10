@@ -69,7 +69,9 @@ impl DataPod {
         // Set owner reference and datNodeRef depending on ref/selector
         let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &ns);
         let data_node = if let Some(node_ref) = &self.spec.data_node_ref {
-            data_node_api
+            // Same rule as the node plugin: an explicit namespace wins.
+            let node_ns = data_node_namespace(&ns, node_ref);
+            Api::<DataNode>::namespaced(client.clone(), &node_ns)
                 .get(&node_ref.name)
                 .await
                 .map_err(Error::KubeError)?
@@ -99,13 +101,17 @@ impl DataPod {
             )));
         };
 
-        // Patch owner ref
-        let owner = data_node.owner_ref(&()).ok_or_else(|| {
-            Error::ReconcilerError(format!(
-                "Failed to create owner ref from DataNode: {}",
-                data_node.name_any()
-            ))
-        })?;
+        // Owner references only work inside one namespace.
+        let owner = if data_node.namespace().as_deref() == Some(ns.as_str()) {
+            Some(vec![data_node.owner_ref(&()).ok_or_else(|| {
+                Error::ReconcilerError(format!(
+                    "Failed to create owner ref from DataNode: {}",
+                    data_node.name_any()
+                ))
+            })?])
+        } else {
+            None
+        };
 
         // Patch everything at once
         let data_pod_clone = data_pod.clone();
@@ -115,7 +121,7 @@ impl DataPod {
             "metadata": ObjectMeta {
                 name: Some(name.clone()),
                 namespace: data_pod_clone.metadata.namespace,
-                owner_references: Some(vec![owner]),
+                owner_references: owner,
                 ..Default::default()
             },
             "spec": DataPodSpec {
@@ -180,5 +186,34 @@ impl DataPod {
             .await
             .map_err(Error::KubeError)?;
         Ok(Action::await_change())
+    }
+}
+
+/// Namespace of the DataNode that a DataPod refers to: the namespace in the
+/// reference, or the namespace of the DataPod.
+fn data_node_namespace(data_pod_namespace: &str, node_ref: &Ref) -> String {
+    node_ref
+        .namespace
+        .clone()
+        .filter(|ns| !ns.is_empty())
+        .unwrap_or_else(|| data_pod_namespace.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn explicit_data_node_namespace_wins() {
+        let local = Ref {
+            name: "dn".into(),
+            namespace: None,
+        };
+        assert_eq!(data_node_namespace("team", &local), "team");
+        let remote = Ref {
+            name: "dn".into(),
+            namespace: Some("shared".into()),
+        };
+        assert_eq!(data_node_namespace("team", &remote), "shared");
     }
 }

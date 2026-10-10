@@ -166,16 +166,29 @@ impl DataReplicaSet {
         }
         let replica_count = replica_resources.len();
 
-        // Make sure the sync pod exists.
+        // Make sure the sync pod exists and mounts exactly the current PVCs.
         //TODO: Interval poll source mount for changes and sync to replica mounts
+        let members = members_hash(
+            &source_pvc.name_any(),
+            replica_resources.iter().map(|(_, pvc)| pvc.name_any()),
+        );
         let pod = match pod_api.get_opt(&sync_pod_name(self)).await? {
-            Some(pod) => pod,
+            Some(pod) if pod_members(&pod) == Some(members.as_str()) => pod,
+            Some(pod) => {
+                // The replicas changed, so the pod mounts the wrong PVCs. Delete it;
+                // a later reconcile creates it again with the new members.
+                info!("Replica set {drs_name} changed, deleting sync pod");
+                pod_api.delete(&pod.name_any(), &Default::default()).await?;
+                self.patch_status(&ctx, false).await?;
+                return Ok(Action::requeue(Duration::from_secs(10)));
+            }
             None => {
                 let pod = create_replica_pod(
                     self,
                     &source_data_pod,
                     &source_pvc,
                     replica_resources,
+                    &members,
                     &pod_api,
                 )
                 .await?;
@@ -357,6 +370,7 @@ async fn create_replica_pod(
     source_data_pod: &DataPod,
     source_pvc: &PersistentVolumeClaim,
     replica_resources: Vec<(DataPod, PersistentVolumeClaim)>,
+    members: &str,
     pod_api: &Api<Pod>,
 ) -> Result<Pod, Error> {
     let replica_owner = data_replica_set.owner_ref(&()).ok_or_else(|| {
@@ -446,8 +460,12 @@ async fn create_replica_pod(
             name: Some(sync_pod_name(data_replica_set)),
             namespace: data_replica_set.namespace(),
             owner_references: Some(vec![replica_owner]),
-            labels: None,      //TODO
-            annotations: None, //TODO
+            labels: None, //TODO
+            annotations: Some(
+                [(MEMBERS_ANNOTATION.to_string(), members.to_string())]
+                    .into_iter()
+                    .collect(),
+            ),
             ..Default::default()
         },
         spec: Some(PodSpec {
@@ -489,6 +507,32 @@ fn missing_replica_indexes(drs_uid: &str, desired: usize, existing: &[DataPod]) 
         .collect()
 }
 
+/// Annotation on the sync pod with a hash of the PVCs it mounts.
+const MEMBERS_ANNOTATION: &str = "kubedal.arunaengine.org/replica-members";
+
+/// Hash of the source PVC and the sorted replica PVC names.
+fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut names: Vec<String> = replicas.collect();
+    names.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(source.as_bytes());
+    for name in names {
+        hasher.update([0u8]);
+        hasher.update(name.as_bytes());
+    }
+    crate::node::paths::to_hex(&hasher.finalize())[..16].to_string()
+}
+
+/// The members hash of a sync pod, if it has one.
+fn pod_members(pod: &Pod) -> Option<&str> {
+    pod.metadata
+        .annotations
+        .as_ref()?
+        .get(MEMBERS_ANNOTATION)
+        .map(String::as_str)
+}
+
 /// Name of the sync pod of this set.
 fn sync_pod_name(data_replica_set: &DataReplicaSet) -> String {
     format!("{}-sync", data_replica_set.name_any())
@@ -502,6 +546,25 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn members_hash_changes_with_the_replicas() {
+        let one = members_hash("src", ["a".to_string()].into_iter());
+        let two = members_hash("src", ["b".to_string(), "a".to_string()].into_iter());
+        assert_ne!(one, two);
+        assert_eq!(
+            two,
+            members_hash("src", ["a".to_string(), "b".to_string()].into_iter())
+        );
+        let mut pod = Pod::default();
+        assert_eq!(pod_members(&pod), None);
+        pod.metadata.annotations = Some(
+            [(MEMBERS_ANNOTATION.to_string(), one.clone())]
+                .into_iter()
+                .collect(),
+        );
+        assert_eq!(pod_members(&pod), Some(one.as_str()));
+    }
 
     #[test]
     fn missing_replicas_are_found_by_name() {

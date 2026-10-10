@@ -36,6 +36,7 @@ schemars = "1.2"
 serde_yaml = "0.9.34"
 thiserror = "2.0.12"
 sys-mount = { version = "3.1.0", default-features = false }
+sha2 = "0.10"
 
 [build-dependencies]
 tonic-prost-build = "0.14.6"
@@ -47,3 +48,6 @@ path = "src/main.rs"
 [[bin]]
 name = "crdgen"
 path = "src/crdgen.rs"
+
+[dev-dependencies]
+tempfile = "3.27.0"

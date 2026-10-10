@@ -3,3 +3,4 @@ pub mod fuse_fs;
 pub mod mount_helper;
 pub mod mountinfo;
 pub mod opendal;
+pub mod quantity;

@@ -1,0 +1,38 @@
+# Example pod with inline (ephemeral) kubedal volumes.
+# The DataNode "example-s3-node" must exist in the namespace of the pod
+# (see data_pod_example.yaml). A DataNode in another namespace can be used if
+# the service account of the pod may "get" that DataNode.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: inline-example
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: app
+      image: alpine
+      command: ["sh", "-c", "ls -R /input && date > /output/finished.txt"]
+      volumeMounts:
+        - name: input
+          mountPath: /input
+        - name: output
+          mountPath: /output
+  volumes:
+    # Files below "datasets/run-1" are copied to the node before the pod starts.
+    - name: input
+      csi:
+        driver: kubedal.arunaengine.org
+        readOnly: true
+        volumeAttributes:
+          dataNode: example-s3-node
+          path: datasets/run-1
+          mount: cache-read-only
+    # An empty or existing prefix. New and changed files are uploaded when the pod ends.
+    - name: output
+      csi:
+        driver: kubedal.arunaengine.org
+        volumeAttributes:
+          dataNode: example-s3-node
+          path: results/run-1
+          mount: cache-read-write

@@ -111,10 +111,8 @@ impl DataReplicaSet {
         if !on_read_only.is_empty() {
             for dp in &on_read_only {
                 info!("Moving replica {} off a read-only DataNode", dp.name_any());
-                let _ = pvc_api
-                    .delete(&pvc_name(self, dp), &Default::default())
-                    .await;
-                dp_api.delete(&dp.name_any(), &Default::default()).await?;
+                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
+                delete_if_present(&dp_api, &dp.name_any()).await?;
             }
             self.patch_status(&ctx, false).await?;
             return Ok(Action::requeue(Duration::from_secs(10)));
@@ -188,7 +186,7 @@ impl DataReplicaSet {
                 // The replicas changed, so the pod mounts the wrong PVCs. Delete it;
                 // a later reconcile creates it again with the new members.
                 info!("Replica set {drs_name} changed, deleting sync pod");
-                pod_api.delete(&pod.name_any(), &Default::default()).await?;
+                delete_if_present(&pod_api, &pod.name_any()).await?;
                 self.patch_status(&ctx, false).await?;
                 return Ok(Action::requeue(Duration::from_secs(10)));
             }
@@ -534,6 +532,19 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
     crate::node::paths::to_hex(&hasher.finalize())[..16].to_string()
 }
 
+/// Delete an object. A missing object is fine; every other error (like a
+/// missing RBAC permission) is returned, not ignored.
+async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<(), Error>
+where
+    K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
+{
+    match api.delete(name, &Default::default()).await {
+        Ok(_) => Ok(()),
+        Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+        Err(err) => Err(Error::KubeError(err)),
+    }
+}
+
 /// True if the replica lives on a DataNode (in namespace `ns`) that is read-only.
 fn on_read_only_node(replica: &DataPod, nodes: &[DataNode], ns: &str) -> bool {
     let Some(node_ref) = replica.spec.data_node_ref.as_ref() else {
@@ -607,6 +618,27 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The controller deletes PVCs, DataPods and pods; the chart must allow it.
+    #[test]
+    fn controller_role_allows_the_deletes_it_does() {
+        let rbac = include_str!("../../charts/kubedal/templates/rbac.yaml");
+        let controller = rbac.split("-node").next().unwrap_or_default();
+        for resource in [
+            "persistentvolumeclaims",
+            "datareplicasets/status",
+            "\"pods\"",
+        ] {
+            let at = controller
+                .find(resource)
+                .unwrap_or_else(|| panic!("{resource} missing"));
+            let verbs = controller[at..]
+                .lines()
+                .find(|l| l.contains("verbs:"))
+                .unwrap();
+            assert!(verbs.contains("\"delete\""), "{resource}: {verbs}");
+        }
+    }
 
     #[test]
     fn replicas_on_read_only_data_nodes_are_found() {

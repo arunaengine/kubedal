@@ -4,7 +4,7 @@ use kubedal::csi::{
 };
 use kubedal::node::kube::KubeCluster;
 use kubedal::node::mounter::SystemMounter;
-use kubedal::node::volume::VolumeManager;
+use kubedal::node::volume::{DEFAULT_CONTENT_CACHE_BYTES, VolumeManager};
 use std::path::PathBuf;
 use std::sync::Arc;
 use tokio::net::UnixListener;
@@ -55,6 +55,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .help("Directory for volume data and state on the node")
                 .default_value("/var/lib/kubelet/plugins/kubedal.arunaengine.org")
                 .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("content-cache-size")
+                .long("content-cache-size")
+                .help("Size limit of the node content cache for file-list volumes, like 10Gi")
+                .default_value("10Gi")
+                .value_parser(clap::value_parser!(String)),
         )
         .get_matches();
 
@@ -121,7 +128,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         // Is a csi driver noder
         let cluster = Arc::new(KubeCluster::new(client.clone(), &node_id));
         let mounter = Arc::new(SystemMounter::default());
-        let manager = VolumeManager::new(&data_dir, cluster, mounter)?;
+        let cache_size = matches
+            .get_one::<String>("content-cache-size")
+            .map(|s| kubedal::util::quantity::parse_bytes(s))
+            .transpose()
+            .map_err(|e| format!("invalid --content-cache-size: {e}"))?
+            .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES);
+        let manager =
+            VolumeManager::new(&data_dir, cluster, mounter)?.with_content_cache_limit(cache_size);
         tracing::info!("Data directory: {}", data_dir.display());
         // Clean up what a previous run of the plugin left behind.
         let report = manager.reconcile().await?;

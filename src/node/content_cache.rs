@@ -52,6 +52,10 @@ impl ContentCache {
         })
     }
 
+    pub fn set_max_bytes(&mut self, max_bytes: u64) {
+        self.max_bytes = max_bytes;
+    }
+
     /// Path of a cached object. `digest` must be lowercase hex (checked by the manifest).
     pub fn path(&self, digest: &str) -> PathBuf {
         self.objects.join(digest)

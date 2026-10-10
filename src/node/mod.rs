@@ -1,5 +1,6 @@
 pub mod cluster;
 pub mod content_cache;
+pub mod file_list;
 pub mod kube;
 pub mod manifest;
 pub mod mounter;

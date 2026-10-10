@@ -6,6 +6,7 @@
 //! - `volumes/<id>/baseline.json`: file sizes and times right after the download
 
 use crate::node::cluster::{Cluster, EventKind, ResolvedNode};
+use crate::node::content_cache::ContentCache;
 use crate::node::mounter::Mounter;
 use crate::node::paths::{self, publish_id};
 use crate::node::state::{
@@ -18,6 +19,9 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
 use tonic::Status;
+
+/// Default size limit of the node content cache (10 GiB).
+pub const DEFAULT_CONTENT_CACHE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
 
 /// How a DataNode prefix is presented in the pod.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,6 +64,7 @@ pub struct VolumeManager {
     mounter: Arc<dyn Mounter>,
     busy: Mutex<HashSet<String>>,
     retry: RetryPolicy,
+    content: ContentCache,
 }
 
 /// Marks a volume as busy while an operation runs on it.
@@ -84,6 +89,7 @@ impl VolumeManager {
         let root = root.into();
         let state = StateStore::open(root.join("state"))?;
         std::fs::create_dir_all(root.join("volumes"))?;
+        let content = ContentCache::open(&root.join("content"), DEFAULT_CONTENT_CACHE_BYTES)?;
         Ok(Self {
             root,
             state,
@@ -91,10 +97,21 @@ impl VolumeManager {
             mounter,
             busy: Mutex::new(HashSet::new()),
             retry: RetryPolicy::default(),
+            content,
         })
     }
 
     /// Change how failed uploads are retried.
+    /// Change the size limit of the node content cache.
+    pub fn with_content_cache_limit(mut self, max_bytes: u64) -> Self {
+        self.content.set_max_bytes(max_bytes);
+        self
+    }
+
+    pub fn content_cache(&self) -> &ContentCache {
+        &self.content
+    }
+
     pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
         self.retry = retry;
         self
@@ -277,9 +294,10 @@ impl VolumeManager {
                     }
                 }
             }
-            VolumeSource::FileList { .. } => Err(Status::unimplemented(
-                "file-list volumes are not supported yet",
-            )),
+            VolumeSource::FileList { node, manifest } => {
+                self.prepare_file_list(id, node, manifest, &req.pod, record)
+                    .await
+            }
         }
     }
 
@@ -325,7 +343,7 @@ impl VolumeManager {
     }
 
     /// Create an empty data directory for a volume, removing old content.
-    async fn fresh_data_dir(&self, id: &str) -> Result<PathBuf, Status> {
+    pub(crate) async fn fresh_data_dir(&self, id: &str) -> Result<PathBuf, Status> {
         let dir = self.volume_dir(id);
         remove_dir_all(&dir).await?;
         let data = self.data_dir(id);

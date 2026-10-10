@@ -297,12 +297,16 @@ the cache. The least recently used files are removed when the cache grows over
 - **FUSE mounts end when the node plugin restarts**, for example on a DaemonSet
   update. kubedal unmounts the stale mount on start and records a `FuseMountLost`
   event on the pod. The pod has to be restarted. Cache volumes are not affected.
-- In FUSE read-write mode, a file that is open for writing lives in a local spool
-  file. The whole file is uploaded on every `close` and `fsync`, and upload errors
-  are returned there. Opening an existing file for writing needs `O_TRUNC` or
-  `O_APPEND`. Use `cache-read-write` for programs that write a lot.
+- In FUSE read-write mode, a file that is open for writing lives in one spool file
+  on the node, shared by all handles of that file. Reads, size, truncate, unlink
+  and rename see the spool content. The whole file is uploaded on every `close`
+  and `fsync`, and upload errors are returned there. If the upload keeps failing,
+  the spool file stays on the node and is uploaded before the next mount or on
+  unpublish (also after a restart of the driver). Every upload sends the whole
+  file, so use `cache-read-write` for programs that write a lot.
 - Write-back uploads new and changed files (compared by size, modification time,
-  change time and inode).
+  change time and inode). For pods with `fsGroup`, kubelet changes the owner of
+  all files, which changes their change time, so all files are uploaded again.
   Files deleted in the pod are not deleted in storage. Symlinks and special files
   are not uploaded.
 - Object storage does not keep file modes. Cache volumes use 0644 for files and 0755

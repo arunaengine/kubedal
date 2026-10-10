@@ -205,18 +205,20 @@ impl ContentCache {
             if total <= self.max_bytes {
                 break;
             }
-            // Skip objects that a running publish holds right now.
+            // Skip objects that a running publish holds right now. The lock map stays
+            // locked until the file is gone, so no publish can start using it in
+            // between: it either holds the lock already (busy) or sees a miss.
             let object = name.to_string_lossy().to_string();
-            let busy = self
-                .locks
-                .lock()
-                .unwrap_or_else(|p| p.into_inner())
+            let locks = self.locks.lock().unwrap_or_else(|p| p.into_inner());
+            let busy = locks
                 .get(&object)
                 .is_some_and(|lock| Arc::strong_count(lock) > 1);
             if busy {
                 continue;
             }
-            match std::fs::remove_file(&path) {
+            let removed = std::fs::remove_file(&path);
+            drop(locks);
+            match removed {
                 Ok(()) => {
                     total -= size;
                     report.removed_files += 1;

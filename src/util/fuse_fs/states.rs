@@ -201,6 +201,9 @@ pub struct StateData {
     charged: u64,
     /// The spool data file was removed from disk.
     data_removed: bool,
+    /// Test hook: the next write writes this many bytes and then fails.
+    #[cfg(test)]
+    fail_after: Option<usize>,
     budget: Arc<SpoolBudget>,
 }
 
@@ -264,14 +267,27 @@ impl StateData {
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
         let before = self.charged;
         self.charge_to(self.len.max(end))?;
-        if let Err(err) = self.file.write_all_at(data, offset) {
-            // Give the space back; the write did not happen.
-            let _ = self.charge_to(before);
+        if let Err(err) = self.write_file(data, offset) {
+            // The write may have extended the file in part. Cut it back to the
+            // old length and charge what is really on disk.
+            let _ = self.file.set_len(self.len);
+            let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(before);
+            let _ = self.charge_to(on_disk);
             return Err(err);
         }
         self.len = self.len.max(end);
         self.dirty = true;
         Ok(())
+    }
+
+    fn write_file(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
+        #[cfg(test)]
+        if let Some(n) = self.fail_after.take() {
+            // Test hook: write only part of the data, then fail.
+            self.file.write_all_at(&data[..n.min(data.len())], offset)?;
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
+        self.file.write_all_at(data, offset)
     }
 
     pub fn read_at(&self, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
@@ -523,6 +539,8 @@ impl States {
                 complete: false,
                 charged: 0,
                 data_removed: false,
+                #[cfg(test)]
+                fail_after: None,
                 budget: self.budget.clone(),
             }),
         });
@@ -1021,6 +1039,24 @@ mod tests {
         assert_eq!(budget.used(), 0);
         // The next byte fits again.
         budget.reserve(1).unwrap();
+    }
+
+    #[tokio::test]
+    async fn partly_failed_writes_charge_what_is_on_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = Arc::new(SpoolBudget::new(u64::MAX));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        let mut data = joined.lock().await;
+        data.write_at(b"12", 0).unwrap();
+        // The next write extends the file by 3 of 10 bytes, then fails.
+        data.fail_after = Some(3);
+        assert!(data.write_at(&[9u8; 10], 2).is_err());
+        let on_disk = data.file.metadata().unwrap().len();
+        assert_eq!(on_disk, 2);
+        assert_eq!(budget.used(), on_disk);
+        assert_eq!(data.len, 2);
     }
 
     #[tokio::test]

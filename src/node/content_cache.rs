@@ -6,9 +6,11 @@
 //! writes to its copy therefore never changes the cache. Cache files are read-only
 //! and are checked against their digest before they enter the cache.
 
+use crate::node::paths;
 use crate::node::transfer::{self, ByteBudget};
 use crate::util::error::io_status;
 use opendal::Operator;
+use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::os::unix::fs::PermissionsExt;
 use std::path::{Path, PathBuf};
@@ -57,8 +59,12 @@ impl ContentCache {
     }
 
     /// Path of a cached object. `digest` must be lowercase hex (checked by the manifest).
-    pub fn path(&self, digest: &str) -> PathBuf {
-        self.objects.join(digest)
+    ///
+    /// `scope` names the DataNode the content came from. A cache hit needs the same
+    /// scope, so a pod can never get content of a DataNode it may not read just by
+    /// knowing its digest.
+    pub fn path(&self, scope: &str, digest: &str) -> PathBuf {
+        self.objects.join(object_name(scope, digest))
     }
 
     fn lock_for(&self, digest: &str) -> Arc<tokio::sync::Mutex<()>> {
@@ -74,13 +80,14 @@ impl ContentCache {
     pub async fn fetch(
         &self,
         op: &Operator,
+        scope: &str,
         key: &str,
         digest: &str,
         budget: &ByteBudget,
     ) -> Result<PathBuf, Status> {
-        let lock = self.lock_for(digest);
+        let lock = self.lock_for(&object_name(scope, digest));
         let _guard = lock.lock().await;
-        let path = self.path(digest);
+        let path = self.path(scope, digest);
 
         if let Ok(meta) = tokio::fs::metadata(&path).await {
             budget.add(meta.len())?;
@@ -166,12 +173,12 @@ impl ContentCache {
                 break;
             }
             // Skip objects that a running publish holds right now.
-            let digest = name.to_string_lossy().to_string();
+            let object = name.to_string_lossy().to_string();
             let busy = self
                 .locks
                 .lock()
                 .unwrap_or_else(|p| p.into_inner())
-                .get(&digest)
+                .get(&object)
                 .is_some_and(|lock| Arc::strong_count(lock) > 1);
             if busy {
                 continue;
@@ -188,6 +195,12 @@ impl ContentCache {
         report.remaining_bytes = total;
         Ok(report)
     }
+}
+
+/// File name of a cached object: a short hash of the scope, then the digest.
+fn object_name(scope: &str, digest: &str) -> String {
+    let scope_hash = paths::to_hex(&Sha256::digest(scope.as_bytes()));
+    format!("{}-{digest}", &scope_hash[..16])
 }
 
 #[cfg(test)]
@@ -211,13 +224,13 @@ mod tests {
         let op = op_with("a", "abc").await;
         let budget = ByteBudget::default();
 
-        let path = cache.fetch(&op, "a", ABC, &budget).await.unwrap();
+        let path = cache.fetch(&op, "ns/dn", "a", ABC, &budget).await.unwrap();
         assert_eq!(std::fs::read_to_string(&path).unwrap(), "abc");
         assert_eq!(std::fs::metadata(&path).unwrap().mode() & 0o777, 0o444);
 
         // A hit does not read the object again, even if storage changed.
         op.write("a", "changed").await.unwrap();
-        let again = cache.fetch(&op, "a", ABC, &budget).await.unwrap();
+        let again = cache.fetch(&op, "ns/dn", "a", ABC, &budget).await.unwrap();
         assert_eq!(again, path);
         assert_eq!(std::fs::read_to_string(&again).unwrap(), "abc");
         // Both uses count against the volume budget.
@@ -230,11 +243,11 @@ mod tests {
         let cache = ContentCache::open(dir.path(), u64::MAX).unwrap();
         let op = op_with("a", "not abc").await;
         let err = cache
-            .fetch(&op, "a", ABC, &ByteBudget::default())
+            .fetch(&op, "ns/dn", "a", ABC, &ByteBudget::default())
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::DataLoss);
-        assert!(!cache.path(ABC).exists());
+        assert!(!cache.path("ns/dn", ABC).exists());
         assert_eq!(
             std::fs::read_dir(dir.path().join("tmp")).unwrap().count(),
             0
@@ -247,7 +260,7 @@ mod tests {
         let cache = ContentCache::open(&dir.path().join("c"), u64::MAX).unwrap();
         let op = op_with("a", "abc").await;
         let cached = cache
-            .fetch(&op, "a", ABC, &ByteBudget::default())
+            .fetch(&op, "ns/dn", "a", ABC, &ByteBudget::default())
             .await
             .unwrap();
         let dest = dir.path().join("copy");
@@ -263,8 +276,8 @@ mod tests {
     async fn prune_removes_oldest_first() {
         let dir = tempfile::tempdir().unwrap();
         let cache = ContentCache::open(dir.path(), 4).unwrap();
-        let old = cache.path(&"1".repeat(64));
-        let new = cache.path(&"2".repeat(64));
+        let old = cache.path("ns/dn", &"1".repeat(64));
+        let new = cache.path("ns/dn", &"2".repeat(64));
         std::fs::write(&old, "old").unwrap();
         std::fs::write(&new, "new").unwrap();
         let past = SystemTime::now() - std::time::Duration::from_secs(3600);

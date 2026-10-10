@@ -111,7 +111,7 @@ async fn files_are_placed_and_outputs_uploaded() {
     assert_eq!(events.last().unwrap().reason, "VolumeUploaded");
 
     // The cache still holds the original content.
-    let cached = env.manager.content_cache().path(HELLO);
+    let cached = env.manager.content_cache().path("team/store", HELLO);
     assert_eq!(std::fs::read_to_string(cached).unwrap(), "hello");
 }
 
@@ -162,7 +162,12 @@ async fn digest_mismatch_fails_and_cleans_up() {
     let id = publish_id("vol-1", &target.to_string_lossy());
     assert!(!env.manager.volume_dir(&id).exists());
     assert!(env.manager.state().load(&id).unwrap().is_none());
-    assert!(!env.manager.content_cache().path(WORLD).exists());
+    assert!(
+        !env.manager
+            .content_cache()
+            .path("team/store", WORLD)
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -249,7 +254,12 @@ async fn declared_sizes_are_checked_against_the_limit() {
         .unwrap_err();
     assert_eq!(err.code(), Code::ResourceExhausted);
     // Nothing was downloaded into the cache.
-    assert!(!env.manager.content_cache().path(HELLO).exists());
+    assert!(
+        !env.manager
+            .content_cache()
+            .path("team/store", HELLO)
+            .exists()
+    );
 }
 
 #[tokio::test]
@@ -273,4 +283,46 @@ async fn invalid_manifest_is_rejected() {
             .iter()
             .all(|e| e.kind != EventKind::Normal)
     );
+}
+
+#[tokio::test]
+async fn cache_hits_need_the_same_data_node() {
+    let env = Env::new();
+    let bucket = env.add_store(None, false);
+    write(&bucket.join("jobs/1.json"), &manifest_json());
+    add_results(&env);
+    env.manager
+        .publish(request("vol-1", &env.target("p1"), "jobs/1.json"))
+        .await
+        .unwrap();
+
+    // Another namespace with its own DataNode knows the digest of a file in "store",
+    // but its source does not exist. It must not get the cached bytes.
+    let other = env.dir.path().join("other-bucket");
+    write(
+        &other.join("jobs/steal.json"),
+        &format!(
+            r#"{{"version": 1, "files": [{{"path": "x", "source": "missing", "sha256": "{HELLO}"}}]}}"#
+        ),
+    );
+    env.cluster.add_node(
+        "other",
+        "store",
+        FakeNode {
+            root: other,
+            limit: None,
+            read_only: false,
+        },
+    );
+    let mut req = request("vol-2", &env.target("p2"), "jobs/steal.json");
+    req.pod = pod("other");
+    req.source = VolumeSource::FileList {
+        node: DataNodeRef {
+            name: "store".into(),
+            namespace: "other".into(),
+        },
+        manifest: "jobs/steal.json".into(),
+    };
+    let err = env.manager.publish(req).await.unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
 }

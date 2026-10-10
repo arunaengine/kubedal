@@ -87,9 +87,10 @@ impl VolumeManager {
         }
 
         let cache = self.content_cache();
+        let scope = node.to_string();
         futures::stream::iter(plan.files.iter().map(Ok::<_, Status>))
             .try_for_each_concurrent(CONCURRENCY, |file| {
-                place_file(cache, &op, &data, file, &budget)
+                place_file(cache, &op, &scope, &data, file, &budget)
             })
             .await?;
         tracing::info!(
@@ -117,6 +118,7 @@ impl VolumeManager {
 async fn place_file(
     cache: &ContentCache,
     op: &Operator,
+    scope: &str,
     data: &Path,
     file: &PlannedFile,
     budget: &ByteBudget,
@@ -127,7 +129,7 @@ async fn place_file(
     }
     let size = match &file.sha256 {
         Some(digest) => {
-            let cached = cache.fetch(op, &file.source, digest, budget).await?;
+            let cached = cache.fetch(op, scope, &file.source, digest, budget).await?;
             ContentCache::place(&cached, &dest, file.executable).await?;
             tokio::fs::metadata(&dest)
                 .await

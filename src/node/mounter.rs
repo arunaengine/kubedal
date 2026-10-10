@@ -17,7 +17,8 @@ use tonic::Status;
 #[allow(clippy::double_must_use)]
 #[tonic::async_trait]
 pub trait Mounter: Send + Sync {
-    /// Bind mount `source` at `target`. `target` must exist.
+    /// Mount `source` at `target`: a bind mount, or a read-only overlay when
+    /// `read_only` is set. `target` must exist.
     async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status>;
 
     /// Serve `op` as a FUSE file system at `target`. `target` must exist.
@@ -77,43 +78,63 @@ fn sys_umount(target: &CString, flags: libc::c_int) -> std::io::Result<()> {
     }
 }
 
-/// Make a read-only bind mount of `source` at `target`.
+/// Mount `source` read-only at `target`.
 ///
-/// MS_RDONLY is ignored by a plain bind, and a later remount does not reach the
-/// copies that mount propagation already made for kubelet and the container.
-/// So the read-only mount is prepared at a staging path first; the bind to the
-/// target then copies the read-only flag, and so do all propagated copies.
-fn bind_read_only(source: &CString, staging: &CString, target: &CString) -> Result<(), Status> {
-    let staging_path = Path::new(std::ffi::OsStr::from_bytes(staging.as_bytes()));
-    std::fs::create_dir_all(staging_path).map_err(|e| io_status(e, "create staging directory"))?;
-    let result = (|| {
-        sys_mount(Some(source), staging, libc::MS_BIND).map_err(|e| io_status(e, "bind mount"))?;
-        let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
-        sys_mount(None, staging, flags).map_err(|e| io_status(e, "remount read-only"))?;
-        sys_mount(Some(staging), target, libc::MS_BIND).map_err(|e| io_status(e, "bind mount"))?;
-        // Also mark the target itself, in case the kernel did not copy the flag.
-        if let Err(err) = sys_mount(None, target, flags) {
-            let _ = sys_umount(target, libc::MNT_DETACH);
-            return Err(io_status(err, "remount read-only"));
+/// A read-only bind mount is not enough: the container runtime remounts the
+/// volume with its own flags and makes it writable again. A read-only overlay
+/// file system is read-only for every mount of it. Overlay needs two lower
+/// layers when it has no upper layer, so an empty folder is the second one.
+fn mount_read_only(source: &Path, empty: &Path, target: &CString) -> Result<(), Status> {
+    for path in [source, empty] {
+        let text = path.to_string_lossy();
+        if text.contains([':', ',', '\\']) {
+            return Err(Status::internal(format!(
+                "path {text} cannot be used as an overlay layer"
+            )));
         }
+    }
+    std::fs::create_dir_all(empty).map_err(|e| io_status(e, "create empty overlay layer"))?;
+    let options = CString::new(format!(
+        "lowerdir={}:{}",
+        source.to_string_lossy(),
+        empty.to_string_lossy()
+    ))
+    .map_err(|_| Status::internal("overlay options contain a NUL byte"))?;
+    let fs_type = c"overlay";
+    // SAFETY: all pointers are valid NUL terminated strings, as mount(2) expects.
+    let rc = unsafe {
+        libc::mount(
+            fs_type.as_ptr(),
+            target.as_ptr(),
+            fs_type.as_ptr(),
+            libc::MS_RDONLY | libc::MS_NOSUID | libc::MS_NODEV,
+            options.as_ptr().cast(),
+        )
+    };
+    if rc == 0 {
         Ok(())
-    })();
-    let _ = sys_umount(staging, libc::MNT_DETACH);
-    let _ = std::fs::remove_dir(staging_path);
-    result
+    } else {
+        Err(io_status(
+            std::io::Error::last_os_error(),
+            "mount read-only overlay",
+        ))
+    }
 }
 
 #[tonic::async_trait]
 impl Mounter for SystemMounter {
     async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status> {
-        let staging = read_only.then(|| source.with_extension("ro"));
+        let source_path = source.to_path_buf();
         let source = c_path(source)?;
         let target_c = c_path(target)?;
-        let staging_c = staging.as_deref().map(c_path).transpose()?;
-        tokio::task::spawn_blocking(move || match staging_c {
-            None => sys_mount(Some(&source), &target_c, libc::MS_BIND)
-                .map_err(|e| io_status(e, "bind mount")),
-            Some(staging_c) => bind_read_only(&source, &staging_c, &target_c),
+        tokio::task::spawn_blocking(move || {
+            if read_only {
+                let empty = source_path.with_extension("empty");
+                mount_read_only(&source_path, &empty, &target_c)
+            } else {
+                sys_mount(Some(&source), &target_c, libc::MS_BIND)
+                    .map_err(|e| io_status(e, "bind mount"))
+            }
         })
         .await
         .map_err(|e| Status::internal(format!("mount task failed: {e}")))?

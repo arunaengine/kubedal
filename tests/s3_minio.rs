@@ -197,3 +197,45 @@ async fn file_list_with_upload() {
     );
     op.delete_with("").recursive(true).await.unwrap();
 }
+
+#[tokio::test]
+async fn fuse_closed_file_rename_on_s3() {
+    use fuse3::path::prelude::*;
+    use kubedal::util::fuse_fs::Filesystem;
+    use std::ffi::OsStr;
+    let Some(cfg) = s3_config() else {
+        eprintln!("KUBEDAL_TEST_S3_ENDPOINT is not set, skipping");
+        return;
+    };
+    check_bucket(&cfg).await;
+    let op = build_operator(&Backend::S3, cfg, "").unwrap();
+    let spool = tempfile::tempdir().unwrap();
+    let fs = Filesystem::new(op.clone(), 0, 0, spool.path().to_path_buf());
+    let req = Request {
+        unique: 1,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    let flags = (libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC) as u32;
+    let fh = fs
+        .create(req, OsStr::new("/"), OsStr::new("out.tmp"), 0o644, flags)
+        .await
+        .unwrap()
+        .fh;
+    let p = Some(OsStr::new("/out.tmp"));
+    fs.write(req, p, fh, 0, b"result", 0, 0).await.unwrap();
+    fs.release(req, p, fh, 0, 0, false).await.unwrap();
+    fs.rename(
+        req,
+        OsStr::new("/"),
+        OsStr::new("out.tmp"),
+        OsStr::new("/"),
+        OsStr::new("out"),
+    )
+    .await
+    .unwrap();
+    assert!(!op.exists("out.tmp").await.unwrap());
+    assert_eq!(op.read("out").await.unwrap().to_vec(), b"result");
+    op.delete_with("").recursive(true).await.unwrap();
+}

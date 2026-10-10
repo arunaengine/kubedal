@@ -238,6 +238,44 @@ impl Filesystem {
             .map_err(io_errno)
     }
 
+    /// Rename a closed file on a backend without native rename (S3, GCS, Azure
+    /// Blob): copy it, then remove the old object. Folders fail with EXDEV, which
+    /// tells programs like `mv` to copy the files themselves.
+    async fn rename_by_copy(&self, from: &str, to: &str) -> Result<()> {
+        let meta = self.stat_entry(from).await.map_err(opendal_error2errno)?;
+        if meta.is_dir() {
+            return Err(Errno::from(libc::EXDEV));
+        }
+        if self.op.info().capability().copy {
+            self.op.copy(from, to).await.map_err(opendal_error2errno)?;
+        } else {
+            let mut reader = self
+                .op
+                .reader(from)
+                .await
+                .map_err(opendal_error2errno)?
+                .into_bytes_stream(..)
+                .await
+                .map_err(opendal_error2errno)?;
+            let mut writer = self
+                .op
+                .writer_with(to)
+                .chunk(8 * 1024 * 1024)
+                .await
+                .map_err(opendal_error2errno)?;
+            while let Some(chunk) = reader.next().await {
+                let chunk =
+                    chunk.map_err(|e| Errno::from(e.raw_os_error().unwrap_or(libc::EIO)))?;
+                if let Err(err) = writer.write(chunk).await {
+                    let _ = writer.abort().await;
+                    return Err(opendal_error2errno(err));
+                }
+            }
+            writer.close().await.map_err(opendal_error2errno)?;
+        }
+        self.op.delete(from).await.map_err(opendal_error2errno)
+    }
+
     /// Returns (read, write, append) for open flags.
     fn check_flags(&self, flags: u32) -> Result<(bool, bool, bool)> {
         let is_append = flags & libc::O_APPEND as u32 != 0;

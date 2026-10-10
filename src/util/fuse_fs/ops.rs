@@ -194,15 +194,15 @@ impl PathFilesystem for Filesystem {
             return Ok(());
         }
 
-        if !self.op.info().capability().rename {
-            Err(Errno::from(libc::ENOTSUP))?;
+        let (from, to) = (key_of(origin_path.as_os_str()), key_of(path.as_os_str()));
+        if self.op.info().capability().rename {
+            return self
+                .op
+                .rename(&from, &to)
+                .await
+                .map_err(opendal_error2errno);
         }
-        self.op
-            .rename(&origin_path.to_string_lossy(), &path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
-
-        Ok(())
+        self.rename_by_copy(&from, &to).await
     }
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {

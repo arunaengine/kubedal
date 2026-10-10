@@ -246,3 +246,42 @@ async fn opening_for_write_without_truncate_keeps_the_content() {
     fs.release(req(), p, w, 0, 0, false).await.unwrap();
     assert_eq!(fs.op.read("f.txt").await.unwrap().to_vec(), b"Jello");
 }
+
+#[tokio::test]
+async fn closed_files_are_renamed_by_copy() {
+    // The memory backend has no native rename, like S3, GCS and Azure Blob.
+    let fs = fs_with("other", "").await;
+    assert!(!fs.op.info().capability().rename);
+    let w = create(&fs, "out.tmp").await;
+    let p = Some(OsStr::new("/out.tmp"));
+    fs.write(req(), p, w, 0, b"result", 0, 0).await.unwrap();
+    fs.release(req(), p, w, 0, 0, false).await.unwrap();
+    // Write a temp file, close it, then rename it to the final name.
+    fs.rename(
+        req(),
+        OsStr::new("/"),
+        OsStr::new("out.tmp"),
+        OsStr::new("/"),
+        OsStr::new("out"),
+    )
+    .await
+    .unwrap();
+    assert!(!fs.op.exists("out.tmp").await.unwrap());
+    assert_eq!(fs.op.read("out").await.unwrap().to_vec(), b"result");
+}
+
+#[tokio::test]
+async fn renaming_a_folder_without_native_rename_asks_for_a_copy() {
+    let fs = fs_with("dir/a.txt", "a").await;
+    let err = fs
+        .rename(
+            req(),
+            OsStr::new("/"),
+            OsStr::new("dir"),
+            OsStr::new("/"),
+            OsStr::new("dir2"),
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::EXDEV));
+}

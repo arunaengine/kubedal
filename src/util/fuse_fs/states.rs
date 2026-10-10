@@ -381,16 +381,39 @@ impl StateData {
     }
 
     /// Upload the content to its key.
+    ///
+    /// The spool data is synced before every upload, and a journal exists while
+    /// the upload runs, so a failed upload can be replayed. After a successful
+    /// upload the journal is removed durably: published content is never
+    /// replayed again (a replay could overwrite newer content in storage).
     async fn upload(&mut self, op: &Operator) -> Result<(), Status> {
         if !self.dirty {
             return Ok(());
         }
+        self.file
+            .sync_all()
+            .map_err(|e| io_status(e, "sync spool file"))?;
         if !self.complete {
             self.write_meta()
                 .map_err(|e| io_status(e, "write spool metadata"))?;
         }
         upload_data_file(op, &self.data_path, &self.key).await?;
         self.dirty = false;
+        let removed = match std::fs::remove_file(&self.meta_path) {
+            Ok(()) => self.sync_dir(),
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(err) => {
+                mark_broken(
+                    &self.broken,
+                    &format!("removing a used journal failed: {err}"),
+                );
+                Err(err)
+            }
+        };
+        if removed.is_err() {
+            return Err(broken_status());
+        }
+        self.complete = false;
         Ok(())
     }
 
@@ -645,7 +668,12 @@ impl States {
             Ok(())
         };
         // Only now the spool file holds complete content and may be replayed.
+        // Content that was just loaded from storage is published already and
+        // needs no journal until it changes.
         let loaded = loaded.and_then(|()| {
+            if !data.dirty {
+                return Ok(());
+            }
             data.write_meta()
                 .map_err(|e| io_status(e, "write spool metadata"))
         });
@@ -1054,7 +1082,8 @@ mod tests {
         let data = joined.lock().await;
         assert_eq!(data.len, 3 * 1024 * 1024);
         assert!(!data.dirty);
-        assert!(data.complete);
+        // Loaded content is published already: no journal to replay.
+        assert!(!data.complete);
         assert_eq!(data.read_at(10, 4).unwrap(), vec![5u8; 4]);
     }
 
@@ -1127,6 +1156,37 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
+    }
+
+    #[tokio::test]
+    async fn uploaded_content_has_no_replayable_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        a.lock().await.write_at(b"v1", 0).unwrap();
+        states.upload(&op, &a).await.unwrap();
+        let journals = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "json")
+                })
+                .count()
+        };
+        assert_eq!(journals(), 0);
+        // Someone else writes a newer version; a replay must not overwrite it.
+        op.write("a", "newer elsewhere").await.unwrap();
+        drop(a);
+        drop(states);
+        upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(op.read("a").await.unwrap().to_vec(), b"newer elsewhere");
     }
 
     #[tokio::test]

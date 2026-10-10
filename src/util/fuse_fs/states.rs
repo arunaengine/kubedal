@@ -251,6 +251,23 @@ impl StateData {
     }
 }
 
+/// Mark a state as unlinked and remove its journal durably, so neither the state
+/// nor a replay after a crash uploads it again.
+fn retire(state: &FileState, data: &mut StateData) -> std::io::Result<()> {
+    state.unlinked.store(true, Ordering::SeqCst);
+    data.dirty = false;
+    match std::fs::remove_file(&data.meta_path) {
+        Ok(()) => {}
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+        Err(err) => return Err(err),
+    }
+    data.complete = false;
+    if let Some(dir) = data.meta_path.parent() {
+        File::open(dir)?.sync_all()?;
+    }
+    Ok(())
+}
+
 async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<(), Status> {
     let file = tokio::fs::File::open(data_path)
         .await
@@ -517,35 +534,80 @@ impl States {
     /// The object under the old name is removed from storage right away, while
     /// the state is locked. Removing it later could remove a new file that was
     /// created under the old name in the meantime. The content stays in the spool
-    /// and is uploaded under the new name.
+    /// and is uploaded under the new name. A live state at `to` is retired: its
+    /// handles keep working, but it never uploads under that name again.
     pub async fn rename(&self, op: &Operator, from: &str, to: &str) -> Result<bool, Status> {
-        let Some(state) = self.get(from) else {
-            return Ok(false);
+        loop {
+            let Some(src) = self.get(from) else {
+                return Ok(false);
+            };
+            let dst = self.get(to).filter(|d| !Arc::ptr_eq(d, &src));
+            // Two states are always locked in the order of their ids.
+            let (mut src_data, dst_data) = match &dst {
+                Some(dst) if dst.id < src.id => {
+                    let d = dst.lock().await;
+                    (src.lock().await, Some(d))
+                }
+                Some(dst) => {
+                    let sd = src.lock().await;
+                    (sd, Some(dst.lock().await))
+                }
+                None => (src.lock().await, None),
+            };
+            if src_data.closed || src.is_unlinked() {
+                // It closed while we waited; look again (it may be a closed file now).
+                if self.get(from).is_some_and(|s| Arc::ptr_eq(&s, &src)) {
+                    return Ok(false);
+                }
+                continue;
+            }
+            let map_ok = {
+                let map = self.map();
+                map.get(from).is_some_and(|s| Arc::ptr_eq(s, &src))
+                    && match &dst {
+                        Some(d) => map.get(to).is_some_and(|s| Arc::ptr_eq(s, d)),
+                        None => !map.contains_key(to),
+                    }
+            };
+            if !map_ok {
+                continue;
+            }
+            self.pause.hit("rename_locked").await;
+            match op.delete(from).await {
+                Ok(()) => {}
+                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+                Err(err) => return Err(opendal_status(err, "remove old name")),
+            }
+            if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data) {
+                retire(dst, &mut dst_data).map_err(|e| io_status(e, "retire old file"))?;
+            }
+            {
+                let mut map = self.map();
+                map.remove(from);
+                map.insert(to.to_string(), src.clone());
+            }
+            src_data.key = to.to_string();
+            src_data.dirty = true;
+            src_data
+                .write_meta()
+                .map_err(|e| io_status(e, "write spool metadata"))?;
+            return Ok(true);
+        }
+    }
+
+    /// Retire the live state of `key`, because another file takes its name (a
+    /// rename of a closed file onto it). Its handles keep working, but it never
+    /// uploads under that name again.
+    pub async fn retire(&self, key: &str) -> Result<(), Status> {
+        let Some(state) = self.get(key) else {
+            return Ok(());
         };
         let Some(mut data) = state.lock_alive().await else {
-            return Ok(false);
+            return Ok(());
         };
-        self.pause.hit("rename_locked").await;
-        match op.delete(from).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
-            Err(err) => return Err(opendal_status(err, "remove old name")),
-        }
-        {
-            let mut map = self.map();
-            if map.get(from).is_some_and(|s| Arc::ptr_eq(s, &state)) {
-                map.remove(from);
-            }
-            if let Some(replaced) = map.insert(to.to_string(), state.clone()) {
-                // The old file under the new name loses its name.
-                replaced.unlinked.store(true, Ordering::SeqCst);
-            }
-        }
-        data.key = to.to_string();
-        data.dirty = true;
-        data.write_meta()
-            .map_err(|e| io_status(e, "write spool metadata"))?;
-        Ok(true)
+        retire(&state, &mut data).map_err(|e| io_status(e, "retire old file"))?;
+        self.unmap(key, &state);
+        Ok(())
     }
 }
 

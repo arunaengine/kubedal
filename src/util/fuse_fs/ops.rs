@@ -195,6 +195,9 @@ impl PathFilesystem for Filesystem {
         }
 
         let (from, to) = (key_of(origin_path.as_os_str()), key_of(path.as_os_str()));
+        // A file open under the new name loses it; it must never upload over
+        // the renamed file later.
+        self.states.retire(&to).await.map_err(status_errno)?;
         if self.op.info().capability().rename {
             return self
                 .op

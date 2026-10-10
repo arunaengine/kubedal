@@ -437,3 +437,63 @@ async fn renaming_an_open_file_never_removes_a_later_file_with_the_old_name() {
     assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"new a");
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"moved");
 }
+
+async fn fs_in(dir: &std::path::Path) -> (Filesystem, Operator) {
+    let root = dir.join("root");
+    std::fs::create_dir_all(&root).unwrap();
+    let op = Operator::new(opendal::services::Fs::default().root(&root.to_string_lossy())).unwrap();
+    (Filesystem::new(op.clone(), 0, 0, dir.join("spool")), op)
+}
+
+#[tokio::test]
+async fn rename_onto_an_open_file_retires_it_also_for_replay() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let (pa, pb) = (Some(OsStr::new("/a")), Some(OsStr::new("/b")));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"old b", 0, 0).await.unwrap();
+    let wa = create(&fs, "a").await;
+    fs.write(req(), pa, wa, 0, b"new content", 0, 0)
+        .await
+        .unwrap();
+    fs.rename(
+        req(),
+        OsStr::new("/"),
+        OsStr::new("a"),
+        OsStr::new("/"),
+        OsStr::new("b"),
+    )
+    .await
+    .unwrap();
+    fs.release(req(), pb, wa, 0, 0, false).await.unwrap();
+    // The driver stops before the old b is closed, then replays its spool.
+    drop(fs);
+    states::upload_pending(&op, &dir.path().join("spool"))
+        .await
+        .unwrap();
+    assert_eq!(op.read("b").await.unwrap().to_vec(), b"new content");
+    let _ = wb;
+}
+
+#[tokio::test]
+async fn closing_a_retired_file_never_overwrites_a_finished_rename() {
+    let fs = fs_with("other", "").await;
+    let (pa, pb) = (Some(OsStr::new("/a")), Some(OsStr::new("/b")));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"old b", 0, 0).await.unwrap();
+    // a is closed before the rename, so the closed-file path renames it.
+    let wa = create(&fs, "a").await;
+    fs.write(req(), pa, wa, 0, b"from a", 0, 0).await.unwrap();
+    fs.release(req(), pa, wa, 0, 0, false).await.unwrap();
+    fs.rename(
+        req(),
+        OsStr::new("/"),
+        OsStr::new("a"),
+        OsStr::new("/"),
+        OsStr::new("b"),
+    )
+    .await
+    .unwrap();
+    fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"from a");
+}

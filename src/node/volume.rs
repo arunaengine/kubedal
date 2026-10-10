@@ -333,6 +333,15 @@ impl VolumeManager {
         Ok(data)
     }
 
+    /// Unmount and delete everything of a recorded volume.
+    pub(crate) async fn discard_record(
+        &self,
+        id: &str,
+        record: &VolumeRecord,
+    ) -> Result<(), Status> {
+        self.discard(id, &record.target_path).await
+    }
+
     /// Unmount and delete everything of a volume that has nothing left to upload.
     async fn discard(&self, id: &str, target: &Path) -> Result<(), Status> {
         self.mounter.unmount(target).await?;

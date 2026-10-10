@@ -123,6 +123,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mounter = Arc::new(SystemMounter::default());
         let manager = VolumeManager::new(&data_dir, cluster, mounter)?;
         tracing::info!("Data directory: {}", data_dir.display());
+        // Clean up what a previous run of the plugin left behind.
+        let report = manager.reconcile().await?;
+        tracing::info!("Startup reconcile: {report:?}");
         let node_service = NodeService::new(client, &node_id, Arc::new(manager));
         builder.add_service(NodeServer::new(node_service))
     };

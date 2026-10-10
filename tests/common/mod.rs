@@ -3,10 +3,19 @@
 
 use kubedal::node::state::{DataNodeRef, PodRef};
 use kubedal::node::testing::{FakeCluster, FakeMounter, FakeNode};
+use kubedal::node::upload::RetryPolicy;
 use kubedal::node::volume::{PublishRequest, TreeMode, VolumeManager, VolumeSource};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tempfile::TempDir;
+
+fn fast_retry() -> RetryPolicy {
+    RetryPolicy {
+        attempts: 2,
+        first_delay: Duration::from_millis(1),
+    }
+}
 
 pub struct Env {
     pub dir: TempDir,
@@ -20,8 +29,9 @@ impl Env {
         let dir = tempfile::tempdir().unwrap();
         let cluster = Arc::new(FakeCluster::default());
         let mounter = Arc::new(FakeMounter::default());
-        let manager =
-            VolumeManager::new(dir.path().join("node"), cluster.clone(), mounter.clone()).unwrap();
+        let manager = VolumeManager::new(dir.path().join("node"), cluster.clone(), mounter.clone())
+            .unwrap()
+            .with_retry_policy(fast_retry());
         Self {
             dir,
             cluster,
@@ -37,7 +47,8 @@ impl Env {
             self.cluster.clone(),
             self.mounter.clone(),
         )
-        .unwrap();
+        .unwrap()
+        .with_retry_policy(fast_retry());
     }
 
     /// Add a DataNode "store" in namespace "team" with some files. Returns its root.

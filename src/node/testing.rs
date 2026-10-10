@@ -57,6 +57,17 @@ impl FakeCluster {
             .insert(key, node);
     }
 
+    pub fn remove_node(&self, namespace: &str, name: &str) {
+        let key = DataNodeRef {
+            name: name.into(),
+            namespace: namespace.into(),
+        };
+        self.nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .remove(&key);
+    }
+
     /// Let pods in `pod_namespace` use a DataNode in another namespace.
     pub fn allow(&self, pod_namespace: &str, node: DataNodeRef) {
         self.allowed

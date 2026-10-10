@@ -69,6 +69,12 @@ impl SpoolBudget {
         self.used.load(Ordering::Relaxed)
     }
 
+    /// Count space that is already used, without checking the limit (spool
+    /// files found on disk at startup).
+    pub fn charge_existing(&self, bytes: u64) {
+        self.used.fetch_add(bytes, Ordering::Relaxed);
+    }
+
     fn reserve(&self, bytes: u64) -> std::io::Result<()> {
         let mut current = self.used.load(Ordering::Relaxed);
         loop {
@@ -259,7 +265,15 @@ impl StateData {
             }
         }
         self.complete = false;
-        let _ = self.charge_to(0);
+    }
+}
+
+impl Drop for StateData {
+    /// The spool file is really gone only when the last holder (also a reader)
+    /// drops the state, because an unlinked file keeps its disk space while it
+    /// is open. Only then the space goes back to the budget.
+    fn drop(&mut self) {
+        self.budget.release(self.charged);
     }
 }
 
@@ -815,6 +829,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn space_comes_back_only_when_the_last_reader_is_gone() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = Arc::new(SpoolBudget::new(u64::MAX));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let writer = states.open_write(&op, "a", false).await.unwrap();
+        writer.lock().await.write_at(b"1234", 0).unwrap();
+        let reader = states.open_read("a").await.unwrap();
+        let (result, _) = states.release(&op, &writer).await;
+        result.unwrap();
+        drop(writer);
+        // The spool file is unlinked but still open for the reader.
+        assert_eq!(budget.used(), 4);
+        drop(reader);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
     async fn replay_gives_the_space_back() {
         let dir = tempfile::tempdir().unwrap();
         std::fs::write(dir.path().join("x.data"), "1234").unwrap();
@@ -860,6 +892,7 @@ mod tests {
         assert_eq!(budget.used(), 1);
         drop(data);
         let _ = states.release(&op, &joined).await;
+        drop(joined);
         assert_eq!(budget.used(), 0);
     }
 }

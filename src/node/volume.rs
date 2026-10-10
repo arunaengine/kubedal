@@ -110,7 +110,11 @@ impl VolumeManager {
     /// Change the size limit of the node content cache.
     /// Share the FUSE spool budget of the mounter, so replayed spool files give
     /// their space back.
+    ///
+    /// Spool files that are already on disk (from before a restart) are charged
+    /// to the budget right away.
     pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
+        budget.charge_existing(existing_spool_bytes(&self.root.join("volumes")));
         self.spool_budget = budget;
         self
     }
@@ -571,6 +575,22 @@ impl VolumeManager {
         )
         .await
     }
+}
+
+/// Size of all spool data files below `volumes/*/spool`.
+fn existing_spool_bytes(volumes: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(volumes) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .filter_map(|volume| std::fs::read_dir(volume.path().join("spool")).ok())
+        .flatten()
+        .filter_map(Result::ok)
+        .filter(|e| e.path().extension().is_some_and(|x| x == "data"))
+        .filter_map(|e| e.metadata().ok())
+        .map(|m| m.len())
+        .sum()
 }
 
 /// True if a spool folder holds content that may still need an upload.

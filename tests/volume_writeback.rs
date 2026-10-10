@@ -230,3 +230,34 @@ async fn fuse_spool_is_kept_when_the_data_node_was_replaced() {
     assert!(spool.join("1.json").exists());
     assert!(!other.join("data/out.txt").exists());
 }
+
+#[tokio::test]
+async fn spool_files_on_disk_are_charged_at_startup() {
+    let mut env = Env::new();
+    env.add_store(None, false);
+    let target = env.target("p1");
+    env.manager
+        .publish(tree_request("vol-1", &target, "data", TreeMode::Fuse, true))
+        .await
+        .unwrap();
+    let id = publish_id("vol-1", &target.to_string_lossy());
+    write(&env.manager.spool_dir(&id).join("1.data"), "123");
+    write(
+        &env.manager.spool_dir(&id).join("1.json"),
+        r#"{"key": "x"}"#,
+    );
+
+    env.restart();
+    let budget = std::sync::Arc::new(kubedal::util::fuse_fs::SpoolBudget::new(u64::MAX));
+    env.manager = kubedal::node::volume::VolumeManager::new(
+        env.dir.path().join("node"),
+        env.cluster.clone(),
+        env.mounter.clone(),
+    )
+    .unwrap()
+    .with_spool_budget(budget.clone());
+    assert_eq!(budget.used(), 3);
+    // The replay on unpublish gives the space back.
+    env.manager.unpublish("vol-1", &target).await.unwrap();
+    assert_eq!(budget.used(), 0);
+}

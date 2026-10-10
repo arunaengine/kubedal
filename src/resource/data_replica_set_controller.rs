@@ -78,20 +78,15 @@ impl DataReplicaSet {
 
         // Fetch source DataPod and its DataNode
         let source_data_pod = dp_api.get(&self.spec.source_pod.name).await?;
-        let source_data_node = dn_api
-            .get(
-                &source_data_pod
-                    .owner_references()
-                    .first()
-                    .ok_or_else(|| {
-                        Error::ReconcilerError(format!(
-                            "DataPod {} is missing owner ref",
-                            source_data_pod.name_any()
-                        ))
-                    })?
-                    .name,
-            )
-            .await?;
+        // The DataPod reference names the DataNode, also in another namespace
+        // (where no owner reference exists).
+        let source_ref = source_node_ref(&source_data_pod, &drs_ns)?;
+        let source_data_node = Api::<DataNode>::namespaced(
+            client.clone(),
+            source_ref.namespace.as_deref().unwrap_or(&drs_ns),
+        )
+        .get(&source_ref.name)
+        .await?;
 
         // Create missing replica DataPods on DataNodes that hold no copy yet.
         //TODO: Scale down when there are more replicas than requested.
@@ -134,10 +129,6 @@ impl DataReplicaSet {
         }
 
         // Make sure every PVC exists, also when an earlier reconcile failed halfway.
-        let source_ref = Ref {
-            name: source_data_node.name_any(),
-            namespace: source_data_node.namespace(),
-        };
         let source_pvc = ensure_replica_pvc(
             &source_data_pod,
             &source_ref,
@@ -524,6 +515,26 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
     crate::node::paths::to_hex(&hasher.finalize())[..16].to_string()
 }
 
+/// The DataNode of the source DataPod, with its namespace filled in.
+fn source_node_ref(source: &DataPod, default_namespace: &str) -> Result<Ref, Error> {
+    let node_ref = source.spec.data_node_ref.as_ref().ok_or_else(|| {
+        Error::ReconcilerError(format!(
+            "source DataPod {} has no DataNode yet",
+            source.name_any()
+        ))
+    })?;
+    Ok(Ref {
+        name: node_ref.name.clone(),
+        namespace: Some(
+            node_ref
+                .namespace
+                .clone()
+                .filter(|ns| !ns.is_empty())
+                .unwrap_or_else(|| default_namespace.to_string()),
+        ),
+    })
+}
+
 /// What a sync pod mount depends on: the DataPod object (UID), its DataNode, its
 /// path and the PVC. If any of these change, the sync pod must be recreated.
 fn member_id(data_pod: &DataPod, pvc: &PersistentVolumeClaim) -> String {
@@ -564,6 +575,24 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn source_data_node_comes_from_the_reference() {
+        let mut dp = DataPod::new("src", DataPodSpec::default());
+        assert!(source_node_ref(&dp, "team").is_err());
+        dp.spec.data_node_ref = Some(Ref {
+            name: "shared-store".into(),
+            namespace: Some("shared".into()),
+        });
+        let r = source_node_ref(&dp, "team").unwrap();
+        assert_eq!(r.namespace.as_deref(), Some("shared"));
+        dp.spec.data_node_ref = Some(Ref {
+            name: "store".into(),
+            namespace: None,
+        });
+        let r = source_node_ref(&dp, "team").unwrap();
+        assert_eq!(r.namespace.as_deref(), Some("team"));
+    }
 
     #[test]
     fn members_change_when_a_replica_is_recreated_elsewhere() {

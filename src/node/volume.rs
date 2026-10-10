@@ -276,6 +276,12 @@ impl VolumeManager {
                         }
                         // The FUSE process from before a restart is gone. Mount again.
                         self.mounter.unmount(target).await?;
+                        if let Some(plan) = &record.upload {
+                            // A writable volume may have content waiting in its
+                            // spool. The record stays as it is until it is safe.
+                            self.remount_fuse(id, record, plan, target).await?;
+                            return Ok(true);
+                        }
                         self.state
                             .remove(id)
                             .map_err(|e| io_status(e, "remove volume state"))?;
@@ -409,7 +415,33 @@ impl VolumeManager {
     }
 
     /// Unmount and delete everything of a volume that has nothing left to upload.
+    /// Mount a writable FUSE volume again after a restart. Spool files from the
+    /// old mount are uploaded first. If anything fails, the record and the spool
+    /// files stay, and kubelet calls publish again later.
+    async fn remount_fuse(
+        &self,
+        id: &str,
+        record: &VolumeRecord,
+        plan: &UploadPlan,
+        target: &Path,
+    ) -> Result<(), Status> {
+        let resolved = self.cluster.resolve(&plan.data_node, &record.pod).await?;
+        resolved.require_writable()?;
+        resolved.require_identity(plan.data_node_identity.as_deref())?;
+        let op = resolved.operator(&plan.prefix)?;
+        let spool_dir = self.spool_dir(id);
+        states::upload_pending(&op, &spool_dir).await?;
+        transfer::create_dir_all(target).await?;
+        self.mounter.mount_fuse(op, target, false, &spool_dir).await
+    }
+
     async fn discard(&self, id: &str, target: &Path) -> Result<(), Status> {
+        // Never delete FUSE content that still waits for its upload.
+        if has_pending_spool(&self.spool_dir(id)) {
+            return Err(Status::failed_precondition(
+                "the volume has FUSE content that is not uploaded yet; it is kept",
+            ));
+        }
         self.mounter.unmount(target).await?;
         remove_dir_all(&self.volume_dir(id)).await?;
         self.state
@@ -527,6 +559,15 @@ impl VolumeManager {
         )
         .await
     }
+}
+
+/// True if a spool folder holds content that may still need an upload.
+fn has_pending_spool(dir: &Path) -> bool {
+    std::fs::read_dir(dir).is_ok_and(|entries| {
+        entries
+            .filter_map(Result::ok)
+            .any(|e| e.path().extension().is_some_and(|x| x == "json"))
+    })
 }
 
 async fn remove_dir_all(path: &Path) -> Result<(), Status> {

@@ -5,13 +5,14 @@
 //! - `volumes/<id>/data`: the files of a cache or file-list volume
 //! - `volumes/<id>/baseline.json`: file sizes and times right after the download
 
-use crate::node::cluster::{Cluster, ResolvedNode};
+use crate::node::cluster::{Cluster, EventKind, ResolvedNode};
 use crate::node::mounter::Mounter;
 use crate::node::paths::{self, publish_id};
 use crate::node::state::{
     DataNodeRef, Phase, PodRef, StateStore, UploadPlan, VolumeMode, VolumeRecord,
 };
 use crate::node::transfer::{self, ByteBudget};
+use crate::node::upload::{self, RetryPolicy, UploadReport};
 use crate::util::error::io_status;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -58,6 +59,7 @@ pub struct VolumeManager {
     cluster: Arc<dyn Cluster>,
     mounter: Arc<dyn Mounter>,
     busy: Mutex<HashSet<String>>,
+    retry: RetryPolicy,
 }
 
 /// Marks a volume as busy while an operation runs on it.
@@ -88,7 +90,14 @@ impl VolumeManager {
             cluster,
             mounter,
             busy: Mutex::new(HashSet::new()),
+            retry: RetryPolicy::default(),
         })
+    }
+
+    /// Change how failed uploads are retried.
+    pub fn with_retry_policy(mut self, retry: RetryPolicy) -> Self {
+        self.retry = retry;
+        self
     }
 
     pub fn state(&self) -> &StateStore {
@@ -109,6 +118,10 @@ impl VolumeManager {
 
     pub fn data_dir(&self, id: &str) -> PathBuf {
         self.volume_dir(id).join("data")
+    }
+
+    fn baseline_path(&self, id: &str) -> PathBuf {
+        self.volume_dir(id).join("baseline.json")
     }
 
     /// The CSI spec asks to return ABORTED while another call for the same volume runs.
@@ -290,6 +303,13 @@ impl VolumeManager {
         );
 
         if !record.read_only {
+            // Remember the downloaded state, so only new and changed files go back.
+            let snapshot_dir = data.clone();
+            let baseline = tokio::task::spawn_blocking(move || upload::snapshot(&snapshot_dir))
+                .await
+                .map_err(|e| Status::internal(format!("snapshot task failed: {e}")))?
+                .map_err(|e| io_status(e, "snapshot volume content"))?;
+            upload::save_baseline(&self.baseline_path(id), &baseline)?;
             record.upload = Some(UploadPlan {
                 data_node: resolved.node.clone(),
                 prefix: tree.base.clone(),
@@ -343,12 +363,77 @@ impl VolumeManager {
                     self.save(&id, &record)?;
                 }
                 self.mounter.unmount(target_path).await?;
-                // Local data is only removed after a successful upload.
+                if record.phase == Phase::Unpublishing
+                    && let Some(plan) = record.upload.clone()
+                {
+                    // Local data is only removed after a successful upload.
+                    self.write_back(&id, &record, &plan).await?;
+                }
                 self.discard(&id, target_path).await?;
             }
         }
 
         remove_target_dir(target_path).await
+    }
+}
+
+impl VolumeManager {
+    /// Upload the volume content as described by the plan, and tell the pod about it.
+    async fn write_back(
+        &self,
+        id: &str,
+        record: &VolumeRecord,
+        plan: &UploadPlan,
+    ) -> Result<(), Status> {
+        let destination = format!("{}:{}", plan.data_node, plan.prefix);
+        match self.try_write_back(id, record, plan).await {
+            Ok(report) => {
+                let message = format!(
+                    "uploaded {} files ({} bytes) to {destination}, {} unchanged files skipped",
+                    report.files, report.bytes, report.skipped
+                );
+                tracing::info!("volume {}: {message}", record.volume_id);
+                self.cluster
+                    .pod_event(&record.pod, EventKind::Normal, "VolumeUploaded", &message)
+                    .await;
+                Ok(())
+            }
+            Err(err) => {
+                let message = format!(
+                    "upload to {destination} failed, the data is kept on the node and the \
+                     upload will be retried: {}",
+                    err.message()
+                );
+                tracing::warn!("volume {}: {message}", record.volume_id);
+                self.cluster
+                    .pod_event(
+                        &record.pod,
+                        EventKind::Warning,
+                        "VolumeUploadFailed",
+                        &message,
+                    )
+                    .await;
+                Err(Status::new(err.code(), message))
+            }
+        }
+    }
+
+    async fn try_write_back(
+        &self,
+        id: &str,
+        record: &VolumeRecord,
+        plan: &UploadPlan,
+    ) -> Result<UploadReport, Status> {
+        let resolved = self.cluster.resolve(&plan.data_node, &record.pod).await?;
+        resolved.require_writable()?;
+        let op = resolved.operator("")?;
+        let local = upload::local_folder(&self.data_dir(id), &plan.local_path)?;
+        let baseline = if plan.only_changed {
+            upload::load_baseline(&self.baseline_path(id))?
+        } else {
+            None
+        };
+        upload::upload_tree(&op, &local, &plan.prefix, baseline.as_ref(), self.retry).await
     }
 }
 

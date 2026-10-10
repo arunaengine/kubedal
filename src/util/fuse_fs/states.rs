@@ -128,6 +128,8 @@ pub struct StateData {
     pub closed: bool,
     /// The JSON file exists, so the spool file may be replayed after a crash.
     complete: bool,
+    /// Bytes charged to the budget for this spool file.
+    charged: u64,
     budget: Arc<SpoolBudget>,
 }
 
@@ -163,23 +165,29 @@ impl StateData {
         Ok(())
     }
 
-    fn charge(&mut self, new_len: u64) -> std::io::Result<()> {
-        if new_len > self.len {
-            self.budget.reserve(new_len - self.len)?;
+    /// Change the space charged for this spool file to `bytes`.
+    fn charge_to(&mut self, bytes: u64) -> std::io::Result<()> {
+        if bytes > self.charged {
+            self.budget.reserve(bytes - self.charged)?;
         } else {
-            self.budget.release(self.len - new_len);
+            self.budget.release(self.charged - bytes);
         }
+        self.charged = bytes;
         Ok(())
     }
 
     pub fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
-        let new_len = self.len.max(offset + data.len() as u64);
-        self.charge(new_len)?;
+        let end = offset
+            .checked_add(data.len() as u64)
+            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+        let before = self.charged;
+        self.charge_to(self.len.max(end))?;
         if let Err(err) = self.file.write_all_at(data, offset) {
-            self.charge(self.len)?;
+            // Give the space back; the write did not happen.
+            let _ = self.charge_to(before);
             return Err(err);
         }
-        self.len = new_len;
+        self.len = self.len.max(end);
         self.dirty = true;
         Ok(())
     }
@@ -195,8 +203,12 @@ impl StateData {
     }
 
     pub fn set_len(&mut self, len: u64) -> std::io::Result<()> {
-        self.charge(len)?;
-        self.file.set_len(len)?;
+        let before = self.charged;
+        self.charge_to(len)?;
+        if let Err(err) = self.file.set_len(len) {
+            let _ = self.charge_to(before);
+            return Err(err);
+        }
         self.len = len;
         self.dirty = true;
         Ok(())
@@ -247,7 +259,7 @@ impl StateData {
             }
         }
         self.complete = false;
-        self.budget.release(self.len);
+        let _ = self.charge_to(0);
     }
 }
 
@@ -369,6 +381,7 @@ impl States {
                 handles: 0,
                 closed: false,
                 complete: false,
+                charged: 0,
                 budget: self.budget.clone(),
             }),
         });
@@ -775,6 +788,22 @@ mod tests {
         joined.lock().await.write_at(b"12345", 0).unwrap();
         let _ = states.release(&op, &joined).await;
         assert!(!states.truncate("a", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_writes_give_their_space_back() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = Arc::new(SpoolBudget::new(u64::MAX));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        let mut data = joined.lock().await;
+        data.write_at(b"12", 0).unwrap();
+        // An offset past the largest file size fails in the kernel (EFBIG or EINVAL).
+        assert!(data.write_at(b"x", i64::MAX as u64).is_err());
+        assert!(data.set_len(i64::MAX as u64 + 1).is_err());
+        assert_eq!(budget.used(), 2);
+        assert_eq!(data.len, 2);
     }
 
     #[tokio::test]

@@ -485,11 +485,30 @@ fn broken_status() -> Status {
 }
 
 /// Remove a spool data file and give its space back.
-fn remove_and_refund(path: &Path, budget: &SpoolBudget) {
+fn remove_and_refund(path: &Path, budget: &SpoolBudget) -> std::io::Result<()> {
     let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
-    if std::fs::remove_file(path).is_ok() {
-        budget.release(size);
+    match std::fs::remove_file(path) {
+        Ok(()) => {
+            budget.release(size);
+            Ok(())
+        }
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
     }
+}
+
+/// Remove a file; a missing file is fine.
+fn remove_if_present(path: &Path) -> std::io::Result<()> {
+    match std::fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(err),
+    }
+}
+
+/// Sync a folder, so removed or renamed files stay that way after a crash.
+fn sync_folder(dir: &Path) -> std::io::Result<()> {
+    File::open(dir)?.sync_all()
 }
 
 async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<(), Status> {
@@ -1014,7 +1033,8 @@ pub async fn upload_pending(
             Ok(data) => serde_json::from_slice(&data)
                 .map_err(|e| Status::internal(format!("bad spool metadata {meta_path:?}: {e}")))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                remove_and_refund(data_path, budget);
+                remove_and_refund(data_path, budget)
+                    .map_err(|e| io_status(e, "remove spool file"))?;
                 continue;
             }
             Err(err) => return Err(io_status(err, "read spool metadata")),
@@ -1032,23 +1052,31 @@ pub async fn upload_pending(
             }
         }
     }
-    for data_path in obsolete {
-        let _ = std::fs::remove_file(data_path.with_extension("json"));
-        remove_and_refund(&data_path, budget);
+    // Every cleanup step is checked: a journal left behind could later restore
+    // old bytes over newer content. Journals go first, then the folder is synced.
+    let cleanup = |e: std::io::Error| io_status(e, "clean up spool folder");
+    for data_path in &obsolete {
+        remove_if_present(&data_path.with_extension("json")).map_err(cleanup)?;
+    }
+    sync_folder(dir).map_err(cleanup)?;
+    for data_path in &obsolete {
+        remove_and_refund(data_path, budget).map_err(cleanup)?;
     }
     let mut uploaded = 0;
     for (key, (_, data_path)) in newest {
         upload_data_file(op, &data_path, &key).await?;
-        let _ = std::fs::remove_file(data_path.with_extension("json"));
-        remove_and_refund(&data_path, budget);
+        remove_if_present(&data_path.with_extension("json")).map_err(cleanup)?;
+        sync_folder(dir).map_err(cleanup)?;
+        remove_and_refund(&data_path, budget).map_err(cleanup)?;
         uploaded += 1;
     }
     for tmp in paths
         .iter()
         .filter(|p| p.to_string_lossy().ends_with(".json.tmp"))
     {
-        let _ = std::fs::remove_file(tmp);
+        remove_if_present(tmp).map_err(cleanup)?;
     }
+    sync_folder(dir).map_err(cleanup)?;
     Ok(uploaded)
 }
 
@@ -1400,6 +1428,20 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.data")), content).unwrap();
         let meta = serde_json::json!({"key": key, "generation": generation});
         std::fs::write(dir.join(format!("{name}.json")), meta.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_fails_when_it_cannot_clean_up() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        journal(dir.path(), "a", "k", 1, "data");
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o555)).unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let result = upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX)).await;
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(result.is_err());
+        // The journal is still there, so the next replay tries again.
+        assert!(dir.path().join("a.json").exists());
     }
 
     #[tokio::test]

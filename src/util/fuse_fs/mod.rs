@@ -154,31 +154,52 @@ impl Filesystem {
     /// without it, the content starts empty (O_TRUNC or a new file).
     async fn open_write(&self, path: &OsStr, keep: bool) -> Result<Arc<Mutex<WriteState>>> {
         let key = key_of(path);
-        let opened = self.spool.open(&key).map_err(io_errno)?;
-        if let Some(mut state) = opened.new_guard {
-            if keep {
-                match state.fill_from(&self.op).await {
-                    Ok(()) => {}
-                    // A missing object is a new, empty file.
-                    Err(err) if err.code() == tonic::Code::NotFound => state.dirty = true,
-                    Err(err) => {
-                        tracing::warn!("cannot read {key} for writing: {}", err.message());
-                        state.remove_files();
-                        drop(state);
-                        self.spool.forget(&key, &opened.state);
-                        return Err(Errno::from(libc::EIO));
-                    }
+        loop {
+            let opened = self.spool.open(&key).map_err(io_errno)?;
+            let Some(state) = opened.new_guard else {
+                let mut state = opened.state.lock().await;
+                if state.closed || state.deleted {
+                    // The last handle closed (or the name was removed) while this
+                    // handle waited for the lock: start again with a new state.
+                    drop(state);
+                    self.spool.forget(&key, &opened.state);
+                    continue;
+                }
+                if !keep {
+                    state.set_len(0).map_err(io_errno)?;
+                }
+                state.handles += 1;
+                drop(state);
+                return Ok(opened.state);
+            };
+            return self.init_write_state(&key, opened.state, state, keep).await;
+        }
+    }
+
+    /// Fill a new write state and count its first handle.
+    async fn init_write_state(
+        &self,
+        key: &str,
+        arc: Arc<Mutex<WriteState>>,
+        mut state: tokio::sync::OwnedMutexGuard<WriteState>,
+        keep: bool,
+    ) -> Result<Arc<Mutex<WriteState>>> {
+        if keep {
+            match state.fill_from(&self.op).await {
+                Ok(()) => {}
+                // A missing object is a new, empty file.
+                Err(err) if err.code() == tonic::Code::NotFound => state.dirty = true,
+                Err(err) => {
+                    tracing::warn!("cannot read {key} for writing: {}", err.message());
+                    state.close();
+                    drop(state);
+                    self.spool.forget(key, &arc);
+                    return Err(Errno::from(libc::EIO));
                 }
             }
-            state.handles += 1;
-        } else {
-            let mut state = opened.state.lock().await;
-            if !keep {
-                state.set_len(0).map_err(io_errno)?;
-            }
-            state.handles += 1;
         }
-        Ok(opened.state)
+        state.handles += 1;
+        Ok(arc)
     }
 
     /// Upload the content of the open file `fh`, if it is open for writing.
@@ -202,7 +223,7 @@ impl Filesystem {
         let result = guard.upload(&self.op).await;
         if guard.handles == 0 {
             if !guard.dirty || guard.deleted {
-                guard.remove_files();
+                guard.close();
                 let key = guard.key.clone();
                 drop(guard);
                 self.spool.forget(&key, &state);
@@ -227,7 +248,7 @@ impl Filesystem {
                     return;
                 }
                 if guard.deleted || guard.upload(&op).await.is_ok() {
-                    guard.remove_files();
+                    guard.close();
                     let key = guard.key.clone();
                     drop(guard);
                     spool.forget(&key, &state);

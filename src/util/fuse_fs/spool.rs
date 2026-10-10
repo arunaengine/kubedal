@@ -57,6 +57,9 @@ pub struct WriteState {
     pub deleted: bool,
     /// Number of open handles.
     pub handles: usize,
+    /// The last handle closed and the spool files are gone. A handle that found
+    /// this state in the map just before must open a new one.
+    pub closed: bool,
 }
 
 impl WriteState {
@@ -79,6 +82,7 @@ impl WriteState {
             dirty: true,
             deleted: false,
             handles: 0,
+            closed: false,
         };
         state.write_meta()?;
         Ok(state)
@@ -173,6 +177,12 @@ impl WriteState {
         upload_data_file(op, &self.data_path, &self.key).await?;
         self.dirty = false;
         Ok(())
+    }
+
+    /// The state is done: remove its spool files.
+    pub fn close(&mut self) {
+        self.closed = true;
+        self.remove_files();
     }
 
     /// Remove the spool files from disk.

@@ -1,7 +1,7 @@
 use std::{fs, io::Write, os::unix::fs::DirBuilderExt, path::Path};
 
+use crate::util::fuse_fs::Filesystem;
 use fuse3::{MountOptions, path::Session, raw::MountHandle};
-use fuse3_opendal::Filesystem;
 use futures::TryStreamExt;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};

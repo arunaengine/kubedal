@@ -1,16 +1,12 @@
-FROM rust:1.85-alpine3.21 AS builder
+FROM rust:1.97-alpine3.23 AS builder
 WORKDIR /build
-RUN apk update
-RUN apk upgrade
+RUN apk add --no-cache build-base cmake clang perl linux-headers protobuf-dev protoc git
+# Link against the musl libc of the runtime image instead of a static binary.
 ENV RUSTFLAGS="-C target-feature=-crt-static"
-ENV CARGO_NET_GIT_FETCH_WITH_CLI=true
-RUN apk add llvm cmake gcc ca-certificates clang17-libclang libc-dev pkgconfig openssl-dev protoc protobuf-dev protobuf-dev musl-dev git curl openssh
 COPY . .
-RUN cargo build --release
+RUN cargo build --release --locked --bin kubedal
 
-FROM alpine:3.21
-RUN apk update
-RUN apk upgrade
-RUN apk add libgcc gcompat ca-certificates openssl-dev fuse3 clang17-libclang
+FROM alpine:3.23
+RUN apk add --no-cache libgcc ca-certificates fuse3 util-linux
 COPY --from=builder /build/target/release/kubedal /usr/local/bin/kubedal
 ENTRYPOINT ["kubedal"]

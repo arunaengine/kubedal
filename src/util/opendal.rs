@@ -53,8 +53,7 @@ pub fn init_service<B: Builder>(cfg: HashMap<String, String>) -> Result<Operator
     let op = Operator::from_iter::<B>(cfg)
         .map_err(|e| Status::internal(format!("Failed to init openDAL operator: {}", e)))?
         .layer(LoggingLayer::default())
-        .layer(RetryLayer::new())
-        .finish();
+        .layer(RetryLayer::new());
 
     Ok(op)
 }

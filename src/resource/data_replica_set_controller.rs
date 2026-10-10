@@ -18,8 +18,6 @@ use kube::{
         finalizer::{Event as Finalizer, finalizer},
     },
 };
-use rand::Rng;
-use rand::distr::Alphanumeric;
 use std::{sync::Arc, time::Duration};
 use tracing::*;
 
@@ -260,12 +258,7 @@ async fn create_replica_pvc(
     pvc_api: &Api<PersistentVolumeClaim>,
 ) -> Result<PersistentVolumeClaim, Error> {
     // Create PVC for source mount
-    let rand_suffix = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(8)
-        .map(char::from)
-        .collect::<String>()
-        .to_lowercase();
+    let rand_suffix = random_suffix();
 
     let replica_owner = data_replica_set.owner_ref(&()).ok_or_else(|| {
         Error::ReconcilerError(format!(
@@ -341,12 +334,7 @@ async fn create_replica_pod(
     replica_resources: Vec<(DataPod, PersistentVolumeClaim)>,
     pod_api: &Api<Pod>,
 ) -> Result<Pod, Error> {
-    let rand_suffix = rand::rng()
-        .sample_iter(&Alphanumeric)
-        .take(8)
-        .map(char::from)
-        .collect::<String>()
-        .to_lowercase();
+    let rand_suffix = random_suffix();
 
     let replica_owner = data_replica_set.owner_ref(&()).ok_or_else(|| {
         Error::ReconcilerError(format!(
@@ -448,4 +436,9 @@ async fn create_replica_pod(
     };
 
     Ok(pod_api.create(&PostParams::default(), &pod).await?)
+}
+
+/// Short random lowercase suffix for generated resource names.
+fn random_suffix() -> String {
+    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
 }

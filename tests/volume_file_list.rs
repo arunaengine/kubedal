@@ -111,7 +111,10 @@ async fn files_are_placed_and_outputs_uploaded() {
     assert_eq!(events.last().unwrap().reason, "VolumeUploaded");
 
     // The cache still holds the original content.
-    let cached = env.manager.content_cache().path("team/store", HELLO);
+    let cached = env
+        .manager
+        .content_cache()
+        .path(&env.cluster.cache_scope("team", "store"), HELLO);
     assert_eq!(std::fs::read_to_string(cached).unwrap(), "hello");
 }
 
@@ -257,7 +260,7 @@ async fn declared_sizes_are_checked_against_the_limit() {
     assert!(
         !env.manager
             .content_cache()
-            .path("team/store", HELLO)
+            .path(&env.cluster.cache_scope("team", "store"), HELLO)
             .exists()
     );
 }
@@ -357,7 +360,45 @@ async fn failed_publish_still_prunes_the_cache() {
     assert!(
         !env.manager
             .content_cache()
-            .path("team/store", HELLO)
+            .path(&env.cluster.cache_scope("team", "store"), HELLO)
             .exists()
     );
+}
+
+#[tokio::test]
+async fn re_created_data_node_does_not_see_old_cache_entries() {
+    let env = Env::new();
+    let bucket = env.add_store(None, false);
+    add_results(&env);
+    write(&bucket.join("jobs/1.json"), &manifest_json());
+    env.manager
+        .publish(request("vol-1", &env.target("p1"), "jobs/1.json"))
+        .await
+        .unwrap();
+
+    // Namespace and DataNode are deleted and created again by someone else, with
+    // other storage. The digest is known, but the source does not exist there.
+    let other = env.dir.path().join("new-owner");
+    write(
+        &other.join("jobs/steal.json"),
+        &format!(
+            r#"{{"version": 1, "files": [{{"path": "x", "source": "missing", "sha256": "{HELLO}"}}]}}"#
+        ),
+    );
+    env.cluster.remove_node("team", "store");
+    env.cluster.add_node(
+        "team",
+        "store",
+        FakeNode {
+            root: other,
+            limit: None,
+            read_only: false,
+        },
+    );
+    let err = env
+        .manager
+        .publish(request("vol-2", &env.target("p2"), "jobs/steal.json"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::NotFound);
 }

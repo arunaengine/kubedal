@@ -110,7 +110,7 @@ impl VolumeManager {
         }
 
         let cache = self.content_cache();
-        let scope = node.to_string();
+        let scope = resolved.cache_scope().to_string();
         // Wait for every started placement, also after an error. A dropped copy
         // task keeps running in the background and could write into the data
         // folder of the next attempt. After the first error no new file starts.

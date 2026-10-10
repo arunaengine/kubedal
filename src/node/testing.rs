@@ -34,7 +34,8 @@ pub struct RecordedEvent {
 /// unless the DataNode was shared with [`FakeCluster::allow`].
 #[derive(Default)]
 pub struct FakeCluster {
-    nodes: Mutex<HashMap<DataNodeRef, FakeNode>>,
+    /// DataNodes with the UID they got when they were added.
+    nodes: Mutex<HashMap<DataNodeRef, (FakeNode, String)>>,
     allowed: Mutex<Vec<(String, DataNodeRef)>>,
     events: Mutex<Vec<RecordedEvent>>,
 }
@@ -51,10 +52,27 @@ impl FakeCluster {
             name: name.into(),
             namespace: namespace.into(),
         };
+        let uid = uuid::Uuid::new_v4().to_string();
         self.nodes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
-            .insert(key, node);
+            .insert(key, (node, uid));
+    }
+
+    /// The content cache scope of a DataNode, as the volume code sees it.
+    pub fn cache_scope(&self, namespace: &str, name: &str) -> String {
+        let key = DataNodeRef {
+            name: name.into(),
+            namespace: namespace.into(),
+        };
+        let uid = self
+            .nodes
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(&key)
+            .map(|(_, uid)| uid.clone())
+            .unwrap_or_default();
+        format!("{key}@{uid}")
     }
 
     pub fn remove_node(&self, namespace: &str, name: &str) {
@@ -99,13 +117,14 @@ impl Cluster for FakeCluster {
                 "pod may not use DataNode {node}"
             )));
         }
-        let fake = self
+        let (fake, _) = self
             .nodes
             .lock()
             .unwrap_or_else(|p| p.into_inner())
             .get(node)
             .cloned()
             .ok_or_else(|| Status::not_found(format!("DataNode {node} not found")))?;
+        let scope = self.cache_scope(&node.namespace, &node.name);
         let root = fake.root.clone();
         let factory = Arc::new(move |sub: &str| {
             let dir = root.join(sub.trim_matches('/'));
@@ -113,12 +132,10 @@ impl Cluster for FakeCluster {
                 .map_err(|e| Status::internal(format!("create fake root: {e}")))?;
             fs_operator(&dir)
         });
-        Ok(ResolvedNode::new(
-            node.clone(),
-            fake.limit,
-            fake.read_only,
-            factory,
-        ))
+        Ok(
+            ResolvedNode::new(node.clone(), fake.limit, fake.read_only, factory)
+                .with_cache_scope(scope),
+        )
     }
 
     async fn pod_event(&self, pod: &PodRef, kind: EventKind, reason: &str, message: &str) {

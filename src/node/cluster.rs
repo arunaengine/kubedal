@@ -19,6 +19,7 @@ pub struct ResolvedNode {
     /// The DataNode does not allow writes.
     pub read_only: bool,
     factory: OperatorFactory,
+    cache_scope: String,
 }
 
 impl ResolvedNode {
@@ -28,12 +29,27 @@ impl ResolvedNode {
         read_only: bool,
         factory: OperatorFactory,
     ) -> Self {
+        let cache_scope = node.to_string();
         Self {
             node,
             limit,
             read_only,
             factory,
+            cache_scope,
         }
+    }
+
+    /// Set the content cache scope. It must change whenever the DataNode could
+    /// point to other data: a new object with the same name (new UID) or a
+    /// changed backend configuration.
+    pub fn with_cache_scope(mut self, scope: String) -> Self {
+        self.cache_scope = scope;
+        self
+    }
+
+    /// Content cache entries are only shared between volumes with the same scope.
+    pub fn cache_scope(&self) -> &str {
+        &self.cache_scope
     }
 
     /// An operator whose root is `root` inside the DataNode. "" is the DataNode root.

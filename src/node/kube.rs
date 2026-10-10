@@ -99,16 +99,20 @@ impl Cluster for KubeCluster {
 
         let cfg = data_node_config(&self.client, &data_node).await?;
         let backend = data_node.spec.backend.clone();
+        let cache_scope = cache_scope(
+            node,
+            data_node.metadata.uid.as_deref().unwrap_or_default(),
+            &backend,
+            &cfg,
+        );
         // Check the configuration once, so errors show up at publish time.
         build_operator(&backend, cfg.clone(), "")?;
         let factory = Arc::new(move |root: &str| build_operator(&backend, cfg.clone(), root));
 
-        Ok(ResolvedNode::new(
-            node.clone(),
-            limit,
-            data_node.spec.read_only,
-            factory,
-        ))
+        Ok(
+            ResolvedNode::new(node.clone(), limit, data_node.spec.read_only, factory)
+                .with_cache_scope(cache_scope),
+        )
     }
 
     async fn pod_event(&self, pod: &PodRef, kind: EventKind, reason: &str, message: &str) {
@@ -137,5 +141,51 @@ impl Cluster for KubeCluster {
                 pod.name
             );
         }
+    }
+}
+
+/// Cache scope of a DataNode: its name, its UID and a hash of its backend and
+/// configuration. A re-created DataNode (new UID) or a changed configuration
+/// never sees content cached for the old one.
+fn cache_scope(
+    node: &DataNodeRef,
+    uid: &str,
+    backend: &crate::resource::crd::Backend,
+    cfg: &std::collections::HashMap<String, String>,
+) -> String {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<_> = cfg.iter().collect();
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(format!("{backend:?}").as_bytes());
+    for (key, value) in entries {
+        hasher.update([0u8]);
+        hasher.update(key.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(value.as_bytes());
+    }
+    let config_hash = crate::node::paths::to_hex(&hasher.finalize());
+    format!("{node}@{uid}#{}", &config_hash[..16])
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::crd::Backend;
+    use std::collections::HashMap;
+
+    #[test]
+    fn cache_scope_changes_with_uid_and_config() {
+        let node = DataNodeRef {
+            name: "store".into(),
+            namespace: "team".into(),
+        };
+        let cfg = HashMap::from([("bucket".to_string(), "a".to_string())]);
+        let base = cache_scope(&node, "uid-1", &Backend::S3, &cfg);
+        assert_eq!(base, cache_scope(&node, "uid-1", &Backend::S3, &cfg));
+        assert_ne!(base, cache_scope(&node, "uid-2", &Backend::S3, &cfg));
+        let other = HashMap::from([("bucket".to_string(), "b".to_string())]);
+        assert_ne!(base, cache_scope(&node, "uid-1", &Backend::S3, &other));
+        assert_ne!(base, cache_scope(&node, "uid-1", &Backend::GCS, &cfg));
     }
 }

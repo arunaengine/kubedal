@@ -338,3 +338,28 @@ async fn truncate_racing_the_last_release_is_never_lost_silently() {
         }
     }
 }
+
+#[tokio::test]
+async fn readers_keep_the_file_they_opened() {
+    let fs = fs_with("other", "").await;
+    let w = create(&fs, "f.txt").await;
+    let p = Some(OsStr::new("/f.txt"));
+    fs.write(req(), p, w, 0, b"x", 0, 0).await.unwrap();
+    // A reader opens while the writer is open, then the writer appends.
+    let r = open(&fs, "/f.txt", libc::O_RDONLY).await;
+    fs.write(req(), p, w, 1, b"A", 0, 0).await.unwrap();
+    assert_eq!(read_all(&fs, "/f.txt", r).await, b"xA");
+    // After the release the reader still sees the same content.
+    fs.release(req(), p, w, 0, 0, false).await.unwrap();
+    assert_eq!(read_all(&fs, "/f.txt", r).await, b"xA");
+    // The name is removed and a new file gets it; the reader keeps the old file.
+    fs.unlink(req(), OsStr::new("/"), OsStr::new("f.txt"))
+        .await
+        .unwrap();
+    let w2 = create(&fs, "f.txt").await;
+    fs.write(req(), p, w2, 0, b"replacement", 0, 0)
+        .await
+        .unwrap();
+    fs.release(req(), p, w2, 0, 0, false).await.unwrap();
+    assert_eq!(read_all(&fs, "/f.txt", r).await, b"xA");
+}

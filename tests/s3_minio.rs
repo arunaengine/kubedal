@@ -239,3 +239,38 @@ async fn fuse_closed_file_rename_on_s3() {
     assert_eq!(op.read("out").await.unwrap().to_vec(), b"result");
     op.delete_with("").recursive(true).await.unwrap();
 }
+
+#[tokio::test]
+async fn fuse_reader_does_not_see_a_replaced_object() {
+    use fuse3::path::prelude::*;
+    use kubedal::util::fuse_fs::Filesystem;
+    use std::ffi::OsStr;
+    let Some(cfg) = s3_config() else {
+        eprintln!("KUBEDAL_TEST_S3_ENDPOINT is not set, skipping");
+        return;
+    };
+    check_bucket(&cfg).await;
+    let op = build_operator(&Backend::S3, cfg, "").unwrap();
+    op.write("f.txt", "old").await.unwrap();
+    let spool = tempfile::tempdir().unwrap();
+    let fs = Filesystem::new(op.clone(), 0, 0, spool.path().to_path_buf());
+    let req = Request {
+        unique: 1,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    let fh = fs
+        .open(req, OsStr::new("/f.txt"), libc::O_RDONLY as u32)
+        .await
+        .unwrap()
+        .fh;
+    // Someone replaces the object; the open reader must not get the new bytes.
+    op.write("f.txt", "new").await.unwrap();
+    let err = fs
+        .read(req, Some(OsStr::new("/f.txt")), fh, 0, 100)
+        .await
+        .unwrap_err();
+    assert_eq!(err, fuse3::Errno::from(libc::ESTALE));
+    op.delete_with("").recursive(true).await.unwrap();
+}

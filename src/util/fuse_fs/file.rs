@@ -32,6 +32,10 @@ pub struct OpenedFile {
     pub is_read: bool,
     /// Shared write state, if the file is open for writing.
     pub write: Option<Arc<FileState>>,
+    /// State a read-only handle joined when it opened, if one was live.
+    pub read_state: Option<Arc<FileState>>,
+    /// Version of the object when a read-only handle without a state opened it.
+    pub etag: Option<String>,
     /// Opened with O_APPEND: writes go to the end of the file.
     pub append: bool,
     /// Size of the file when it was opened for reading. Reads are limited to it,

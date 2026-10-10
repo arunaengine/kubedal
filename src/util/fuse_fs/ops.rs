@@ -221,15 +221,22 @@ impl PathFilesystem for Filesystem {
             None
         };
 
-        let size = if write.is_none() && self.spool_size(path).await.is_none() {
+        // A reader holds the state that is live when it opens, or else remembers
+        // the size and version (etag) of the object. So it never sees content of
+        // another file that later gets the same name.
+        let read_state = match write {
+            None => self.live_state(path).await,
+            Some(_) => None,
+        };
+        let (size, etag) = if write.is_none() && read_state.is_none() {
             let meta = self
                 .op
                 .stat(&path.to_string_lossy())
                 .await
                 .map_err(opendal_error2errno)?;
-            Some(meta.content_length())
+            (Some(meta.content_length()), meta.etag().map(str::to_string))
         } else {
-            None
+            (None, None)
         };
 
         let key = self
@@ -238,8 +245,10 @@ impl PathFilesystem for Filesystem {
                 path: path.into(),
                 is_read,
                 write,
+                read_state,
                 append: is_append,
                 size,
+                etag,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 
@@ -259,7 +268,7 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyData> {
         tracing::debug!("read(path={path:?}, fh={fh}, offset={offset}, size={size})");
 
-        let (file_path, file_size, own_state) = {
+        let (file_path, file_size, state, etag) = {
             let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
             if !file.is_read {
                 Err(Errno::from(libc::EACCES))?;
@@ -267,17 +276,13 @@ impl PathFilesystem for Filesystem {
             (
                 file.path.to_string_lossy().to_string(),
                 file.size,
-                file.write.clone(),
+                file.write.clone().or_else(|| file.read_state.clone()),
+                file.etag.clone(),
             )
         };
 
-        // Content that is being written is read from the shared spool: the state
-        // of this handle (it stays readable after unlink), or the state of
-        // another handle that writes the same file.
-        let state = match own_state {
-            Some(state) => Some(state),
-            None => self.live_state(OsStr::new(&file_path)).await,
-        };
+        // A handle with a state reads from its spool file. It stays readable after
+        // unlink or close, because the handle keeps the open spool file.
         if let Some(state) = state {
             let data = state.lock().await.read_at(offset, size).map_err(io_errno)?;
             return Ok(ReplyData { data: data.into() });
@@ -290,9 +295,16 @@ impl PathFilesystem for Filesystem {
             }
             end = end.min(file_size);
         }
-        let result = self.op.read_with(&file_path).range(offset..end).await;
-        let data = match result {
+        let mut read = self.op.read_with(&file_path).range(offset..end);
+        if let Some(etag) = etag {
+            read = read.if_match(&etag);
+        }
+        let data = match read.await {
             Ok(buffer) => buffer.to_bytes(),
+            // The object changed since this handle opened it.
+            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {
+                return Err(Errno::from(libc::ESTALE));
+            }
             // A read at or after the end of the file returns no data.
             Err(err) if err.kind() == ErrorKind::RangeNotSatisfied => Bytes::new(),
             Err(err) => return Err(opendal_error2errno(err)),
@@ -443,8 +455,10 @@ impl PathFilesystem for Filesystem {
                 path: path.into(),
                 is_read,
                 write,
+                read_state: None,
                 append: is_append,
                 size: None,
+                etag: None,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 

@@ -36,6 +36,9 @@ pub struct OpenedFile {
     pub read_state: Option<Arc<FileState>>,
     /// Version of the object when a read-only handle without a state opened it.
     pub etag: Option<String>,
+    /// Modification time of the object when a read-only handle without a state
+    /// opened it. With `size`, getattr answers from it.
+    pub mtime: Option<std::time::SystemTime>,
     /// Opened with O_APPEND: writes go to the end of the file.
     pub append: bool,
     /// Size of the file when it was opened for reading. Reads are limited to it,

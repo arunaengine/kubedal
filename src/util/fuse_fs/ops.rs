@@ -66,6 +66,28 @@ impl PathFilesystem for Filesystem {
                 .get(FileKey::try_from(fh).ok()?.0)
                 .and_then(|f| f.write.clone().or_else(|| f.read_state.clone()))
         });
+        // A reader without a state answers from what it saw at open, also after
+        // a rename or unlink of the name.
+        let reader_attr = fh.and_then(|fh| {
+            let f = self.opened_files.get(FileKey::try_from(fh).ok()?.0)?;
+            (f.write.is_none() && f.read_state.is_none())
+                .then_some(f.size.map(|size| (size, f.mtime)))
+                .flatten()
+        });
+        if let Some((size, mtime)) = reader_attr {
+            let now = SystemTime::now();
+            let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
+            let mtime = mtime.unwrap_or(now);
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr {
+                    size,
+                    mtime,
+                    ctime: mtime,
+                    ..attr
+                },
+            });
+        }
         if let Some(state) = handle_state {
             let size = state.lock().await.len;
             let attr =
@@ -265,15 +287,19 @@ impl PathFilesystem for Filesystem {
             None => self.live_state(path).await,
             Some(_) => None,
         };
-        let (size, etag) = if write.is_none() && read_state.is_none() {
+        let (size, etag, mtime) = if write.is_none() && read_state.is_none() {
             let meta = self
                 .op
                 .stat(&path.to_string_lossy())
                 .await
                 .map_err(opendal_error2errno)?;
-            (Some(meta.content_length()), meta.etag().map(str::to_string))
+            (
+                Some(meta.content_length()),
+                meta.etag().map(str::to_string),
+                meta.last_modified().map(Into::into),
+            )
         } else {
-            (None, None)
+            (None, None, None)
         };
 
         let key = self
@@ -286,6 +312,7 @@ impl PathFilesystem for Filesystem {
                 append: is_append,
                 size,
                 etag,
+                mtime,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 
@@ -502,6 +529,7 @@ impl PathFilesystem for Filesystem {
                 append: is_append,
                 size: None,
                 etag: None,
+                mtime: None,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 

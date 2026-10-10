@@ -838,3 +838,18 @@ async fn rename_noreplace_does_not_treat_lookup_errors_as_absent() {
     assert!(fs.op.exists("a").await.unwrap());
     assert!(!fs.op.exists("b").await.unwrap());
 }
+
+#[tokio::test]
+async fn reader_getattr_survives_a_rename_of_its_file() {
+    let fs = fs_with("a", "hello").await;
+    let r = open(&fs, "/a", libc::O_RDONLY).await;
+    let root = OsStr::new("/");
+    fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await
+        .unwrap();
+    let attr = fs
+        .getattr(req(), Some(OsStr::new("/a")), Some(r), 0)
+        .await
+        .unwrap();
+    assert_eq!(attr.attr.size, 5);
+}

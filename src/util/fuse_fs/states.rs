@@ -784,11 +784,17 @@ impl States {
             return false;
         }
         drop(data);
+        self.pause.hit("retry_close").await;
         let _ns = self.lock_namespace().await;
         let mut data = state.lock().await;
-        if !data.closed && data.handles == 0 && (!data.dirty || state.is_unlinked()) {
-            self.close(state, &mut data);
+        if data.closed || data.handles > 0 {
+            return true;
         }
+        if data.dirty && !state.is_unlinked() {
+            // A rename made it dirty again meanwhile: another upload is needed.
+            return false;
+        }
+        self.close(state, &mut data);
         true
     }
 
@@ -1155,6 +1161,33 @@ mod tests {
         upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
             .await
             .unwrap();
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
+    }
+
+    #[tokio::test]
+    async fn retry_is_needed_again_after_a_rename_during_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = Arc::new(states(dir.path()));
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        {
+            let mut data = a.lock().await;
+            data.write_at(b"SOURCE", 0).unwrap();
+            // Like a closed file whose upload failed and waits for a retry.
+            data.handles = 0;
+        }
+        let pause = states.pause.arm("retry_close");
+        let retry = {
+            let (states, op, a) = (states.clone(), op.clone(), a.clone());
+            tokio::spawn(async move { states.retry(&op, &a).await })
+        };
+        pause.reached().await;
+        let ns = states.lock_namespace().await;
+        assert!(states.rename(&ns, &op, "a", "b").await.unwrap());
+        drop(ns);
+        pause.resume();
+        assert!(!retry.await.unwrap(), "the rename needs another upload");
+        assert!(states.retry(&op, &a).await);
         assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
     }
 

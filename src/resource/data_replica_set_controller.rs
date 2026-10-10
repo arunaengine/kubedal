@@ -81,6 +81,8 @@ impl DataReplicaSet {
         // source must be in the namespace of the set.
         if let Some(message) = source_namespace_error(&drs_ns, &self.spec.source_pod) {
             warn!("DataReplicaSet {drs_name}: {message}");
+            // An old sync pod must not keep running for an invalid source.
+            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
             ctx.recorder
                 .publish(
                     &Event {

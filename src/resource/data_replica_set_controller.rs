@@ -187,11 +187,12 @@ impl DataReplicaSet {
             replica_resources.iter().map(|(dp, pvc)| member_id(dp, pvc)),
         );
         let pod = match pod_api.get_opt(&sync_pod_name(self)).await? {
-            Some(pod) if pod_members(&pod) == Some(members.as_str()) => pod,
+            Some(pod) if sync_pod_is_current(&pod, &members) => pod,
             Some(pod) => {
-                // The replicas changed, so the pod mounts the wrong PVCs. Delete it;
-                // a later reconcile creates it again with the new members.
-                info!("Replica set {drs_name} changed, deleting sync pod");
+                // The replicas changed (the pod mounts the wrong PVCs), or the pod
+                // ended (evicted, crashed). Delete it; a later reconcile creates it
+                // again.
+                info!("Replacing the sync pod of replica set {drs_name}");
                 delete_if_present(&pod_api, &pod.name_any()).await?;
                 self.patch_status(&ctx, false).await?;
                 return Ok(Action::requeue(Duration::from_secs(10)));
@@ -606,6 +607,13 @@ fn member_id(data_pod: &DataPod, pvc: &PersistentVolumeClaim) -> String {
     )
 }
 
+/// A sync pod is kept only while it mounts the current members and has not ended.
+fn sync_pod_is_current(pod: &Pod, members: &str) -> bool {
+    let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+    let ended = matches!(phase, Some("Failed") | Some("Succeeded"));
+    !ended && pod_members(pod) == Some(members)
+}
+
 /// The members hash of a sync pod, if it has one.
 fn pod_members(pod: &Pod) -> Option<&str> {
     pod.metadata
@@ -734,6 +742,30 @@ mod tests {
             members_hash("src", [before].into_iter()),
             members_hash("src", [after].into_iter())
         );
+    }
+
+    #[test]
+    fn ended_sync_pods_are_replaced() {
+        use k8s_openapi::api::core::v1::PodStatus;
+        let mut pod = Pod::default();
+        pod.metadata.annotations = Some(
+            [(MEMBERS_ANNOTATION.to_string(), "m".to_string())]
+                .into_iter()
+                .collect(),
+        );
+        for (phase, current) in [
+            ("Running", true),
+            ("Pending", true),
+            ("Failed", false),
+            ("Succeeded", false),
+        ] {
+            pod.status = Some(PodStatus {
+                phase: Some(phase.into()),
+                ..Default::default()
+            });
+            assert_eq!(sync_pod_is_current(&pod, "m"), current, "{phase}");
+        }
+        assert!(!sync_pod_is_current(&pod, "other"));
     }
 
     #[test]

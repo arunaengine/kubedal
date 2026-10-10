@@ -94,31 +94,22 @@ impl DataReplicaSet {
         let drs_uid = self.metadata.uid.clone().ok_or_else(|| {
             Error::ReconcilerError(format!("DataReplicaSet {drs_name} has no uid"))
         })?;
-        let existing: Vec<DataPod> = drs_data_pods.items;
-        let missing = missing_replica_indexes(&drs_uid, drs_replicas, &existing);
-        let mut replicas: Vec<DataPod> = existing
+        let prefix = format!("{drs_uid}-replica-");
+        let ours: Vec<DataPod> = drs_data_pods
+            .items
             .into_iter()
-            .filter(|dp| (0..drs_replicas).any(|i| replica_name(&drs_uid, i) == dp.name_any()))
+            .filter(|dp| dp.name_any().starts_with(&prefix))
             .collect();
+        let taken: Vec<String> = ours.iter().map(|dp| dp.name_any()).collect();
         let all_nodes = dn_api.list(&ListParams::default()).await?.items;
 
-        // A read-only DataNode cannot hold a replica. Remove replicas on one; they
-        // are created again on a writable DataNode once they are gone.
-        let (on_read_only, kept): (Vec<DataPod>, Vec<DataPod>) = replicas
+        // A read-only DataNode cannot hold a replica. Such replicas do not count;
+        // replacements are created first, and the old ones go only after that.
+        let (on_read_only, mut replicas): (Vec<DataPod>, Vec<DataPod>) = ours
             .into_iter()
             .partition(|dp| on_read_only_node(dp, &all_nodes, &drs_ns));
-        replicas = kept;
-        if !on_read_only.is_empty() {
-            for dp in &on_read_only {
-                info!("Moving replica {} off a read-only DataNode", dp.name_any());
-                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
-                delete_if_present(&dp_api, &dp.name_any()).await?;
-            }
-            self.patch_status(&ctx, false).await?;
-            return Ok(Action::requeue(Duration::from_secs(10)));
-        }
-
-        if !missing.is_empty() {
+        let need = drs_replicas.saturating_sub(replicas.len());
+        if need > 0 {
             let used: Vec<String> = replicas
                 .iter()
                 .filter_map(|dp| dp.spec.data_node_ref.as_ref().map(|r| r.name.clone()))
@@ -129,7 +120,7 @@ impl DataReplicaSet {
                 .filter(|node| !node.spec.read_only)
                 .filter(|node| !used.contains(&node.name_any()))
                 .collect::<Vec<_>>();
-            for index in missing {
+            for index in free_replica_indexes(&drs_uid, &taken, need) {
                 let Some(replica_data_node) = available_data_nodes.pop() else {
                     warn!("DataReplicaSet {drs_name}: no free DataNode for replica {index}");
                     break;
@@ -138,9 +129,24 @@ impl DataReplicaSet {
                     .push(create_replica_data_pod(index, self, &replica_data_node, &dp_api).await?);
             }
         }
+        if old_replicas_can_go(replicas.len(), drs_replicas) {
+            for dp in &on_read_only {
+                info!(
+                    "Removing replica {} from a read-only DataNode",
+                    dp.name_any()
+                );
+                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
+                delete_if_present(&dp_api, &dp.name_any()).await?;
+            }
+        } else if !on_read_only.is_empty() {
+            warn!(
+                "DataReplicaSet {drs_name}: replicas on read-only DataNodes wait for a replacement"
+            );
+        }
         replicas.sort_by_key(|dp| dp.name_any());
         if replicas.is_empty() {
-            // Do not start a sync pod without replicas.
+            // No replica: no sync pod either, also not an old one.
+            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
             self.patch_status(&ctx, false).await?;
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
         }
@@ -504,15 +510,19 @@ fn replica_path(drs_uid: &str, index: usize) -> String {
     format!("/{drs_uid}/replica-{index}")
 }
 
-/// Indexes of replica DataPods that should exist but do not. Names, not counts,
-/// decide this, so a deleted replica in the middle is created again.
-fn missing_replica_indexes(drs_uid: &str, desired: usize, existing: &[DataPod]) -> Vec<usize> {
-    (0..desired)
-        .filter(|i| {
-            let name = replica_name(drs_uid, *i);
-            !existing.iter().any(|dp| dp.name_any() == name)
-        })
+/// The `count` smallest replica indexes whose names are not taken. Names, not
+/// counts, decide this, so a deleted replica in the middle is created again.
+fn free_replica_indexes(drs_uid: &str, taken: &[String], count: usize) -> Vec<usize> {
+    (0..)
+        .filter(|i| !taken.contains(&replica_name(drs_uid, *i)))
+        .take(count)
         .collect()
+}
+
+/// Replicas on read-only DataNodes are only removed once enough replacements
+/// exist, so the set never has fewer copies than before.
+fn old_replicas_can_go(healthy: usize, desired: usize) -> bool {
+    healthy >= desired
 }
 
 /// Annotation on the sync pod with a hash of the PVCs it mounts.
@@ -749,10 +759,14 @@ mod tests {
     fn missing_replicas_are_found_by_name() {
         let dp = |name: &str| DataPod::new(name, DataPodSpec::default());
         // replica-0 was deleted while replica-1 still exists.
-        let existing = vec![dp("u-replica-1"), dp("unrelated")];
-        assert_eq!(missing_replica_indexes("u", 2, &existing), vec![0]);
-        assert_eq!(missing_replica_indexes("u", 3, &existing), vec![0, 2]);
-        assert!(missing_replica_indexes("u", 0, &existing).is_empty());
+        let existing = [dp("u-replica-1"), dp("unrelated")];
+        let taken: Vec<String> = existing.iter().map(|dp| dp.name_any()).collect();
+        assert_eq!(free_replica_indexes("u", &taken, 1), vec![0]);
+        assert_eq!(free_replica_indexes("u", &taken, 2), vec![0, 2]);
+        assert!(free_replica_indexes("u", &taken, 0).is_empty());
+        // Old replicas wait until replacements exist.
+        assert!(!old_replicas_can_go(1, 2));
+        assert!(old_replicas_can_go(2, 2));
     }
 
     #[test]

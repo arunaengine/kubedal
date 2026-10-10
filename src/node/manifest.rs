@@ -20,7 +20,7 @@
 use crate::node::paths::{self, PathError};
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, HashSet};
+use std::collections::HashMap;
 use tonic::Status;
 
 /// The only manifest version this kubedal understands.
@@ -126,8 +126,62 @@ fn invalid(message: String) -> Status {
     Status::invalid_argument(format!("invalid manifest: {message}"))
 }
 
+/// Longest path in a manifest, in bytes (like PATH_MAX on Linux).
+pub const MAX_PATH_BYTES: usize = 4096;
+/// Most parts (folders and file name) in a manifest path.
+pub const MAX_PATH_PARTS: usize = 256;
+
 fn check_path(what: &str, value: &str) -> Result<String, Status> {
-    paths::safe_relative(value).map_err(|e: PathError| invalid(format!("{what}: {e}")))
+    if value.len() > MAX_PATH_BYTES {
+        return Err(invalid(format!(
+            "{what} is longer than {MAX_PATH_BYTES} bytes"
+        )));
+    }
+    let path =
+        paths::safe_relative(value).map_err(|e: PathError| invalid(format!("{what}: {e}")))?;
+    if path.split('/').count() > MAX_PATH_PARTS {
+        return Err(invalid(format!(
+            "{what} has more than {MAX_PATH_PARTS} parts"
+        )));
+    }
+    Ok(path)
+}
+
+/// Check that every path is either a file or a folder, never both, and that no
+/// file is listed twice. Folders are the given ones and all parents of files and
+/// folders. Map keys borrow from the paths, so no new strings are built.
+fn check_conflicts(files: &[&str], dirs: &[&str]) -> Result<(), Status> {
+    let mut kinds: HashMap<&str, bool> = HashMap::new(); // true = file
+    for file in files {
+        if kinds.insert(file, true).is_some() {
+            return Err(invalid(format!("file {file:?} is listed twice")));
+        }
+    }
+    let parents = files
+        .iter()
+        .filter_map(|f| f.rsplit_once('/').map(|(p, _)| p));
+    for dir in parents.chain(dirs.iter().copied()) {
+        let mut current = dir;
+        loop {
+            match kinds.get(current) {
+                Some(true) => {
+                    return Err(invalid(format!(
+                        "{current:?} is a file and a directory at the same time"
+                    )));
+                }
+                // Known folder: its parents are known too.
+                Some(false) => break,
+                None => {
+                    kinds.insert(current, false);
+                }
+            }
+            match current.rsplit_once('/') {
+                Some((parent, _)) => current = parent,
+                None => break,
+            }
+        }
+    }
+    Ok(())
 }
 
 fn check_digest(value: &str) -> Result<String, Status> {
@@ -164,56 +218,25 @@ pub fn plan(manifest: Manifest) -> Result<FilePlan, Status> {
         )));
     }
 
-    // Every path in the volume is either a file or a directory, never both.
-    let mut kinds: BTreeMap<String, bool> = BTreeMap::new(); // true = file
-    let add_dir_chain = |path: &str, kinds: &mut BTreeMap<String, bool>| {
-        let mut current = String::new();
-        for part in path.split('/') {
-            if !current.is_empty() {
-                current.push('/');
-            }
-            current.push_str(part);
-            if kinds.get(&current) == Some(&true) {
-                return Err(invalid(format!(
-                    "{current:?} is a file and a directory at the same time"
-                )));
-            }
-            kinds.insert(current.clone(), false);
-        }
-        Ok(())
-    };
-
     let mut files = Vec::with_capacity(manifest.files.len());
-    let mut seen = HashSet::new();
     for file in manifest.files {
-        let path = check_path("file path", &file.path)?;
-        let source = check_path("file source", file.source.trim_start_matches('/'))?;
-        if !seen.insert(path.clone()) {
-            return Err(invalid(format!("file {path:?} is listed twice")));
-        }
-        if let Some((parent, _)) = path.rsplit_once('/') {
-            add_dir_chain(parent, &mut kinds)?;
-        }
-        if kinds.get(&path) == Some(&false) {
-            return Err(invalid(format!(
-                "{path:?} is a file and a directory at the same time"
-            )));
-        }
-        kinds.insert(path.clone(), true);
         files.push(PlannedFile {
-            path,
-            source,
+            path: check_path("file path", &file.path)?,
+            source: check_path("file source", file.source.trim_start_matches('/'))?,
             sha256: file.sha256.as_deref().map(check_digest).transpose()?,
             size: file.size,
             executable: file.executable,
         });
     }
-
-    let mut directories = Vec::with_capacity(manifest.directories.len());
-    for dir in manifest.directories {
-        let dir = check_path("directory", &dir)?;
-        add_dir_chain(&dir, &mut kinds)?;
-        directories.push(dir);
+    let directories = manifest
+        .directories
+        .iter()
+        .map(|dir| check_path("directory", dir))
+        .collect::<Result<Vec<_>, _>>()?;
+    {
+        let file_paths: Vec<&str> = files.iter().map(|f| f.path.as_str()).collect();
+        let dir_paths: Vec<&str> = directories.iter().map(String::as_str).collect();
+        check_conflicts(&file_paths, &dir_paths)?;
     }
 
     let upload = match manifest.upload {
@@ -355,6 +378,31 @@ mod tests {
             let err = parse_str(bad).unwrap_err();
             assert_eq!(err.code(), tonic::Code::InvalidArgument, "{bad}");
         }
+    }
+
+    #[test]
+    fn rejects_too_long_and_too_deep_paths() {
+        let deep = vec!["a"; MAX_PATH_PARTS + 1].join("/");
+        let long = "a".repeat(MAX_PATH_BYTES + 1);
+        for path in [deep, long] {
+            let data = format!(r#"{{"version": 1, "directories": ["{path}"]}}"#);
+            assert!(parse(data.as_bytes()).is_err());
+        }
+        let ok = vec!["a"; MAX_PATH_PARTS].join("/");
+        let data = format!(r#"{{"version": 1, "directories": ["{ok}"]}}"#);
+        assert!(parse(data.as_bytes()).is_ok());
+    }
+
+    #[test]
+    fn many_deep_paths_are_checked_quickly() {
+        // Many different deep paths: the check must not build every parent string.
+        let dirs: Vec<String> = (0..500)
+            .map(|i| format!("{i}/{}", vec!["d"; MAX_PATH_PARTS - 1].join("/")))
+            .collect();
+        let data = serde_json::json!({"version": 1, "directories": dirs}).to_string();
+        let start = std::time::Instant::now();
+        assert!(parse(data.as_bytes()).is_ok());
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
     }
 
     #[test]

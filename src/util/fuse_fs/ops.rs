@@ -52,6 +52,22 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyAttr> {
         tracing::debug!("getattr(path={path:?}, fh={fh:?}, flags={flags:?})");
 
+        // A file that is being written may not be uploaded yet; its size is local.
+        let writer = fh.and_then(|fh| {
+            self.opened_files
+                .get(FileKey::try_from(fh).ok()?.0)
+                .and_then(|f| f.inner_writer.clone())
+        });
+        if let Some(writer) = writer {
+            let size = writer.lock().await.written;
+            let attr =
+                dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr { size, ..attr },
+            });
+        }
+
         let fh_path = fh.and_then(|fh| {
             self.opened_files
                 .get(FileKey::try_from(fh).ok()?.0)
@@ -177,30 +193,24 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("open(path={path:?}, flags=0x{flags:x})");
 
         let (is_read, is_trunc, is_append) = self.check_flags(flags)?;
-        if flags & libc::O_CREAT as u32 != 0 {
-            self.op
-                .write(&path.to_string_lossy(), Bytes::new())
-                .await
-                .map_err(opendal_error2errno)?;
-        }
 
         let inner_writer = if is_trunc || is_append {
-            let writer = self
-                .op
-                .writer_with(&path.to_string_lossy())
-                .append(is_append)
-                .await
-                .map_err(opendal_error2errno)?;
-            let written = if is_append {
-                self.op
-                    .stat(&path.to_string_lossy())
+            let writer = self.new_writer()?;
+            if is_append {
+                // Start from the current content, so appends keep it.
+                let data = self
+                    .op
+                    .read(&path.to_string_lossy())
                     .await
                     .map_err(opendal_error2errno)?
-                    .content_length()
-            } else {
-                0
-            };
-            Some(Arc::new(Mutex::new(InnerWriter { writer, written })))
+                    .to_bytes();
+                let mut inner = writer.lock().await;
+                std::os::unix::fs::FileExt::write_all_at(&inner.spool, &data, 0)
+                    .map_err(io_errno)?;
+                inner.written = data.len() as u64;
+                inner.dirty = false;
+            }
+            Some(writer)
         } else {
             None
         };
@@ -296,17 +306,9 @@ impl PathFilesystem for Filesystem {
         };
 
         let mut inner = inner_writer.lock().await;
-        // OpenDAL doesn't support random write
-        if offset != inner.written {
-            Err(Errno::from(libc::EINVAL))?;
-        }
-
-        inner
-            .writer
-            .write_from(data)
-            .await
-            .map_err(opendal_error2errno)?;
-        inner.written += data.len() as u64;
+        std::os::unix::fs::FileExt::write_all_at(&inner.spool, data, offset).map_err(io_errno)?;
+        inner.written = inner.written.max(offset + data.len() as u64);
+        inner.dirty = true;
 
         Ok(ReplyWrite {
             written: data.len() as _,
@@ -331,20 +333,17 @@ impl PathFilesystem for Filesystem {
             .take(FileKey::try_from(fh)?.0)
             .ok_or(Errno::from(libc::EBADF))?;
 
-        // Release comes once, after the last file descriptor is closed. Only then
-        // no more writes can follow, so the object is finished here.
+        // Release comes once, after the last file descriptor is closed. Its result
+        // does not reach the program, so this upload is only a last attempt.
         if let Some(inner_writer) = file.inner_writer {
-            let mut lock = inner_writer.lock().await;
-            if let Err(err) = lock.writer.close().await {
-                tracing::error!("finishing {:?} failed: {err}", file.path);
-                return Err(opendal_error2errno(err));
-            }
+            self.upload_writer(&file.path, &inner_writer).await?;
         }
         Ok(())
     }
 
     /// Flush is called on every close of a file descriptor, also for duplicated
-    /// descriptors. More writes can follow, so the writer stays open until release.
+    /// descriptors. The content is uploaded here, so `close` returns upload errors.
+    /// More writes can follow; they are uploaded by the next flush.
     async fn flush(
         &self,
         _req: Request,
@@ -353,8 +352,18 @@ impl PathFilesystem for Filesystem {
         lock_owner: u64,
     ) -> Result<()> {
         tracing::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
-        self.get_opened_file(FileKey::try_from(fh)?, path)?;
-        Ok(())
+        self.upload_open_file(path, fh).await
+    }
+
+    async fn fsync(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        datasync: bool,
+    ) -> Result<()> {
+        tracing::debug!("fsync(path={path:?}, fh={fh}, datasync={datasync})");
+        self.upload_open_file(path, fh).await
     }
 
     async fn readdir<'a>(
@@ -395,14 +404,7 @@ impl PathFilesystem for Filesystem {
         let path = PathBuf::from(parent).join(name);
 
         let inner_writer = if is_trunc || is_append {
-            let writer = self
-                .op
-                .writer_with(&path.to_string_lossy())
-                .chunk(4 * 1024 * 1024)
-                .append(is_append)
-                .await
-                .map_err(opendal_error2errno)?;
-            Some(Arc::new(Mutex::new(InnerWriter { writer, written: 0 })))
+            Some(self.new_writer()?)
         } else {
             None
         };

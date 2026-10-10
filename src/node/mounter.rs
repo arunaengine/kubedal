@@ -35,9 +35,19 @@ pub trait Mounter: Send + Sync {
 }
 
 /// Real mounts through the Linux mount system calls.
-#[derive(Default)]
 pub struct SystemMounter {
     fuse_sessions: Mutex<HashMap<PathBuf, MountHandle>>,
+    /// Folder for spool files of FUSE files that are being written.
+    spool_dir: PathBuf,
+}
+
+impl SystemMounter {
+    pub fn new(spool_dir: PathBuf) -> Self {
+        Self {
+            fuse_sessions: Mutex::new(HashMap::new()),
+            spool_dir,
+        }
+    }
 }
 
 fn c_path(path: &Path) -> Result<CString, Status> {
@@ -147,7 +157,7 @@ impl Mounter for SystemMounter {
             .allow_other(true)
             .read_only(read_only);
         let handle = fuse3::path::Session::new(options)
-            .mount(Filesystem::new(op, 0, 0), target)
+            .mount(Filesystem::new(op, 0, 0, self.spool_dir.clone()), target)
             .await
             .map_err(|e| io_status(e, "mount FUSE file system"))?;
         self.fuse_sessions

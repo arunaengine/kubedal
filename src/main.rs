@@ -142,7 +142,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     } else {
         // Is a csi driver noder
         let cluster = Arc::new(KubeCluster::new(client.clone(), &node_id));
-        let mounter = Arc::new(SystemMounter::default());
+        let mounter = Arc::new(SystemMounter::new(data_dir.join("spool")));
         let cache_size = matches
             .get_one::<String>("content-cache-size")
             .map(|s| kubedal::util::quantity::parse_bytes(s))

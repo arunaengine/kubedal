@@ -34,6 +34,7 @@ tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
 schemars = "1.2"
 serde_yaml = "0.9.34"
+tempfile = "3.27.0"
 thiserror = "2.0.12"
 sha2 = "0.10"
 rustix = { version = "1", features = ["fs"] }
@@ -48,6 +49,3 @@ path = "src/main.rs"
 [[bin]]
 name = "crdgen"
 path = "src/crdgen.rs"
-
-[dev-dependencies]
-tempfile = "3.27.0"

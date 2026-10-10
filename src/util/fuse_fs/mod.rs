@@ -54,12 +54,15 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 /// crate does not yet support the OpenDAL and fuse3 versions used by kubedal.
 /// Changes: adapted to opendal 0.59 and fuse3 0.9; `read` only fetches the
 /// requested byte range and stops at the end of the file; the writer of a file
-/// is finished in `release` instead of `flush`, so writes through duplicated
+/// is replaced by a local spool file that is uploaded on `flush`, `fsync` and
+/// `release`, so upload errors reach the program and writes through duplicated
 /// file descriptors (like shell redirects) work.
 pub struct Filesystem {
     op: Operator,
     gid: u32,
     uid: u32,
+    /// Folder for the spool files of files opened for writing.
+    spool_dir: PathBuf,
 
     opened_files: Slab<OpenedFile>,
 }
@@ -75,12 +78,12 @@ impl Filesystem {
                 .inner_writer
                 .clone();
             if let Some(writer) = writer {
-                // An open writer only supports the size it has written so far.
-                return if writer.lock().await.written == size {
-                    Ok(())
-                } else {
-                    Err(Errno::from(libc::EOPNOTSUPP))
-                };
+                // An open file is a local spool file, so any size works.
+                let mut inner = writer.lock().await;
+                inner.spool.set_len(size).map_err(io_errno)?;
+                inner.written = size;
+                inner.dirty = true;
+                return Ok(());
             }
         }
         let path = match (path, fh) {
@@ -123,14 +126,59 @@ impl Filesystem {
         }
     }
 
-    /// Create a new filesystem with given operator, uid and gid.
-    pub fn new(op: Operator, uid: u32, gid: u32) -> Self {
+    /// Create a new filesystem with given operator, uid and gid. Files opened for
+    /// writing are kept in `spool_dir` until they are uploaded.
+    pub fn new(op: Operator, uid: u32, gid: u32, spool_dir: PathBuf) -> Self {
         Self {
             op,
             uid,
             gid,
+            spool_dir,
             opened_files: Slab::new(),
         }
+    }
+
+    /// A new empty spool file, removed from the folder right away.
+    fn new_writer(&self) -> Result<Arc<Mutex<InnerWriter>>> {
+        std::fs::create_dir_all(&self.spool_dir).map_err(io_errno)?;
+        let spool = tempfile::tempfile_in(&self.spool_dir).map_err(io_errno)?;
+        Ok(Arc::new(Mutex::new(InnerWriter {
+            spool,
+            written: 0,
+            dirty: true,
+        })))
+    }
+
+    /// Upload the spool file of the open file `fh`, if it has one.
+    async fn upload_open_file(&self, path: Option<&OsStr>, fh: u64) -> Result<()> {
+        let (file_path, writer) = {
+            let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
+            (file.path.clone(), file.inner_writer.clone())
+        };
+        match writer {
+            Some(writer) => self.upload_writer(&file_path, &writer).await,
+            None => Ok(()),
+        }
+    }
+
+    /// Upload the spool file of an open file if it changed since the last upload.
+    async fn upload_writer(&self, path: &OsStr, writer: &Mutex<InnerWriter>) -> Result<()> {
+        let mut inner = writer.lock().await;
+        if !inner.dirty {
+            return Ok(());
+        }
+        let mut file = inner.spool.try_clone().map_err(io_errno)?;
+        std::io::Seek::seek(&mut file, std::io::SeekFrom::Start(0)).map_err(io_errno)?;
+        let key = path.to_string_lossy();
+        let key = key.trim_start_matches('/');
+        crate::node::upload::upload_file(&self.op, tokio::fs::File::from_std(file), key, key)
+            .await
+            .map_err(|err| {
+                tracing::error!("upload of {key} failed: {}", err.message());
+                Errno::from(libc::EIO)
+            })?;
+        inner.dirty = false;
+        Ok(())
     }
 
     fn check_flags(&self, flags: u32) -> Result<(bool, bool, bool)> {
@@ -153,10 +201,7 @@ impl Filesystem {
         if is_read && !capability.read {
             Err(Errno::from(libc::EACCES))?;
         }
-        if is_trunc && !capability.write {
-            Err(Errno::from(libc::EACCES))?;
-        }
-        if is_append && !capability.write_can_append {
+        if (is_trunc || is_append) && !capability.write {
             Err(Errno::from(libc::EACCES))?;
         }
 
@@ -227,6 +272,11 @@ const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) ->
         #[cfg(target_os = "macos")]
         flags: 0,
     }
+}
+
+fn io_errno(err: std::io::Error) -> Errno {
+    tracing::warn!("spool file error: {err}");
+    Errno::from(err.raw_os_error().unwrap_or(libc::EIO))
 }
 
 fn opendal_error2errno(err: opendal::Error) -> fuse3::Errno {

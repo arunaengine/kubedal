@@ -19,7 +19,6 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use fuse3::Errno;
-use opendal::Writer;
 use tokio::sync::Mutex;
 
 /// Opened file represents file that opened in memory.
@@ -36,12 +35,16 @@ pub struct OpenedFile {
     pub size: Option<u64>,
 }
 
-/// # FIXME
+/// Content of a file opened for writing.
 ///
-/// We need better naming and API for this struct.
+/// Writes go to a local spool file. `flush`, `fsync` and `release` upload the
+/// whole spool file as one object, so an upload error reaches `close` or `fsync`.
 pub struct InnerWriter {
-    pub writer: Writer,
+    pub spool: std::fs::File,
+    /// Size of the file content.
     pub written: u64,
+    /// The spool file has content that is not uploaded yet.
+    pub dirty: bool,
 }
 
 /// File key is the key of opened file.

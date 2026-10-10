@@ -72,10 +72,66 @@ impl NodeService {
         };
         Ok(VolumeSource::Tree {
             node,
-            path: data_pod.spec.path.unwrap_or_else(|| "/".into()),
+            path: data_pod_path(&data_pod)?,
             mode,
             writable,
         })
+    }
+}
+
+/// The folder of a DataPod inside its DataNode.
+///
+/// Without a path, the DataPod controller assigns "/<uid>". The same default is
+/// used here, so a pod that starts before the controller ran never sees the root
+/// of the DataNode.
+fn data_pod_path(data_pod: &DataPod) -> Result<String, Status> {
+    match data_pod.spec.path.as_deref() {
+        Some(path) if !path.is_empty() && path != "/" => Ok(path.to_string()),
+        _ => {
+            let uid = data_pod.metadata.uid.as_deref().ok_or_else(|| {
+                Status::unavailable("the DataPod has no path and no uid yet; try again later")
+            })?;
+            Ok(format!("/{uid}"))
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::crd::DataPodSpec;
+
+    fn data_pod(path: Option<&str>, uid: Option<&str>) -> DataPod {
+        let mut dp = DataPod::new(
+            "dp",
+            DataPodSpec {
+                path: path.map(str::to_string),
+                ..Default::default()
+            },
+        );
+        dp.metadata.uid = uid.map(str::to_string);
+        dp
+    }
+
+    #[test]
+    fn data_pod_without_path_uses_its_uid() {
+        assert_eq!(data_pod_path(&data_pod(None, Some("u1"))).unwrap(), "/u1");
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/"), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some(""), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/data"), Some("u1"))).unwrap(),
+            "/data"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(None, None)).unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 }
 

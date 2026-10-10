@@ -24,6 +24,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
+        // Colors only on a terminal, not in container logs.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_file(true)
         .with_line_number(true)
         .with_env_filter(filter)

@@ -9,7 +9,7 @@ bytes = "1.10"
 clap = "4.6"
 futures = "0.3.31"
 k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
-kube = { version = "4.2.0", features = ["derive", "runtime"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "derive", "runtime"] }
 opendal = { version = "0.59.4", features = [
     "services-s3",
     "services-http",

@@ -87,6 +87,39 @@ impl ContentCache {
     ) -> Result<PathBuf, Status> {
         let lock = self.lock_for(&object_name(scope, digest));
         let _guard = lock.lock().await;
+        self.fetch_locked(op, scope, key, digest, budget).await
+    }
+
+    /// Like [`ContentCache::fetch`], then copy the object to `dest`.
+    ///
+    /// The object stays locked until the copy is done, so [`ContentCache::prune`]
+    /// cannot remove it between the lookup and the copy.
+    #[allow(clippy::too_many_arguments)]
+    pub async fn fetch_into(
+        &self,
+        op: &Operator,
+        scope: &str,
+        key: &str,
+        digest: &str,
+        budget: &ByteBudget,
+        dest: &Path,
+        executable: bool,
+    ) -> Result<(), Status> {
+        let lock = self.lock_for(&object_name(scope, digest));
+        let _guard = lock.lock().await;
+        let cached = self.fetch_locked(op, scope, key, digest, budget).await?;
+        Self::place(&cached, dest, executable).await
+    }
+
+    /// The work of `fetch`. The caller must hold the lock of the object.
+    async fn fetch_locked(
+        &self,
+        op: &Operator,
+        scope: &str,
+        key: &str,
+        digest: &str,
+        budget: &ByteBudget,
+    ) -> Result<PathBuf, Status> {
         let path = self.path(scope, digest);
 
         if let Ok(meta) = tokio::fs::metadata(&path).await {
@@ -270,6 +303,38 @@ mod tests {
         // The pod writes to its copy; the cache stays intact.
         std::fs::write(&dest, "overwritten").unwrap();
         assert_eq!(std::fs::read_to_string(&cached).unwrap(), "abc");
+    }
+
+    #[tokio::test]
+    async fn prune_skips_objects_in_use() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ContentCache::open(dir.path(), 0).unwrap();
+        let op = op_with("a", "abc").await;
+        let path = cache
+            .fetch(&op, "ns/dn", "a", ABC, &ByteBudget::default())
+            .await
+            .unwrap();
+        // While a publish holds the object, prune must leave it alone.
+        let lock = cache.lock_for(&object_name("ns/dn", ABC));
+        let guard = lock.lock().await;
+        assert_eq!(cache.prune().unwrap().removed_files, 0);
+        assert!(path.exists());
+        drop(guard);
+        drop(lock);
+        assert_eq!(cache.prune().unwrap().removed_files, 1);
+    }
+
+    #[tokio::test]
+    async fn fetch_into_copies_the_object() {
+        let dir = tempfile::tempdir().unwrap();
+        let cache = ContentCache::open(&dir.path().join("c"), 0).unwrap();
+        let op = op_with("a", "abc").await;
+        let dest = dir.path().join("copy");
+        cache
+            .fetch_into(&op, "ns/dn", "a", ABC, &ByteBudget::default(), &dest, false)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&dest).unwrap(), "abc");
     }
 
     #[tokio::test]

@@ -129,8 +129,17 @@ async fn place_file(
     }
     let size = match &file.sha256 {
         Some(digest) => {
-            let cached = cache.fetch(op, scope, &file.source, digest, budget).await?;
-            ContentCache::place(&cached, &dest, file.executable).await?;
+            cache
+                .fetch_into(
+                    op,
+                    scope,
+                    &file.source,
+                    digest,
+                    budget,
+                    &dest,
+                    file.executable,
+                )
+                .await?;
             tokio::fs::metadata(&dest)
                 .await
                 .map_err(|e| io_status(e, "stat placed file"))?

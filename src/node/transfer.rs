@@ -74,6 +74,9 @@ pub struct RemoteFile {
 /// Everything found below a prefix.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct RemoteTree {
+    /// Prefix in the DataNode that relative paths start from, like `data/` or "".
+    /// For a single file this is the folder of the file.
+    pub base: String,
     /// Directories relative to the volume root, including empty ones.
     pub dirs: Vec<String>,
     pub files: Vec<RemoteFile>,
@@ -102,8 +105,12 @@ pub async fn list_tree(op: &Operator, prefix: &str) -> Result<RemoteTree, Status
     if let Some(key) = prefix.strip_suffix('/') {
         match op.stat(key).await {
             Ok(meta) if meta.is_file() => {
-                let name = key.rsplit('/').next().unwrap_or(key).to_string();
+                let (base, name) = match key.rsplit_once('/') {
+                    Some((parent, name)) => (format!("{parent}/"), name.to_string()),
+                    None => (String::new(), key.to_string()),
+                };
                 return Ok(RemoteTree {
+                    base,
                     dirs: vec![],
                     files: vec![RemoteFile {
                         key: key.to_string(),
@@ -124,7 +131,10 @@ pub async fn list_tree(op: &Operator, prefix: &str) -> Result<RemoteTree, Status
         .await
         .map_err(|e| opendal_status(e, &format!("list {prefix}")))?;
 
-    let mut tree = RemoteTree::default();
+    let mut tree = RemoteTree {
+        base: prefix.clone(),
+        ..Default::default()
+    };
     while let Some(entry) = lister
         .try_next()
         .await
@@ -302,6 +312,7 @@ mod tests {
         assert_eq!(tree.files.len(), 1);
         assert_eq!(tree.files[0].relative, "a.txt");
         assert_eq!(tree.files[0].key, "data/a.txt");
+        assert_eq!(tree.base, "data/");
     }
 
     #[tokio::test]

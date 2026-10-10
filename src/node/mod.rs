@@ -3,3 +3,4 @@ pub mod mounter;
 pub mod paths;
 pub mod state;
 pub mod transfer;
+pub mod volume;

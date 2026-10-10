@@ -720,3 +720,29 @@ async fn forced_open_during_rename_never_displaces_a_new_destination() {
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"created later");
     assert!(!fs.op.exists("a").await.unwrap());
 }
+
+#[tokio::test]
+async fn rename_with_a_failing_journal_changes_nothing() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let pa = Some(OsStr::new("/a"));
+    let w = create(&fs, "a").await;
+    fs.write(req(), pa, w, 0, b"data", 0, 0).await.unwrap();
+    fs.flush(req(), pa, w, 0).await.unwrap();
+    // The journal cannot be written: the spool folder is read-only.
+    let spool = dir.path().join("spool");
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let root = OsStr::new("/");
+    let result = fs
+        .rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await;
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    // Nothing moved: the object, the name and the journal are still the old ones.
+    assert_eq!(op.read("a").await.unwrap().to_vec(), b"data");
+    assert!(!op.exists("b").await.unwrap());
+    fs.write(req(), pa, w, 4, b"!", 0, 0).await.unwrap();
+    fs.release(req(), pa, w, 0, 0, false).await.unwrap();
+    assert_eq!(op.read("a").await.unwrap().to_vec(), b"data!");
+}

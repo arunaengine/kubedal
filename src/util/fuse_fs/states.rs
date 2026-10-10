@@ -208,9 +208,17 @@ impl FileState {
 
 impl StateData {
     fn write_meta(&mut self) -> std::io::Result<()> {
+        let key = self.key.clone();
+        self.write_meta_for(&key)
+    }
+
+    /// Write the journal with `key` durably: the spool data is synced first, then
+    /// the JSON file is written to a temp file, synced, renamed and the folder
+    /// synced. After a crash the journal is either the old or the new one.
+    fn write_meta_for(&mut self, key: &str) -> std::io::Result<()> {
         self.file.sync_all()?;
         let data = serde_json::to_vec(&SpoolMeta {
-            key: self.key.clone(),
+            key: key.to_string(),
         })
         .map_err(std::io::Error::other)?;
         let tmp = self.meta_path.with_extension("json.tmp");
@@ -218,6 +226,9 @@ impl StateData {
         file.write_all(&data)?;
         file.sync_all()?;
         std::fs::rename(&tmp, &self.meta_path)?;
+        if let Some(dir) = self.meta_path.parent() {
+            File::open(dir)?.sync_all()?;
+        }
         self.complete = true;
         Ok(())
     }
@@ -689,14 +700,31 @@ impl States {
             None => (src.lock().await, None),
         };
         self.pause.hit("rename_locked").await;
+        // Write-ahead: first the journal points to the new key. If that fails,
+        // nothing changed at all.
+        src_data
+            .write_meta_for(to)
+            .map_err(|e| io_status(e, "write spool metadata"))?;
+        let undo = |data: &mut StateData| {
+            if let Err(err) = data.write_meta_for(from) {
+                tracing::error!("cannot restore the journal of {from}: {err}");
+            }
+        };
         match op.delete(from).await {
             Ok(()) => {}
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
-            Err(err) => return Err(opendal_status(err, "remove old name")),
+            Err(err) => {
+                undo(&mut src_data);
+                return Err(opendal_status(err, "remove old name"));
+            }
         }
-        if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data) {
-            retire(dst, &mut dst_data).map_err(|e| io_status(e, "retire old file"))?;
+        if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data)
+            && let Err(err) = retire(dst, &mut dst_data)
+        {
+            undo(&mut src_data);
+            return Err(io_status(err, "retire old file"));
         }
+        // Only now the state changes in memory.
         {
             let mut map = self.map();
             map.remove(from);
@@ -704,9 +732,6 @@ impl States {
         }
         src_data.key = to.to_string();
         src_data.dirty = true;
-        src_data
-            .write_meta()
-            .map_err(|e| io_status(e, "write spool metadata"))?;
         Ok(true)
     }
 

@@ -768,12 +768,21 @@ impl States {
             return (result, true);
         }
         drop(data);
+        self.pause.hit("release_close").await;
         // Closing removes the name from the map, so it needs the namespace lock,
         // taken before the state lock.
         let _ns = self.lock_namespace().await;
         let mut data = state.lock().await;
         if data.closed || data.handles > 0 {
             return (result, false);
+        }
+        // Something may have stopped the file system meanwhile: then nothing is
+        // uploaded or removed, everything stays for the replay.
+        if self.is_broken() {
+            return (Err(broken_status()), false);
+        }
+        if self.fence.is_closing() {
+            return (result, true);
         }
         // A rename may have changed the key meanwhile; upload under the new key.
         if data.dirty
@@ -804,6 +813,10 @@ impl States {
         let _ns = self.lock_namespace().await;
         let mut data = state.lock().await;
         if data.closed || data.handles > 0 {
+            return true;
+        }
+        if self.is_broken() || self.fence.is_closing() {
+            // Leave everything for the replay.
             return true;
         }
         if data.dirty && !state.is_unlinked() {
@@ -1178,6 +1191,66 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
+    }
+
+    /// Make `states` broken through a rename whose folder sync fails.
+    async fn break_states(states: &States, op: &Operator) {
+        let other = states.open_write(op, "other", false).await.unwrap();
+        other.lock().await.write_at(b"x", 0).unwrap();
+        states.pause.fail_once("dir_fsync");
+        let ns = states.lock_namespace().await;
+        assert!(states.rename(&ns, op, "other", "moved").await.is_err());
+        assert!(states.is_broken());
+    }
+
+    fn spool_files(dir: &Path) -> usize {
+        std::fs::read_dir(dir).unwrap().count()
+    }
+
+    #[tokio::test]
+    async fn release_keeps_recovery_files_when_broken_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = Arc::new(states(dir.path()));
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        a.lock().await.write_at(b"A", 0).unwrap();
+        let pause = states.pause.arm("release_close");
+        let release = {
+            let (states, op, a) = (states.clone(), op.clone(), a.clone());
+            tokio::spawn(async move { states.release(&op, &a).await })
+        };
+        pause.reached().await;
+        break_states(&states, &op).await;
+        let before = spool_files(dir.path());
+        pause.resume();
+        assert!(release.await.unwrap().0.is_err());
+        assert!(!a.lock().await.closed);
+        assert_eq!(spool_files(dir.path()), before);
+    }
+
+    #[tokio::test]
+    async fn retry_keeps_recovery_files_when_broken_meanwhile() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = Arc::new(states(dir.path()));
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        {
+            let mut data = a.lock().await;
+            data.write_at(b"A", 0).unwrap();
+            data.handles = 0;
+        }
+        let pause = states.pause.arm("retry_close");
+        let retry = {
+            let (states, op, a) = (states.clone(), op.clone(), a.clone());
+            tokio::spawn(async move { states.retry(&op, &a).await })
+        };
+        pause.reached().await;
+        break_states(&states, &op).await;
+        let before = spool_files(dir.path());
+        pause.resume();
+        retry.await.unwrap();
+        assert!(!a.lock().await.closed);
+        assert_eq!(spool_files(dir.path()), before);
     }
 
     #[tokio::test]

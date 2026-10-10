@@ -6,4 +6,5 @@ pub mod request;
 pub mod state;
 pub mod testing;
 pub mod transfer;
+pub mod upload;
 pub mod volume;

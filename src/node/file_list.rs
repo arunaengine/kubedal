@@ -6,7 +6,7 @@ use crate::node::state::{DataNodeRef, PodRef, UploadPlan, VolumeRecord};
 use crate::node::transfer::{self, ByteBudget, CONCURRENCY};
 use crate::node::volume::VolumeManager;
 use crate::util::error::{io_status, opendal_status};
-use futures::TryStreamExt;
+use futures::StreamExt;
 use opendal::Operator;
 use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
@@ -88,11 +88,26 @@ impl VolumeManager {
 
         let cache = self.content_cache();
         let scope = node.to_string();
-        futures::stream::iter(plan.files.iter().map(Ok::<_, Status>))
-            .try_for_each_concurrent(CONCURRENCY, |file| {
-                place_file(cache, &op, &scope, &data, file, &budget)
+        // Wait for every started placement, also after an error. A dropped copy
+        // task keeps running in the background and could write into the data
+        // folder of the next attempt. After the first error no new file starts.
+        let first_error: std::sync::Mutex<Option<Status>> = std::sync::Mutex::new(None);
+        futures::stream::iter(plan.files.iter())
+            .for_each_concurrent(CONCURRENCY, |file| async {
+                let failed = || first_error.lock().is_ok_and(|e| e.is_some());
+                if failed() {
+                    return;
+                }
+                if let Err(err) = place_file(cache, &op, &scope, &data, file, &budget).await
+                    && let Ok(mut slot) = first_error.lock()
+                {
+                    slot.get_or_insert(err);
+                }
             })
-            .await?;
+            .await;
+        if let Some(err) = first_error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+            return Err(err);
+        }
         tracing::info!(
             "placed {} files ({} bytes) from manifest {manifest_key} of {node}",
             plan.files.len(),

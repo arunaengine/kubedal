@@ -24,11 +24,31 @@ pub async fn read_manifest(op: &Operator, key: &str) -> Result<FilePlan, Status>
             "manifest {key} is larger than {MAX_MANIFEST_BYTES} bytes"
         )));
     }
-    let data = op
-        .read(key)
+    // The size from stat may be wrong or change, so the read is limited as well.
+    let data = read_capped(op, key, MAX_MANIFEST_BYTES).await?;
+    manifest::parse(&data)
+}
+
+/// Read an object, but fail as soon as it is longer than `max` bytes.
+async fn read_capped(op: &Operator, key: &str, max: u64) -> Result<Vec<u8>, Status> {
+    let mut stream = op
+        .reader(key)
+        .await
+        .map_err(|e| opendal_status(e, &format!("read manifest {key}")))?
+        .into_bytes_stream(..)
         .await
         .map_err(|e| opendal_status(e, &format!("read manifest {key}")))?;
-    manifest::parse(&data.to_vec())
+    let mut data = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(|e| io_status(e, &format!("read manifest {key}")))?;
+        if (data.len() + chunk.len()) as u64 > max {
+            return Err(Status::invalid_argument(format!(
+                "manifest {key} is larger than {max} bytes"
+            )));
+        }
+        data.extend_from_slice(&chunk);
+    }
+    Ok(data)
 }
 
 impl VolumeManager {
@@ -182,4 +202,19 @@ async fn place_file(
         )));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use opendal::services::Memory;
+
+    #[tokio::test]
+    async fn manifest_read_is_limited() {
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("m", vec![b'x'; 11]).await.unwrap();
+        assert_eq!(read_capped(&op, "m", 11).await.unwrap().len(), 11);
+        let err = read_capped(&op, "m", 10).await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+    }
 }

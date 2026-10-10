@@ -77,23 +77,43 @@ fn sys_umount(target: &CString, flags: libc::c_int) -> std::io::Result<()> {
     }
 }
 
+/// Make a read-only bind mount of `source` at `target`.
+///
+/// MS_RDONLY is ignored by a plain bind, and a later remount does not reach the
+/// copies that mount propagation already made for kubelet and the container.
+/// So the read-only mount is prepared at a staging path first; the bind to the
+/// target then copies the read-only flag, and so do all propagated copies.
+fn bind_read_only(source: &CString, staging: &CString, target: &CString) -> Result<(), Status> {
+    let staging_path = Path::new(std::ffi::OsStr::from_bytes(staging.as_bytes()));
+    std::fs::create_dir_all(staging_path).map_err(|e| io_status(e, "create staging directory"))?;
+    let result = (|| {
+        sys_mount(Some(source), staging, libc::MS_BIND).map_err(|e| io_status(e, "bind mount"))?;
+        let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
+        sys_mount(None, staging, flags).map_err(|e| io_status(e, "remount read-only"))?;
+        sys_mount(Some(staging), target, libc::MS_BIND).map_err(|e| io_status(e, "bind mount"))?;
+        // Also mark the target itself, in case the kernel did not copy the flag.
+        if let Err(err) = sys_mount(None, target, flags) {
+            let _ = sys_umount(target, libc::MNT_DETACH);
+            return Err(io_status(err, "remount read-only"));
+        }
+        Ok(())
+    })();
+    let _ = sys_umount(staging, libc::MNT_DETACH);
+    let _ = std::fs::remove_dir(staging_path);
+    result
+}
+
 #[tonic::async_trait]
 impl Mounter for SystemMounter {
     async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status> {
+        let staging = read_only.then(|| source.with_extension("ro"));
         let source = c_path(source)?;
         let target_c = c_path(target)?;
-        tokio::task::spawn_blocking(move || {
-            sys_mount(Some(&source), &target_c, libc::MS_BIND)
-                .map_err(|e| io_status(e, "bind mount"))?;
-            if read_only {
-                // A bind mount ignores MS_RDONLY. A second remount call makes it read-only.
-                let flags = libc::MS_BIND | libc::MS_REMOUNT | libc::MS_RDONLY;
-                if let Err(err) = sys_mount(None, &target_c, flags) {
-                    let _ = sys_umount(&target_c, libc::MNT_DETACH);
-                    return Err(io_status(err, "remount read-only"));
-                }
-            }
-            Ok(())
+        let staging_c = staging.as_deref().map(c_path).transpose()?;
+        tokio::task::spawn_blocking(move || match staging_c {
+            None => sys_mount(Some(&source), &target_c, libc::MS_BIND)
+                .map_err(|e| io_status(e, "bind mount")),
+            Some(staging_c) => bind_read_only(&source, &staging_c, &target_c),
         })
         .await
         .map_err(|e| Status::internal(format!("mount task failed: {e}")))?

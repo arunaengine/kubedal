@@ -42,11 +42,10 @@ use opendal::Metadata;
 use opendal::Operator;
 use opendal::raw::normalize_path;
 use sharded_slab::Slab;
-use tokio::sync::Mutex;
 
 use file::FileKey;
 use file::OpenedFile;
-use spool::{Spool, WriteState};
+use states::{FileState, SpoolBudget, States};
 
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
@@ -64,8 +63,8 @@ pub struct Filesystem {
     op: Operator,
     gid: u32,
     uid: u32,
-    /// Shared spool of files that are open for writing.
-    spool: Arc<Spool>,
+    /// Shared states of files that are open for writing.
+    states: Arc<States>,
 
     opened_files: Slab<OpenedFile>,
 }
@@ -82,13 +81,22 @@ impl Filesystem {
                 .clone();
             if let Some(writer) = writer {
                 // An open file is a local spool file, so any size works.
-                writer.lock().await.set_len(size).map_err(io_errno)?;
-                return Ok(());
+                let mut data = writer.lock().await;
+                if !data.closed {
+                    data.set_len(size).map_err(io_errno)?;
+                    return Ok(());
+                }
             }
         }
-        if let Some(state) = path.and_then(|p| self.spool.get(&key_of(p))) {
-            // Another handle writes this file: truncate the shared content.
-            state.lock().await.set_len(size).map_err(io_errno)?;
+        // Another handle writes this file: truncate the shared content. A state
+        // that closed meanwhile is skipped; its content is in storage then.
+        if let Some(path) = path
+            && self
+                .states
+                .truncate(&key_of(path), size)
+                .await
+                .map_err(io_errno)?
+        {
             return Ok(());
         }
         let path = match (path, fh) {
@@ -138,69 +146,28 @@ impl Filesystem {
             op,
             uid,
             gid,
-            spool: Arc::new(Spool::new(spool_dir)),
+            states: Arc::new(States::new(spool_dir, Arc::new(SpoolBudget::new(u64::MAX)))),
             opened_files: Slab::new(),
         }
     }
 
     /// Size of the spool content of `path`, if the file is being written.
     async fn spool_size(&self, path: &OsStr) -> Option<u64> {
-        let state = self.spool.get(&key_of(path))?;
-        let state = state.lock().await;
-        (!state.deleted).then_some(state.len)
+        self.states.size(&key_of(path)).await
     }
 
-    /// Get the shared write state of `path` for a new handle. With `keep`, a new
-    /// state starts with the current object content (streamed in chunks);
-    /// without it, the content starts empty (O_TRUNC or a new file).
-    async fn open_write(&self, path: &OsStr, keep: bool) -> Result<Arc<Mutex<WriteState>>> {
-        let key = key_of(path);
-        loop {
-            let opened = self.spool.open(&key).map_err(io_errno)?;
-            let Some(state) = opened.new_guard else {
-                let mut state = opened.state.lock().await;
-                if state.closed || state.deleted {
-                    // The last handle closed (or the name was removed) while this
-                    // handle waited for the lock: start again with a new state.
-                    drop(state);
-                    self.spool.forget(&key, &opened.state);
-                    continue;
-                }
-                if !keep {
-                    state.set_len(0).map_err(io_errno)?;
-                }
-                state.handles += 1;
-                drop(state);
-                return Ok(opened.state);
-            };
-            return self.init_write_state(&key, opened.state, state, keep).await;
-        }
+    /// The live state of `path`, for reads by handles without their own state.
+    async fn live_state(&self, path: &OsStr) -> Option<Arc<FileState>> {
+        self.states.open_read(&key_of(path)).await
     }
 
-    /// Fill a new write state and count its first handle.
-    async fn init_write_state(
-        &self,
-        key: &str,
-        arc: Arc<Mutex<WriteState>>,
-        mut state: tokio::sync::OwnedMutexGuard<WriteState>,
-        keep: bool,
-    ) -> Result<Arc<Mutex<WriteState>>> {
-        if keep {
-            match state.fill_from(&self.op).await {
-                Ok(()) => {}
-                // A missing object is a new, empty file.
-                Err(err) if err.code() == tonic::Code::NotFound => state.dirty = true,
-                Err(err) => {
-                    tracing::warn!("cannot read {key} for writing: {}", err.message());
-                    state.close();
-                    drop(state);
-                    self.spool.forget(key, &arc);
-                    return Err(Errno::from(libc::EIO));
-                }
-            }
-        }
-        state.handles += 1;
-        Ok(arc)
+    /// Join or create the shared write state of `path` for a new handle. With
+    /// `keep`, a new state starts with the current object content.
+    async fn open_write(&self, path: &OsStr, keep: bool) -> Result<Arc<FileState>> {
+        self.states
+            .open_write(&self.op, &key_of(path), keep)
+            .await
+            .map_err(status_errno)
     }
 
     /// Upload the content of the open file `fh`, if it is open for writing.
@@ -210,7 +177,7 @@ impl Filesystem {
             .write
             .clone();
         match state {
-            Some(state) => upload_errno(state.lock().await.upload(&self.op).await),
+            Some(state) => upload_errno(self.states.upload(&self.op, &state).await),
             None => Ok(()),
         }
     }
@@ -218,77 +185,58 @@ impl Filesystem {
     /// A handle closes. The last handle uploads the content. If that fails, the
     /// spool files stay on the node, a background task retries, and unpublish
     /// uploads whatever is still left.
-    async fn release_state(&self, state: Arc<Mutex<WriteState>>) -> Result<()> {
-        let mut guard = state.lock().await;
-        guard.handles = guard.handles.saturating_sub(1);
-        let result = guard.upload(&self.op).await;
-        if guard.handles == 0 {
-            if !guard.dirty || guard.deleted {
-                guard.close();
-                let key = guard.key.clone();
-                drop(guard);
-                self.spool.forget(&key, &state);
-            } else {
-                drop(guard);
-                self.retry_upload(state);
-            }
+    async fn release_state(&self, state: Arc<FileState>) -> Result<()> {
+        let (result, pending) = self.states.release(&self.op, &state).await;
+        if pending {
+            self.retry_upload(state);
         }
         upload_errno(result)
     }
 
     /// Retry the upload of a closed file a few times in the background.
-    fn retry_upload(&self, state: Arc<Mutex<WriteState>>) {
+    fn retry_upload(&self, state: Arc<FileState>) {
         let op = self.op.clone();
-        let spool = self.spool.clone();
+        let states = self.states.clone();
         tokio::spawn(async move {
             for attempt in 0..5u32 {
                 tokio::time::sleep(Duration::from_secs(2u64 << attempt)).await;
-                let mut guard = state.lock().await;
-                if guard.handles > 0 {
-                    // A new handle took over; it uploads on close.
-                    return;
-                }
-                if guard.deleted || guard.upload(&op).await.is_ok() {
-                    guard.close();
-                    let key = guard.key.clone();
-                    drop(guard);
-                    spool.forget(&key, &state);
+                if states.retry(&op, &state).await {
                     return;
                 }
             }
-            tracing::error!("upload keeps failing; the content stays on the node until unpublish");
+            tracing::error!(
+                "upload of FUSE file {} keeps failing; the content stays on the node until unpublish",
+                state.id
+            );
         });
     }
 
-    /// Mark the write state of `path` as deleted. Returns true if there was one.
-    async fn forget_state(&self, path: &OsStr) -> bool {
-        let key = key_of(path);
-        let Some(state) = self.spool.get(&key) else {
-            return false;
-        };
-        state.lock().await.mark_deleted();
-        self.spool.forget(&key, &state);
-        true
+    /// Remove the name `path` from storage and from a live state. Returns true if
+    /// a live state existed. The state only loses its name if the delete worked.
+    async fn unlink_state(&self, path: &OsStr) -> Result<bool> {
+        let op = self.op.clone();
+        self.states
+            .unlink(&key_of(path), |keys| async move {
+                for key in keys {
+                    match op.delete(&key).await {
+                        Ok(()) => {}
+                        Err(err) if err.kind() == ErrorKind::NotFound => {}
+                        Err(err) => return Err(crate::util::error::opendal_status(err, "delete")),
+                    }
+                }
+                Ok(())
+            })
+            .await
+            .map_err(status_errno)
     }
 
-    /// Move the write state of `from` to `to`, if `from` has one. The old object
-    /// is removed; the content is uploaded under the new key on the next flush.
+    /// Move the live state of `from` to `to`, if `from` has one. The old object
+    /// is removed by the next upload.
     async fn rename_state(&self, from: &OsStr, to: &OsStr) -> Result<bool> {
-        let (from_key, to_key) = (key_of(from), key_of(to));
-        let (moved, replaced) = self.spool.rename(&from_key, &to_key);
-        let Some(moved) = moved else {
-            return Ok(false);
-        };
-        if let Some(replaced) = replaced {
-            replaced.lock().await.mark_deleted();
-        }
-        moved.lock().await.set_key(&to_key).map_err(io_errno)?;
-        match self.op.delete(&from_key).await {
-            Ok(()) => {}
-            Err(err) if err.kind() == ErrorKind::NotFound => {}
-            Err(err) => return Err(opendal_error2errno(err)),
-        }
-        Ok(true)
+        self.states
+            .rename(&key_of(from), &key_of(to))
+            .await
+            .map_err(io_errno)
     }
 
     /// Returns (read, write, append) for open flags.
@@ -385,6 +333,16 @@ fn upload_errno(result: std::result::Result<(), tonic::Status>) -> Result<()> {
     result.map_err(|err| {
         tracing::error!("upload failed: {}", err.message());
         Errno::from(libc::EIO)
+    })
+}
+
+fn status_errno(err: tonic::Status) -> Errno {
+    tracing::warn!("file operation failed: {}", err.message());
+    Errno::from(match err.code() {
+        tonic::Code::NotFound => libc::ENOENT,
+        tonic::Code::PermissionDenied => libc::EACCES,
+        tonic::Code::ResourceExhausted => libc::ENOSPC,
+        _ => libc::EIO,
     })
 }
 

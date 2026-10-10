@@ -149,12 +149,13 @@ impl PathFilesystem for Filesystem {
 
         let path = PathBuf::from(parent).join(name);
         // Open handles keep their content, but it must never be uploaded again.
-        let had_state = self.forget_state(path.as_os_str()).await;
-        match self.op.delete(&path.to_string_lossy()).await {
-            Ok(()) => Ok(()),
-            Err(err) if had_state && err.kind() == ErrorKind::NotFound => Ok(()),
-            Err(err) => Err(opendal_error2errno(err)),
+        if self.unlink_state(path.as_os_str()).await? {
+            return Ok(());
         }
+        self.op
+            .delete(&path.to_string_lossy())
+            .await
+            .map_err(opendal_error2errno)
     }
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
@@ -273,7 +274,10 @@ impl PathFilesystem for Filesystem {
         // Content that is being written is read from the shared spool: the state
         // of this handle (it stays readable after unlink), or the state of
         // another handle that writes the same file.
-        let state = own_state.or_else(|| self.spool.get(&key_of(OsStr::new(&file_path))));
+        let state = match own_state {
+            Some(state) => Some(state),
+            None => self.live_state(OsStr::new(&file_path)).await,
+        };
         if let Some(state) = state {
             let data = state.lock().await.read_at(offset, size).map_err(io_errno)?;
             return Ok(ReplyData { data: data.into() });
@@ -325,6 +329,9 @@ impl PathFilesystem for Filesystem {
         };
 
         let mut state = state.lock().await;
+        if state.closed {
+            return Err(Errno::from(libc::EBADF));
+        }
         // With O_APPEND every write goes to the current end, also when other
         // handles made the file longer since the kernel last asked for its size.
         let offset = if append { state.len } else { offset };

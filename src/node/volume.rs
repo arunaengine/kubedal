@@ -15,7 +15,7 @@ use crate::node::state::{
 use crate::node::transfer::{self, ByteBudget};
 use crate::node::upload::{self, RetryPolicy, UploadReport};
 use crate::util::error::io_status;
-use crate::util::fuse_fs::spool;
+use crate::util::fuse_fs::states as spool;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};

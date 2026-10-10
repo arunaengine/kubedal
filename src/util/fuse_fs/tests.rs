@@ -230,7 +230,9 @@ async fn content_that_cannot_be_uploaded_is_kept_on_disk() {
     // The storage works again, for example after a restart of the driver.
     std::fs::remove_file(&root).unwrap();
     std::fs::create_dir_all(&root).unwrap();
-    let uploaded = spool::upload_pending(&make_op(), &spool_dir).await.unwrap();
+    let uploaded = states::upload_pending(&make_op(), &spool_dir)
+        .await
+        .unwrap();
     assert_eq!(uploaded, 1);
     assert_eq!(std::fs::read(root.join("f.txt")).unwrap(), b"precious");
 }

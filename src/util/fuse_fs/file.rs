@@ -19,9 +19,8 @@ use std::ffi::OsString;
 use std::sync::Arc;
 
 use fuse3::Errno;
-use tokio::sync::Mutex;
 
-use super::spool::WriteState;
+use super::states::FileState;
 
 /// Opened file represents file that opened in memory.
 ///
@@ -32,7 +31,7 @@ pub struct OpenedFile {
     pub path: OsString,
     pub is_read: bool,
     /// Shared write state, if the file is open for writing.
-    pub write: Option<Arc<Mutex<WriteState>>>,
+    pub write: Option<Arc<FileState>>,
     /// Opened with O_APPEND: writes go to the end of the file.
     pub append: bool,
     /// Size of the file when it was opened for reading. Reads are limited to it,

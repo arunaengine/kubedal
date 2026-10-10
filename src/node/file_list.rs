@@ -105,6 +105,16 @@ impl VolumeManager {
                 }
             })
             .await;
+        // Prune also after a failure, so failed publish calls cannot grow the
+        // cache beyond its limit.
+        match cache.prune() {
+            Ok(report) if report.removed_files > 0 => {
+                tracing::info!("content cache pruned: {report:?}")
+            }
+            Ok(_) => {}
+            Err(err) => tracing::warn!("content cache prune failed: {err}"),
+        }
+
         if let Some(err) = first_error.into_inner().unwrap_or_else(|p| p.into_inner()) {
             return Err(err);
         }
@@ -113,14 +123,6 @@ impl VolumeManager {
             plan.files.len(),
             budget.used()
         );
-
-        match cache.prune() {
-            Ok(report) if report.removed_files > 0 => {
-                tracing::info!("content cache pruned: {report:?}")
-            }
-            Ok(_) => {}
-            Err(err) => tracing::warn!("content cache prune failed: {err}"),
-        }
 
         record.upload = upload;
         transfer::create_dir_all(&record.target_path).await?;

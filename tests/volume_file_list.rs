@@ -326,3 +326,38 @@ async fn cache_hits_need_the_same_data_node() {
     let err = env.manager.publish(req).await.unwrap_err();
     assert_eq!(err.code(), Code::NotFound);
 }
+
+#[tokio::test]
+async fn failed_publish_still_prunes_the_cache() {
+    let mut env = Env::new();
+    env.manager = kubedal::node::volume::VolumeManager::new(
+        env.dir.path().join("node"),
+        env.cluster.clone(),
+        env.mounter.clone(),
+    )
+    .unwrap()
+    .with_content_cache_limit(0);
+    let bucket = env.add_store(None, false);
+    // The first file is fine and enters the cache, the second has a wrong digest.
+    write(
+        &bucket.join("jobs/1.json"),
+        &format!(
+            r#"{{"version": 1, "files": [
+                {{"path": "a", "source": "data/a.txt", "sha256": "{HELLO}"}},
+                {{"path": "b", "source": "data/a.txt", "sha256": "{WORLD}"}}
+            ]}}"#
+        ),
+    );
+    let err = env
+        .manager
+        .publish(request("vol-1", &env.target("p1"), "jobs/1.json"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::DataLoss);
+    assert!(
+        !env.manager
+            .content_cache()
+            .path("team/store", HELLO)
+            .exists()
+    );
+}

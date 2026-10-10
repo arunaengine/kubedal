@@ -2,7 +2,11 @@ use clap::{Arg, Command};
 use kubedal::csi::{
     controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
 };
+use kubedal::node::kube::KubeCluster;
+use kubedal::node::mounter::SystemMounter;
+use kubedal::node::volume::VolumeManager;
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -45,6 +49,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("node-1")
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("data-dir")
+                .long("data-dir")
+                .help("Directory for volume data and state on the node")
+                .default_value("/var/lib/kubelet/plugins/kubedal.arunaengine.org")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
         .get_matches();
 
     // Both arguments have default values, so they are always present.
@@ -54,6 +65,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .unwrap_or_default();
     let node_id = matches
         .get_one::<String>("node-id")
+        .cloned()
+        .unwrap_or_default();
+    let data_dir = matches
+        .get_one::<PathBuf>("data-dir")
         .cloned()
         .unwrap_or_default();
 
@@ -104,7 +119,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder
-        let node_service = NodeService::new(client, &node_id);
+        let cluster = Arc::new(KubeCluster::new(client.clone(), &node_id));
+        let mounter = Arc::new(SystemMounter::default());
+        let manager = VolumeManager::new(&data_dir, cluster, mounter)?;
+        tracing::info!("Data directory: {}", data_dir.display());
+        let node_service = NodeService::new(client, &node_id, Arc::new(manager));
         builder.add_service(NodeServer::new(node_service))
     };
 

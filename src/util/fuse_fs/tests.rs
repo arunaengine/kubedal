@@ -766,3 +766,31 @@ async fn failed_closed_file_rename_keeps_the_open_destination() {
     fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"pending edits");
 }
+
+#[tokio::test]
+async fn failed_retirement_leaves_a_usable_state() {
+    use std::os::unix::fs::PermissionsExt;
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let p = Some(OsStr::new("/f"));
+    let w = create(&fs, "f").await;
+    fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+    // The journal cannot be removed, so the unlink fails.
+    let spool = dir.path().join("spool");
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+    let result = fs.unlink(req(), OsStr::new("/"), OsStr::new("f")).await;
+    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
+    assert!(result.is_err());
+    // The state is still alive: a new handle joins it at once (no waiting loop).
+    let w2 = tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        fs.open(req(), OsStr::new("/f"), libc::O_WRONLY as u32),
+    )
+    .await
+    .expect("open must not hang")
+    .unwrap()
+    .fh;
+    fs.release(req(), p, w2, 0, 0, false).await.unwrap();
+    fs.release(req(), p, w, 0, 0, false).await.unwrap();
+    assert_eq!(op.read("f").await.unwrap().to_vec(), b"data");
+}

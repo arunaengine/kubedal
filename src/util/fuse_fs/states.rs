@@ -341,18 +341,21 @@ impl Drop for StateData {
 
 /// Mark a state as unlinked and remove its journal durably, so neither the state
 /// nor a replay after a crash uploads it again.
+///
+/// The state only changes after the journal is durably gone. If that fails, the
+/// state stays as it was (alive and mapped), so nobody waits on a dead state.
 fn retire(state: &FileState, data: &mut StateData) -> std::io::Result<()> {
-    state.unlinked.store(true, Ordering::SeqCst);
-    data.dirty = false;
     match std::fs::remove_file(&data.meta_path) {
         Ok(()) => {}
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
         Err(err) => return Err(err),
     }
-    data.complete = false;
     if let Some(dir) = data.meta_path.parent() {
         File::open(dir)?.sync_all()?;
     }
+    data.complete = false;
+    data.dirty = false;
+    state.unlinked.store(true, Ordering::SeqCst);
     Ok(())
 }
 
@@ -657,14 +660,7 @@ impl States {
         };
         let mut data = state.lock().await;
         delete(vec![data.key.clone()]).await?;
-        state.unlinked.store(true, Ordering::SeqCst);
-        data.dirty = false;
-        if let Err(err) = std::fs::remove_file(&data.meta_path)
-            && err.kind() != std::io::ErrorKind::NotFound
-        {
-            tracing::warn!("cannot remove {:?}: {err}", data.meta_path);
-        }
-        data.complete = false;
+        retire(&state, &mut data).map_err(|e| io_status(e, "remove spool journal"))?;
         self.unmap(key, &state);
         Ok(true)
     }

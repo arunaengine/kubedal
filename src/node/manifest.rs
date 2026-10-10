@@ -18,6 +18,7 @@
 //! ```
 
 use crate::node::paths::{self, PathError};
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashSet};
 use tonic::Status;
@@ -28,8 +29,13 @@ pub const MANIFEST_VERSION: u32 = 1;
 /// Manifests larger than this are rejected.
 pub const MAX_MANIFEST_BYTES: u64 = 16 * 1024 * 1024;
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(
+    title = "kubedal file-list manifest",
+    description = "Files to place in a kubedal file-list volume, directories to create, \
+                   and where to upload the volume content when the pod ends."
+)]
 pub struct Manifest {
     /// Format version. Must be 1.
     pub version: u32,
@@ -44,8 +50,9 @@ pub struct Manifest {
     pub upload: Option<ManifestUpload>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "One file to place in the volume.")]
 pub struct ManifestFile {
     /// Path of the file inside the volume.
     pub path: String,
@@ -63,8 +70,9 @@ pub struct ManifestFile {
     pub executable: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "camelCase", deny_unknown_fields)]
+#[schemars(description = "Where to upload the volume content when the pod ends.")]
 pub struct ManifestUpload {
     /// Name of the DataNode to upload to.
     pub data_node: String,
@@ -229,9 +237,36 @@ pub fn plan(manifest: Manifest) -> Result<FilePlan, Status> {
     })
 }
 
+/// The JSON schema of the manifest format, as pretty printed JSON.
+pub fn json_schema() -> String {
+    let schema = schemars::schema_for!(Manifest);
+    let mut text = serde_json::to_string_pretty(&schema).unwrap_or_default();
+    text.push('\n');
+    text
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The schema file in the repository must match the code.
+    /// Run with `UPDATE_SCHEMA=1` to rewrite it.
+    #[test]
+    fn schema_file_is_current() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/schema/manifest-v1.schema.json"
+        );
+        let current = json_schema();
+        if std::env::var_os("UPDATE_SCHEMA").is_some() {
+            std::fs::write(path, &current).unwrap();
+        }
+        let stored = std::fs::read_to_string(path).unwrap_or_default();
+        assert_eq!(
+            stored, current,
+            "run UPDATE_SCHEMA=1 cargo test to refresh {path}"
+        );
+    }
 
     const DIGEST: &str = "9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08";
 

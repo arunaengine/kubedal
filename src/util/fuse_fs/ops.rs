@@ -130,6 +130,7 @@ impl PathFilesystem for Filesystem {
         fh: Option<u64>,
         set_attr: SetAttr,
     ) -> Result<ReplyAttr> {
+        let _running = self.enter();
         tracing::debug!("setattr(path={path:?}, fh={fh:?}, set_attr={set_attr:?})");
 
         if let Some(size) = set_attr.size {
@@ -162,6 +163,7 @@ impl PathFilesystem for Filesystem {
     }
 
     async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let _running = self.enter();
         tracing::debug!("unlink(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
@@ -195,6 +197,7 @@ impl PathFilesystem for Filesystem {
         parent: &OsStr,
         name: &OsStr,
     ) -> Result<()> {
+        let _running = self.enter();
         tracing::debug!(
             "rename(p={origin_parent:?}, name={origin_name:?}, newp={parent:?}, newname={name:?})"
         );
@@ -231,6 +234,7 @@ impl PathFilesystem for Filesystem {
     }
 
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
+        let _running = self.enter();
         tracing::debug!("open(path={path:?}, flags=0x{flags:x})");
 
         let (is_read, is_write, is_append) = self.check_flags(flags)?;
@@ -343,6 +347,7 @@ impl PathFilesystem for Filesystem {
         _write_flags: u32,
         flags: u32,
     ) -> Result<ReplyWrite> {
+        let _running = self.enter();
         tracing::debug!(
             "write(path={:?}, fh={}, offset={}, data_len={}, flags=0x{:x})",
             path,
@@ -383,6 +388,7 @@ impl PathFilesystem for Filesystem {
         lock_owner: u64,
         flush: bool,
     ) -> Result<()> {
+        let _running = self.enter();
         tracing::debug!(
             "release(path={path:?}, fh={fh}, flags=0x{flags:x}, lock_owner={lock_owner}, flush={flush})"
         );
@@ -410,6 +416,7 @@ impl PathFilesystem for Filesystem {
         fh: u64,
         lock_owner: u64,
     ) -> Result<()> {
+        let _running = self.enter();
         tracing::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
         self.upload_open_file(path, fh).await
     }
@@ -421,6 +428,7 @@ impl PathFilesystem for Filesystem {
         fh: u64,
         datasync: bool,
     ) -> Result<()> {
+        let _running = self.enter();
         tracing::debug!("fsync(path={path:?}, fh={fh}, datasync={datasync})");
         self.upload_open_file(path, fh).await
     }
@@ -454,6 +462,7 @@ impl PathFilesystem for Filesystem {
         mode: u32,
         flags: u32,
     ) -> Result<ReplyCreated> {
+        let _running = self.enter();
         tracing::debug!(
             "create(parent={parent:?}, name={name:?}, mode=0o{mode:o}, flags=0x{flags:x})"
         );

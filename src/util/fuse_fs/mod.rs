@@ -51,22 +51,28 @@ use states::{FileState, States};
 const TTL: Duration = Duration::from_secs(1); // 1 second
 
 /// Background tasks of one FUSE file system.
-#[derive(Default)]
 pub struct Workers {
     tasks: std::sync::Mutex<tokio::task::JoinSet<()>>,
+    fence: Arc<states::Fence>,
 }
 
 impl Workers {
     fn spawn(&self, task: impl std::future::Future<Output = ()> + Send + 'static) {
+        if self.fence.is_closing() {
+            // The spool files stay; the replay after shutdown uploads them.
+            return;
+        }
         let mut tasks = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
         // Forget tasks that are done.
         while tasks.try_join_next().is_some() {}
         tasks.spawn(task);
     }
 
-    /// Stop all tasks and wait until they are gone. Their spool files stay on
-    /// disk, so nothing is lost; the next replay uploads them.
+    /// Stop the file system: refuse new uploads and workers, wait for running
+    /// operations (FUSE callbacks), then stop all tasks and wait until they are
+    /// gone. Spool files stay on disk, so the next replay uploads them.
     pub async fn shutdown(&self) {
+        self.fence.close_and_wait().await;
         let mut tasks = {
             let mut guard = self.tasks.lock().unwrap_or_else(|p| p.into_inner());
             std::mem::take(&mut *guard)
@@ -183,13 +189,20 @@ impl Filesystem {
     /// Create a new filesystem with given operator, uid and gid. Files opened for
     /// writing are kept in `spool_dir` until they are uploaded.
     pub fn new(op: Operator, uid: u32, gid: u32, spool_dir: PathBuf) -> Self {
+        let states = Arc::new(States::new(
+            spool_dir.clone(),
+            Arc::new(SpoolBudget::new(u64::MAX)),
+        ));
         Self {
             op,
             uid,
             gid,
-            workers: Arc::new(Workers::default()),
+            workers: Arc::new(Workers {
+                tasks: Default::default(),
+                fence: states.fence.clone(),
+            }),
             spool_dir: spool_dir.clone(),
-            states: Arc::new(States::new(spool_dir, Arc::new(SpoolBudget::new(u64::MAX)))),
+            states,
             opened_files: Slab::new(),
         }
     }
@@ -239,8 +252,16 @@ impl Filesystem {
     /// Limit the space of the spool files (shared by all file systems of a node).
     /// Writes past the limit fail with ENOSPC.
     pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
-        self.states = Arc::new(States::new(self.spool_dir.clone(), budget));
+        let mut states = States::new(self.spool_dir.clone(), budget);
+        states.fence = self.workers.fence.clone();
+        states.pause = self.states.pause.clone();
+        self.states = Arc::new(states);
         self
+    }
+
+    /// Count a running FUSE callback, so shutdown can wait for it.
+    fn enter(&self) -> states::FenceGuard {
+        self.states.fence.enter()
     }
 
     /// Pause points for tests that force an order of operations.

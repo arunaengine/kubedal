@@ -107,6 +107,57 @@ impl SpoolBudget {
     }
 }
 
+/// Stops a file system cleanly: no new uploads or workers once it closes, and a
+/// way to wait for operations that are still running.
+#[derive(Default)]
+pub struct Fence {
+    closing: AtomicBool,
+    inflight: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+/// Counts one running operation until it is dropped.
+pub struct FenceGuard(Arc<Fence>);
+
+impl Drop for FenceGuard {
+    fn drop(&mut self) {
+        if self.0.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+            self.0.idle.notify_waiters();
+        }
+    }
+}
+
+impl Fence {
+    /// Count a running operation.
+    pub fn enter(self: &Arc<Self>) -> FenceGuard {
+        self.inflight.fetch_add(1, Ordering::SeqCst);
+        FenceGuard(self.clone())
+    }
+
+    pub fn is_closing(&self) -> bool {
+        self.closing.load(Ordering::SeqCst)
+    }
+
+    /// Refuse new uploads and workers, then wait until no operation runs.
+    pub async fn close_and_wait(&self) {
+        self.closing.store(true, Ordering::SeqCst);
+        loop {
+            let idle = self.idle.notified();
+            if self.inflight.load(Ordering::SeqCst) == 0 {
+                return;
+            }
+            idle.await;
+        }
+    }
+
+    fn check(&self) -> Result<(), Status> {
+        if self.is_closing() {
+            return Err(Status::unavailable("the file system is shutting down"));
+        }
+        Ok(())
+    }
+}
+
 /// One file that is open for writing, or whose upload is still pending.
 pub struct FileState {
     /// Fixed identity, for logs and tests.
@@ -314,6 +365,8 @@ async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<
 pub struct States {
     /// Pause points for tests that force an order of operations.
     pub pause: Arc<super::pause::PausePoints>,
+    /// Shutdown fence of the file system.
+    pub fence: Arc<Fence>,
     dir: PathBuf,
     budget: Arc<SpoolBudget>,
     next_id: AtomicU64,
@@ -324,6 +377,7 @@ impl States {
     pub fn new(dir: PathBuf, budget: Arc<SpoolBudget>) -> Self {
         Self {
             pause: Arc::default(),
+            fence: Arc::default(),
             dir,
             budget,
             next_id: AtomicU64::new(1),
@@ -472,6 +526,7 @@ impl States {
         if data.closed || state.is_unlinked() {
             return Ok(());
         }
+        self.fence.check()?;
         data.upload(op).await
     }
 
@@ -491,7 +546,13 @@ impl States {
         let result = if state.is_unlinked() {
             Ok(())
         } else {
-            data.upload(op).await
+            match self.fence.check() {
+                Ok(()) => {
+                    self.pause.hit("release_upload").await;
+                    data.upload(op).await
+                }
+                Err(err) => Err(err),
+            }
         };
         if data.handles > 0 {
             return (result, false);
@@ -509,6 +570,9 @@ impl States {
     pub async fn retry(&self, op: &Operator, state: &Arc<FileState>) -> bool {
         let mut data = state.lock().await;
         if data.closed || data.handles > 0 {
+            return true;
+        }
+        if self.fence.is_closing() {
             return true;
         }
         if state.is_unlinked() || data.upload(op).await.is_ok() {

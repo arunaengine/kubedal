@@ -561,3 +561,46 @@ async fn getattr_with_a_handle_uses_the_handle_state() {
     let attr = fs.getattr(req(), p, Some(w), 0).await.unwrap();
     assert_eq!(attr.attr.size, 3);
 }
+
+#[tokio::test]
+async fn shutdown_waits_for_running_callbacks_and_refuses_new_workers() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, _op) = fs_in(dir.path()).await;
+    let fs = Arc::new(fs);
+    let w = create(&fs, "f.txt").await;
+    let p = Some(OsStr::new("/f.txt"));
+    fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+    // The upload will fail, which normally starts a retry worker.
+    let root = dir.path().join("root");
+    std::fs::remove_dir_all(&root).unwrap();
+    std::fs::write(&root, "not a folder").unwrap();
+
+    let pause = fs.pause_points().arm("release_upload");
+    let release = {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            fs.release(req(), Some(OsStr::new("/f.txt")), w, 0, 0, false)
+                .await
+        })
+    };
+    pause.reached().await;
+    let workers = fs.workers();
+    let shutdown = {
+        let workers = workers.clone();
+        tokio::spawn(async move { workers.shutdown().await })
+    };
+    // Shutdown waits while the release callback still runs.
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    assert!(!shutdown.is_finished());
+    pause.resume();
+    assert!(release.await.unwrap().is_err());
+    shutdown.await.unwrap();
+    // The failed upload could not start a worker during shutdown; the content
+    // stays in the spool for the replay.
+    assert!(workers.is_empty());
+    assert!(
+        std::fs::read_dir(dir.path().join("spool"))
+            .unwrap()
+            .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "json"))
+    );
+}

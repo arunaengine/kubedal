@@ -18,6 +18,7 @@
 mod dir;
 mod file;
 mod ops;
+pub mod spool;
 #[cfg(test)]
 mod tests;
 

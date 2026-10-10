@@ -313,15 +313,6 @@ impl Filesystem {
             .map_err(status_errno)
     }
 
-    /// Move the live state of `from` to `to`, if `from` has one. The old object
-    /// is removed right away.
-    async fn rename_state(&self, from: &OsStr, to: &OsStr) -> Result<bool> {
-        self.states
-            .rename(&self.op, &key_of(from), &key_of(to))
-            .await
-            .map_err(status_errno)
-    }
-
     /// Rename a closed file on a backend without native rename (S3, GCS, Azure
     /// Blob): copy it, then remove the old object. Folders fail with EXDEV, which
     /// tells programs like `mv` to copy the files themselves.

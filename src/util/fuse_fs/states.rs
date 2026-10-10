@@ -361,8 +361,18 @@ async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<
     Ok(())
 }
 
+/// Proof that the caller holds the namespace lock of a file system.
+pub struct NsGuard<'a>(#[allow(dead_code)] tokio::sync::MutexGuard<'a, ()>);
+
 /// All file states of one FUSE file system.
+///
+/// Every operation that changes which state or object a name points to (open
+/// or create that adds a state, the close of the last release, rename, unlink,
+/// retire) holds the namespace lock for its whole run, also across storage
+/// calls. The lock order is: namespace lock first, then state locks by id.
+/// Reads, writes, flush and fsync of an open state do not take it.
 pub struct States {
+    ns: Mutex<()>,
     /// Pause points for tests that force an order of operations.
     pub pause: Arc<super::pause::PausePoints>,
     /// Shutdown fence of the file system.
@@ -376,6 +386,7 @@ pub struct States {
 impl States {
     pub fn new(dir: PathBuf, budget: Arc<SpoolBudget>) -> Self {
         Self {
+            ns: Mutex::new(()),
             pause: Arc::default(),
             fence: Arc::default(),
             dir,
@@ -404,6 +415,26 @@ impl States {
         }
     }
 
+    /// Take the namespace lock.
+    pub async fn lock_namespace(&self) -> NsGuard<'_> {
+        NsGuard(self.ns.lock().await)
+    }
+
+    /// The live state of `key`. A dead entry (closed or unlinked) is removed
+    /// from the map, so no caller can ever wait on it in a loop.
+    async fn live(&self, _ns: &NsGuard<'_>, key: &str) -> Option<Arc<FileState>> {
+        let state = self.get(key)?;
+        let dead = {
+            let data = state.lock().await;
+            data.closed || state.is_unlinked()
+        };
+        if dead {
+            self.unmap(key, &state);
+            return None;
+        }
+        Some(state)
+    }
+
     /// Join the state of `key` as a writing handle, or create it. With `keep`, a
     /// new state starts with the current object content; without it, the content
     /// is empty (O_TRUNC or a new file).
@@ -413,23 +444,17 @@ impl States {
         key: &str,
         keep: bool,
     ) -> Result<Arc<FileState>, Status> {
-        loop {
-            let existing = self.get(key);
-            if let Some(state) = existing {
-                let Some(mut data) = state.lock_alive().await else {
-                    // It closed or lost its name while we waited. Its map entry is
-                    // gone (or replaced), so look again.
-                    continue;
-                };
-                if !keep {
-                    data.set_len(0).map_err(|e| io_status(e, "truncate"))?;
-                }
-                data.handles += 1;
-                drop(data);
-                return Ok(state);
+        let ns = self.lock_namespace().await;
+        if let Some(state) = self.live(&ns, key).await {
+            let mut data = state.lock().await;
+            if !keep {
+                data.set_len(0).map_err(|e| io_status(e, "truncate"))?;
             }
-            return self.create(op, key, keep).await;
+            data.handles += 1;
+            drop(data);
+            return Ok(state);
         }
+        self.create(op, key, keep).await
     }
 
     async fn create(&self, op: &Operator, key: &str, keep: bool) -> Result<Arc<FileState>, Status> {
@@ -461,22 +486,9 @@ impl States {
                 budget: self.budget.clone(),
             }),
         });
+        // The caller holds the namespace lock, so nobody else adds this key now.
         let mut data = state.data.lock().await;
-        let inserted = {
-            let mut map = self.map();
-            let free = !map.contains_key(key);
-            if free {
-                map.insert(key.to_string(), state.clone());
-            }
-            free
-        };
-        if !inserted {
-            // Another handle created a state first; join that one instead.
-            data.remove_files();
-            data.closed = true;
-            drop(data);
-            return Box::pin(self.open_write(op, key, keep)).await;
-        }
+        self.map().insert(key.to_string(), state.clone());
         let loaded = if keep {
             match data.fill_from(op).await {
                 Ok(()) => Ok(()),
@@ -557,12 +569,26 @@ impl States {
         if data.handles > 0 {
             return (result, false);
         }
-        if result.is_ok() {
-            self.close(state, &mut data);
-            (result, false)
-        } else {
-            (result, true)
+        if result.is_err() {
+            return (result, true);
         }
+        drop(data);
+        // Closing removes the name from the map, so it needs the namespace lock,
+        // taken before the state lock.
+        let _ns = self.lock_namespace().await;
+        let mut data = state.lock().await;
+        if data.closed || data.handles > 0 {
+            return (result, false);
+        }
+        // A rename may have changed the key meanwhile; upload under the new key.
+        if data.dirty
+            && !state.is_unlinked()
+            && let Err(err) = data.upload(op).await
+        {
+            return (Err(err), true);
+        }
+        self.close(state, &mut data);
+        (result, false)
     }
 
     /// Retry the upload of a state without handles. Returns true when the state
@@ -575,11 +601,16 @@ impl States {
         if self.fence.is_closing() {
             return true;
         }
-        if state.is_unlinked() || data.upload(op).await.is_ok() {
-            self.close(state, &mut data);
-            return true;
+        if !state.is_unlinked() && data.upload(op).await.is_err() {
+            return false;
         }
-        false
+        drop(data);
+        let _ns = self.lock_namespace().await;
+        let mut data = state.lock().await;
+        if !data.closed && data.handles == 0 && (!data.dirty || state.is_unlinked()) {
+            self.close(state, &mut data);
+        }
+        true
     }
 
     fn close(&self, state: &Arc<FileState>, data: &mut StateData) {
@@ -609,12 +640,11 @@ impl States {
         F: FnOnce(Vec<String>) -> Fut,
         Fut: std::future::Future<Output = Result<(), Status>>,
     {
-        let Some(state) = self.get(key) else {
+        let ns = self.lock_namespace().await;
+        let Some(state) = self.live(&ns, key).await else {
             return Ok(false);
         };
-        let Some(mut data) = state.lock_alive().await else {
-            return Ok(false);
-        };
+        let mut data = state.lock().await;
         delete(vec![data.key.clone()]).await?;
         state.unlinked.store(true, Ordering::SeqCst);
         data.dirty = false;
@@ -635,75 +665,59 @@ impl States {
     /// created under the old name in the meantime. The content stays in the spool
     /// and is uploaded under the new name. A live state at `to` is retired: its
     /// handles keep working, but it never uploads under that name again.
-    pub async fn rename(&self, op: &Operator, from: &str, to: &str) -> Result<bool, Status> {
-        loop {
-            let Some(src) = self.get(from) else {
-                return Ok(false);
-            };
-            let dst = self.get(to).filter(|d| !Arc::ptr_eq(d, &src));
-            // Two states are always locked in the order of their ids.
-            let (mut src_data, dst_data) = match &dst {
-                Some(dst) if dst.id < src.id => {
-                    let d = dst.lock().await;
-                    (src.lock().await, Some(d))
-                }
-                Some(dst) => {
-                    let sd = src.lock().await;
-                    (sd, Some(dst.lock().await))
-                }
-                None => (src.lock().await, None),
-            };
-            if src_data.closed || src.is_unlinked() {
-                // It closed while we waited; look again (it may be a closed file now).
-                if self.get(from).is_some_and(|s| Arc::ptr_eq(&s, &src)) {
-                    return Ok(false);
-                }
-                continue;
+    pub async fn rename(
+        &self,
+        ns: &NsGuard<'_>,
+        op: &Operator,
+        from: &str,
+        to: &str,
+    ) -> Result<bool, Status> {
+        let Some(src) = self.live(ns, from).await else {
+            return Ok(false);
+        };
+        let dst = self.live(ns, to).await.filter(|d| !Arc::ptr_eq(d, &src));
+        // Two states are always locked in the order of their ids.
+        let (mut src_data, dst_data) = match &dst {
+            Some(dst) if dst.id < src.id => {
+                let d = dst.lock().await;
+                (src.lock().await, Some(d))
             }
-            let map_ok = {
-                let map = self.map();
-                map.get(from).is_some_and(|s| Arc::ptr_eq(s, &src))
-                    && match &dst {
-                        Some(d) => map.get(to).is_some_and(|s| Arc::ptr_eq(s, d)),
-                        None => !map.contains_key(to),
-                    }
-            };
-            if !map_ok {
-                continue;
+            Some(dst) => {
+                let sd = src.lock().await;
+                (sd, Some(dst.lock().await))
             }
-            self.pause.hit("rename_locked").await;
-            match op.delete(from).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
-                Err(err) => return Err(opendal_status(err, "remove old name")),
-            }
-            if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data) {
-                retire(dst, &mut dst_data).map_err(|e| io_status(e, "retire old file"))?;
-            }
-            {
-                let mut map = self.map();
-                map.remove(from);
-                map.insert(to.to_string(), src.clone());
-            }
-            src_data.key = to.to_string();
-            src_data.dirty = true;
-            src_data
-                .write_meta()
-                .map_err(|e| io_status(e, "write spool metadata"))?;
-            return Ok(true);
+            None => (src.lock().await, None),
+        };
+        self.pause.hit("rename_locked").await;
+        match op.delete(from).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+            Err(err) => return Err(opendal_status(err, "remove old name")),
         }
+        if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data) {
+            retire(dst, &mut dst_data).map_err(|e| io_status(e, "retire old file"))?;
+        }
+        {
+            let mut map = self.map();
+            map.remove(from);
+            map.insert(to.to_string(), src.clone());
+        }
+        src_data.key = to.to_string();
+        src_data.dirty = true;
+        src_data
+            .write_meta()
+            .map_err(|e| io_status(e, "write spool metadata"))?;
+        Ok(true)
     }
 
     /// Retire the live state of `key`, because another file takes its name (a
     /// rename of a closed file onto it). Its handles keep working, but it never
     /// uploads under that name again.
-    pub async fn retire(&self, key: &str) -> Result<(), Status> {
-        let Some(state) = self.get(key) else {
+    pub async fn retire(&self, ns: &NsGuard<'_>, key: &str) -> Result<(), Status> {
+        let Some(state) = self.live(ns, key).await else {
             return Ok(());
         };
-        let Some(mut data) = state.lock_alive().await else {
-            return Ok(());
-        };
+        let mut data = state.lock().await;
         retire(&state, &mut data).map_err(|e| io_status(e, "retire old file"))?;
         self.unmap(key, &state);
         Ok(())
@@ -836,7 +850,9 @@ mod tests {
         let states = states(dir.path());
         let joined = states.open_write(&op, "a.tmp", false).await.unwrap();
         joined.lock().await.write_at(b"new", 0).unwrap();
-        assert!(states.rename(&op, "a.tmp", "a").await.unwrap());
+        let ns = states.lock_namespace().await;
+        assert!(states.rename(&ns, &op, "a.tmp", "a").await.unwrap());
+        drop(ns);
         drop(states);
         // The driver stopped before the upload. Replay uploads and cleans up.
         assert_eq!(
@@ -877,7 +893,8 @@ mod tests {
         assert!(result.is_ok());
         // The last release won the race: rename finds no live state, so the
         // caller renames the uploaded object instead.
-        assert!(!states.rename(&op, "a", "b").await.unwrap());
+        let ns = states.lock_namespace().await;
+        assert!(!states.rename(&ns, &op, "a", "b").await.unwrap());
         assert_eq!(op.read("a").await.unwrap().to_vec(), b"data");
     }
 

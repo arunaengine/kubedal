@@ -687,8 +687,36 @@ async fn forced_release_before_truncate() {
     )
     .await;
     released.unwrap();
-    // The file closed first, so the truncate goes to storage, which cannot cut
-    // an object to 2 bytes: it fails instead of claiming success.
-    assert_eq!(truncated.unwrap_err(), Errno::from(libc::EOPNOTSUPP));
-    assert_eq!(fs.op.read("t").await.unwrap().to_vec(), b"12345");
+    // The truncate reaches the state after the upload but before the close, so
+    // the close step uploads the truncated content. It is never lost.
+    truncated.unwrap();
+    assert_eq!(fs.op.read("t").await.unwrap().to_vec(), b"12");
+}
+
+#[tokio::test]
+async fn forced_open_during_rename_never_displaces_a_new_destination() {
+    let fs = fs_with("other", "").await;
+    let (pa, pb) = (Some(OsStr::new("/a")), Some(OsStr::new("/b")));
+    let wa = create(&fs, "a").await;
+    fs.write(req(), pa, wa, 0, b"renamed", 0, 0).await.unwrap();
+    let root = OsStr::new("/");
+    // While the rename waits on storage, another program creates b.
+    let (renamed, created) = forced(
+        &fs,
+        "rename_locked",
+        fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b")),
+        fs.create(req(), root, OsStr::new("b"), 0o644, WRITE_FLAGS),
+    )
+    .await;
+    renamed.unwrap();
+    // The create had to wait for the rename and then truncated the renamed file
+    // (O_TRUNC), like on a local file system. It never writes past the rename.
+    let wb = created.unwrap().fh;
+    fs.write(req(), pb, wb, 0, b"created later", 0, 0)
+        .await
+        .unwrap();
+    fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
+    fs.release(req(), pb, wa, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"created later");
+    assert!(!fs.op.exists("a").await.unwrap());
 }

@@ -205,19 +205,24 @@ impl PathFilesystem for Filesystem {
         let origin_path = PathBuf::from(origin_parent).join(origin_name);
         let path = PathBuf::from(parent).join(name);
 
+        let (from, to) = (key_of(origin_path.as_os_str()), key_of(path.as_os_str()));
+        // The namespace lock is held for the whole rename, also during storage
+        // calls, so no other name change can come in between.
+        let ns = self.states.lock_namespace().await;
         // A file with a spool holds its whole content, so the rename only moves
         // the spool to the new key and removes the old object.
         if self
-            .rename_state(origin_path.as_os_str(), path.as_os_str())
-            .await?
+            .states
+            .rename(&ns, &self.op, &from, &to)
+            .await
+            .map_err(status_errno)?
         {
             return Ok(());
         }
 
-        let (from, to) = (key_of(origin_path.as_os_str()), key_of(path.as_os_str()));
         // A file open under the new name loses it; it must never upload over
         // the renamed file later.
-        self.states.retire(&to).await.map_err(status_errno)?;
+        self.states.retire(&ns, &to).await.map_err(status_errno)?;
         if self.op.info().capability().rename {
             return self
                 .op

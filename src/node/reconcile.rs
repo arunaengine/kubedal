@@ -39,6 +39,8 @@ pub fn plan(record: &VolumeRecord, observed: Observed) -> Action {
         Phase::Unpublishing => Action::Discard,
         Phase::Published => match record.mode {
             VolumeMode::Fuse if observed.target_mounted => Action::UnmountStaleFuse,
+            // Spool files of a writable FUSE volume may wait for upload.
+            VolumeMode::Fuse if !observed.target_exists && has_upload => Action::KeepPendingUpload,
             VolumeMode::Fuse if !observed.target_exists => Action::Discard,
             VolumeMode::Fuse => Action::Keep,
             VolumeMode::Cache | VolumeMode::FileList => {
@@ -175,6 +177,8 @@ mod tests {
         assert_eq!(plan(&r, observed(true, true)), Action::UnmountStaleFuse);
         assert_eq!(plan(&r, observed(true, false)), Action::Keep);
         assert_eq!(plan(&r, observed(false, false)), Action::Discard);
+        let r = record(Phase::Published, VolumeMode::Fuse, true);
+        assert_eq!(plan(&r, observed(false, false)), Action::KeepPendingUpload);
     }
 
     #[test]

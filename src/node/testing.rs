@@ -232,6 +232,7 @@ impl Mounter for FakeMounter {
         _op: Operator,
         target: &Path,
         read_only: bool,
+        _spool_dir: &Path,
     ) -> Result<(), Status> {
         self.insert(target, FakeMount::Fuse { read_only })
     }

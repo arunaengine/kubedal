@@ -150,3 +150,27 @@ async fn read_only_volume_uploads_nothing() {
     assert!(!bucket.join("data/sneaky.txt").exists());
     assert!(env.cluster.events().is_empty());
 }
+
+#[tokio::test]
+async fn fuse_spool_files_are_uploaded_on_unpublish() {
+    let env = Env::new();
+    let bucket = env.add_store(None, false);
+    let target = env.target("p1");
+    env.manager
+        .publish(tree_request("vol-1", &target, "data", TreeMode::Fuse, true))
+        .await
+        .unwrap();
+    let id = publish_id("vol-1", &target.to_string_lossy());
+    // Content that the FUSE file system could not upload, for example before
+    // the driver restarted.
+    let spool = env.manager.spool_dir(&id);
+    write(&spool.join("1.data"), "from the spool");
+    write(&spool.join("1.json"), r#"{"key": "out/late.txt"}"#);
+
+    env.manager.unpublish("vol-1", &target).await.unwrap();
+    assert_eq!(
+        std::fs::read_to_string(bucket.join("data/out/late.txt")).unwrap(),
+        "from the spool"
+    );
+    assert!(!env.manager.volume_dir(&id).exists());
+}

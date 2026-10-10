@@ -22,7 +22,14 @@ pub trait Mounter: Send + Sync {
     async fn bind(&self, source: &Path, target: &Path, read_only: bool) -> Result<(), Status>;
 
     /// Serve `op` as a FUSE file system at `target`. `target` must exist.
-    async fn mount_fuse(&self, op: Operator, target: &Path, read_only: bool) -> Result<(), Status>;
+    /// Files open for writing are kept in `spool_dir` until they are uploaded.
+    async fn mount_fuse(
+        &self,
+        op: Operator,
+        target: &Path,
+        read_only: bool,
+        spool_dir: &Path,
+    ) -> Result<(), Status>;
 
     /// Unmount `target`. Unmounting a path that is not mounted is not an error.
     async fn unmount(&self, target: &Path) -> Result<(), Status>;
@@ -35,19 +42,9 @@ pub trait Mounter: Send + Sync {
 }
 
 /// Real mounts through the Linux mount system calls.
+#[derive(Default)]
 pub struct SystemMounter {
     fuse_sessions: Mutex<HashMap<PathBuf, MountHandle>>,
-    /// Folder for spool files of FUSE files that are being written.
-    spool_dir: PathBuf,
-}
-
-impl SystemMounter {
-    pub fn new(spool_dir: PathBuf) -> Self {
-        Self {
-            fuse_sessions: Mutex::new(HashMap::new()),
-            spool_dir,
-        }
-    }
 }
 
 fn c_path(path: &Path) -> Result<CString, Status> {
@@ -150,14 +147,20 @@ impl Mounter for SystemMounter {
         .map_err(|e| Status::internal(format!("mount task failed: {e}")))?
     }
 
-    async fn mount_fuse(&self, op: Operator, target: &Path, read_only: bool) -> Result<(), Status> {
+    async fn mount_fuse(
+        &self,
+        op: Operator,
+        target: &Path,
+        read_only: bool,
+        spool_dir: &Path,
+    ) -> Result<(), Status> {
         let mut options = MountOptions::default();
         options
             .fs_name("kubedal")
             .allow_other(true)
             .read_only(read_only);
         let handle = fuse3::path::Session::new(options)
-            .mount(Filesystem::new(op, 0, 0, self.spool_dir.clone()), target)
+            .mount(Filesystem::new(op, 0, 0, spool_dir.to_path_buf()), target)
             .await
             .map_err(|e| io_status(e, "mount FUSE file system"))?;
         self.fuse_sessions

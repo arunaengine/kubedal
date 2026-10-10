@@ -15,6 +15,7 @@ use crate::node::state::{
 use crate::node::transfer::{self, ByteBudget};
 use crate::node::upload::{self, RetryPolicy, UploadReport};
 use crate::util::error::io_status;
+use crate::util::fuse_fs::spool;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
@@ -135,6 +136,11 @@ impl VolumeManager {
 
     pub fn data_dir(&self, id: &str) -> PathBuf {
         self.volume_dir(id).join("data")
+    }
+
+    /// Spool files of a FUSE volume: content that is not uploaded yet.
+    pub fn spool_dir(&self, id: &str) -> PathBuf {
+        self.volume_dir(id).join("spool")
     }
 
     fn baseline_path(&self, id: &str) -> PathBuf {
@@ -315,9 +321,21 @@ impl VolumeManager {
                             Status::invalid_argument(format!("invalid path {path:?}: {e}"))
                         })?;
                         let op = resolved.operator(&prefix)?;
+                        let spool_dir = self.spool_dir(id);
+                        if !record.read_only {
+                            // Content left from an earlier mount goes first, so it
+                            // cannot overwrite newer writes later.
+                            spool::upload_pending(&op, &spool_dir).await?;
+                            record.upload = Some(UploadPlan {
+                                data_node: resolved.node.clone(),
+                                prefix: prefix.clone(),
+                                local_path: String::new(),
+                                only_changed: false,
+                            });
+                        }
                         transfer::create_dir_all(&req.target_path).await?;
                         self.mounter
-                            .mount_fuse(op, &req.target_path, record.read_only)
+                            .mount_fuse(op, &req.target_path, record.read_only, &spool_dir)
                             .await
                     }
                 }
@@ -481,6 +499,15 @@ impl VolumeManager {
     ) -> Result<UploadReport, Status> {
         let resolved = self.cluster.resolve(&plan.data_node, &record.pod).await?;
         resolved.require_writable()?;
+        if record.mode == VolumeMode::Fuse {
+            // FUSE writes went to storage already; only spool files are left.
+            let op = resolved.operator(&plan.prefix)?;
+            let files = spool::upload_pending(&op, &self.spool_dir(id)).await?;
+            return Ok(UploadReport {
+                files,
+                ..Default::default()
+            });
+        }
         let op = resolved.operator("")?;
         let baseline = if plan.only_changed {
             upload::load_baseline(&self.baseline_path(id))?

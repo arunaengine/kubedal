@@ -612,6 +612,36 @@ mod tests {
     use super::*;
     use opendal::services::Memory;
 
+    fn states(dir: &Path) -> States {
+        States::new(dir.to_path_buf(), Arc::new(SpoolBudget::new(u64::MAX)))
+    }
+
+    #[tokio::test]
+    async fn handles_share_one_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        let b = states.open_write(&op, "a", true).await.unwrap();
+        assert!(Arc::ptr_eq(&a, &b));
+        assert_eq!(a.lock().await.handles, 2);
+    }
+
+    #[tokio::test]
+    async fn closed_states_are_never_joined() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        let (result, pending) = states.release(&op, &a).await;
+        assert!(result.is_ok() && !pending);
+        assert!(a.lock().await.closed);
+        let b = states.open_write(&op, "a", true).await.unwrap();
+        assert!(!Arc::ptr_eq(&a, &b));
+        // A closed state cannot be truncated or renamed through its old name.
+        assert!(states.get("a").is_some_and(|s| Arc::ptr_eq(&s, &b)));
+    }
+
     #[tokio::test]
     async fn unfinished_loads_are_never_replayed() {
         let dir = tempfile::tempdir().unwrap();
@@ -625,5 +655,97 @@ mod tests {
             b"complete content"
         );
         assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+    }
+
+    #[tokio::test]
+    async fn metadata_is_written_only_after_loading() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("big", vec![5u8; 3 * 1024 * 1024]).await.unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "big", true).await.unwrap();
+        let data = joined.lock().await;
+        assert_eq!(data.len, 3 * 1024 * 1024);
+        assert!(!data.dirty);
+        assert!(data.complete);
+        assert_eq!(data.read_at(10, 4).unwrap(), vec![5u8; 4]);
+    }
+
+    #[tokio::test]
+    async fn pending_content_and_renames_are_replayed() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("a.tmp", "old").await.unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "a.tmp", false).await.unwrap();
+        joined.lock().await.write_at(b"new", 0).unwrap();
+        assert!(states.rename("a.tmp", "a").await.unwrap());
+        drop(states);
+        // The driver stopped before the upload. Replay uploads and cleans up.
+        assert_eq!(upload_pending(&op, dir.path()).await.unwrap(), 1);
+        assert_eq!(op.read("a").await.unwrap().to_vec(), b"new");
+        assert!(!op.exists("a.tmp").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn failed_unlink_keeps_the_pending_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "f", false).await.unwrap();
+        joined.lock().await.write_at(b"keep me", 0).unwrap();
+        let err = states
+            .unlink("f", |_| async { Err(Status::unavailable("backend down")) })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
+        let (result, pending) = states.release(&op, &joined).await;
+        assert!(result.is_ok() && !pending);
+        assert_eq!(op.read("f").await.unwrap().to_vec(), b"keep me");
+    }
+
+    #[tokio::test]
+    async fn rename_after_close_does_not_touch_the_closed_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        joined.lock().await.write_at(b"data", 0).unwrap();
+        let (result, _) = states.release(&op, &joined).await;
+        assert!(result.is_ok());
+        // The last release won the race: rename finds no live state, so the
+        // caller renames the uploaded object instead.
+        assert!(!states.rename("a", "b").await.unwrap());
+        assert_eq!(op.read("a").await.unwrap().to_vec(), b"data");
+    }
+
+    #[tokio::test]
+    async fn truncate_after_close_falls_back_to_storage() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        joined.lock().await.write_at(b"12345", 0).unwrap();
+        let _ = states.release(&op, &joined).await;
+        assert!(!states.truncate("a", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn spool_space_is_limited() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = Arc::new(SpoolBudget::new(4));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        let mut data = joined.lock().await;
+        data.write_at(b"1234", 0).unwrap();
+        let err = data.write_at(b"5", 4).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+        assert_eq!(data.len, 4);
+        data.set_len(1).unwrap();
+        assert_eq!(budget.used(), 1);
+        drop(data);
+        let _ = states.release(&op, &joined).await;
+        assert_eq!(budget.used(), 0);
     }
 }

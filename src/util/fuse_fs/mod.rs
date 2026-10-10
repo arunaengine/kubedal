@@ -260,8 +260,12 @@ impl Filesystem {
     }
 
     /// Count a running FUSE callback, so shutdown can wait for it.
-    fn enter(&self) -> states::FenceGuard {
-        self.states.fence.enter()
+    /// After shutdown started, callbacks fail with ENOTCONN.
+    fn enter(&self) -> Result<states::FenceGuard> {
+        self.states
+            .fence
+            .enter()
+            .map_err(|_| Errno::from(libc::ENOTCONN))
     }
 
     /// Pause points for tests that force an order of operations.

@@ -107,12 +107,15 @@ impl SpoolBudget {
     }
 }
 
-/// Stops a file system cleanly: no new uploads or workers once it closes, and a
-/// way to wait for operations that are still running.
+/// Stops a file system cleanly: no new operations, uploads or workers once it
+/// closes, and a way to wait for operations that are still running.
+///
+/// Entering and closing use the same lock, so an operation either entered
+/// before shutdown started (and shutdown waits for it) or is refused.
 #[derive(Default)]
 pub struct Fence {
-    closing: AtomicBool,
-    inflight: std::sync::atomic::AtomicUsize,
+    /// (closing, number of running operations)
+    inner: std::sync::Mutex<(bool, usize)>,
     idle: tokio::sync::Notify,
 }
 
@@ -121,29 +124,38 @@ pub struct FenceGuard(Arc<Fence>);
 
 impl Drop for FenceGuard {
     fn drop(&mut self) {
-        if self.0.inflight.fetch_sub(1, Ordering::SeqCst) == 1 {
+        let mut inner = self.0.inner.lock().unwrap_or_else(|p| p.into_inner());
+        inner.1 = inner.1.saturating_sub(1);
+        if inner.1 == 0 {
             self.0.idle.notify_waiters();
         }
     }
 }
 
 impl Fence {
-    /// Count a running operation.
-    pub fn enter(self: &Arc<Self>) -> FenceGuard {
-        self.inflight.fetch_add(1, Ordering::SeqCst);
-        FenceGuard(self.clone())
+    /// Count a running operation, or refuse it if the file system is closing.
+    pub fn enter(self: &Arc<Self>) -> Result<FenceGuard, Status> {
+        let mut inner = self.inner.lock().unwrap_or_else(|p| p.into_inner());
+        if inner.0 {
+            return Err(Status::unavailable("the file system is shutting down"));
+        }
+        inner.1 += 1;
+        Ok(FenceGuard(self.clone()))
     }
 
     pub fn is_closing(&self) -> bool {
-        self.closing.load(Ordering::SeqCst)
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).0
     }
 
-    /// Refuse new uploads and workers, then wait until no operation runs.
+    /// Refuse new operations, uploads and workers, then wait until no operation
+    /// runs.
     pub async fn close_and_wait(&self) {
-        self.closing.store(true, Ordering::SeqCst);
+        self.inner.lock().unwrap_or_else(|p| p.into_inner()).0 = true;
         loop {
             let idle = self.idle.notified();
-            if self.inflight.load(Ordering::SeqCst) == 0 {
+            tokio::pin!(idle);
+            idle.as_mut().enable();
+            if self.inner.lock().unwrap_or_else(|p| p.into_inner()).1 == 0 {
                 return;
             }
             idle.await;

@@ -794,3 +794,26 @@ async fn failed_retirement_leaves_a_usable_state() {
     fs.release(req(), p, w, 0, 0, false).await.unwrap();
     assert_eq!(op.read("f").await.unwrap().to_vec(), b"data");
 }
+
+#[tokio::test]
+async fn callbacks_that_enter_after_shutdown_are_refused() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, _op) = fs_in(dir.path()).await;
+    let fs = Arc::new(fs);
+    let w = create(&fs, "f").await;
+    // A write callback was started by fuse3 but stops right before it is counted.
+    let pause = fs.pause_points().arm("before_enter");
+    let write = {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            fs.write(req(), Some(OsStr::new("/f")), w, 0, b"late", 0, 0)
+                .await
+        })
+    };
+    pause.reached().await;
+    // Shutdown sees no running callback and finishes.
+    fs.workers().shutdown().await;
+    pause.resume();
+    let err = write.await.unwrap().unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOTCONN));
+}

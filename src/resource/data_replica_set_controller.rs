@@ -83,7 +83,10 @@ impl DataReplicaSet {
             warn!("DataReplicaSet {drs_name}: {message}");
             // An old sync pod must not keep running for an invalid source.
             delete_if_present(&pod_api, &sync_pod_name(self)).await?;
-            ctx.recorder
+            // The status comes first; the Event is only a hint and may fail.
+            self.patch_status(&ctx, false).await?;
+            if let Err(err) = ctx
+                .recorder
                 .publish(
                     &Event {
                         type_: EventType::Warning,
@@ -95,8 +98,9 @@ impl DataReplicaSet {
                     &self.object_ref(&()),
                 )
                 .await
-                .map_err(Error::KubeError)?;
-            self.patch_status(&ctx, false).await?;
+            {
+                warn!("DataReplicaSet {drs_name}: cannot record event: {err}");
+            }
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
         }
         let source_data_pod = dp_api.get(&self.spec.source_pod.name).await?;

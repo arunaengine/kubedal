@@ -25,7 +25,9 @@ const DATASOURCE_FINALIZER: &str = "kubedal.arunaengine.org/datareplicaset";
 
 #[instrument(skip(ctx, res), fields(trace_id))]
 pub async fn reconcile_drs(res: Arc<DataReplicaSet>, ctx: Arc<Context>) -> Result<Action, Error> {
-    let ns = res.namespace().unwrap(); // res is namespace scoped
+    let ns = res
+        .namespace()
+        .ok_or_else(|| Error::ReconcilerError(format!("{} has no namespace", res.name_any())))?;
     let dn: Api<DataReplicaSet> = Api::namespaced(ctx.client.clone(), &ns);
 
     info!("Reconciling Document \"{}\" in {}", res.name_any(), ns);
@@ -115,12 +117,12 @@ impl DataReplicaSet {
                 match available_data_nodes.pop() {
                     Some(replica_data_node) => {
                         let replica_data_pod =
-                            create_replica_data_pod(index, &self, &replica_data_node, &dp_api)
+                            create_replica_data_pod(index, self, &replica_data_node, &dp_api)
                                 .await?;
                         let replica_pvc = create_replica_pvc(
                             &replica_data_pod,
                             &replica_data_node,
-                            &self,
+                            self,
                             MountAccess::FuseReadWrite,
                             &pvc_api,
                         )
@@ -134,7 +136,7 @@ impl DataReplicaSet {
             let source_pvc = create_replica_pvc(
                 &source_data_pod,
                 &source_data_node,
-                &self,
+                self,
                 MountAccess::FuseReadWrite,
                 &pvc_api,
             )
@@ -144,7 +146,7 @@ impl DataReplicaSet {
             //TODO: Interval poll source mount for changes and sync to replica mounts
             let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
             let pod = create_replica_pod(
-                &self,
+                self,
                 &source_data_pod,
                 &source_pvc,
                 replica_resources,
@@ -179,7 +181,7 @@ impl DataReplicaSet {
         */
 
         // Patch status and reschedule reconcile in 5 minutes
-        return Ok(Action::requeue(Duration::from_secs(5 * 60)));
+        Ok(Action::requeue(Duration::from_secs(5 * 60)))
     }
 
     // Finalizer cleanup (the object was deleted, ensure nothing is orphaned)

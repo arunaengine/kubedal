@@ -8,6 +8,8 @@ use serde::{Deserialize, Serialize};
 use sys_mount::{Mount as SysMount, MountFlags, UnmountFlags, unmount};
 use tonic::Status;
 
+use crate::util::error::io_status;
+
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]
 pub enum MountMode {
     Cached,
@@ -91,7 +93,8 @@ impl Mount {
 
         let mount_handle = Session::new(mount_options)
             .mount_with_unprivileged(fs, self.target_path.clone())
-            .await?;
+            .await
+            .map_err(|e| io_status(e, "failed to mount FUSE file system"))?;
 
         self.fuse_mount = Some(mount_handle);
 
@@ -100,7 +103,10 @@ impl Mount {
 
     async fn unmount_fuse(&mut self) -> Result<(), Status> {
         if let Some(mount_handle) = self.fuse_mount.take() {
-            mount_handle.unmount().await?;
+            mount_handle
+                .unmount()
+                .await
+                .map_err(|e| io_status(e, "failed to unmount FUSE file system"))?;
         }
         Ok(())
     }
@@ -132,7 +138,8 @@ impl Mount {
             match entry.metadata().mode() {
                 opendal::EntryMode::FILE => {
                     // Create file
-                    let mut file = std::fs::File::create(entry_path)?;
+                    let mut file = std::fs::File::create(&entry_path)
+                        .map_err(|e| io_status(e, "failed to create cache file"))?;
                     // Create stream
                     let mut r = self
                         .operator
@@ -147,8 +154,13 @@ impl Mount {
                             Status::internal(format!("Failed to convert reader into stream: {}", e))
                         })?;
                     // Write stream into file
-                    while let Some(bytes) = r.try_next().await? {
-                        file.write_all(&bytes)?;
+                    while let Some(bytes) = r
+                        .try_next()
+                        .await
+                        .map_err(|e| io_status(e, "failed to download file"))?
+                    {
+                        file.write_all(&bytes)
+                            .map_err(|e| io_status(e, "failed to write cache file"))?;
                     }
                 }
                 opendal::EntryMode::DIR => {
@@ -167,7 +179,7 @@ impl Mount {
                     }
                 }
                 opendal::EntryMode::Unknown => {
-                    return Err(Status::unknown("Data source entry type is unknown"));
+                    return Err(Status::internal("Data source entry type is unknown"));
                 }
             }
         }

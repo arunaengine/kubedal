@@ -2,11 +2,12 @@ use crate::csi::node_server::Node;
 use crate::csi::{
     NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
     NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse, NodePublishVolumeRequest,
-    NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
-    NodeUnpublishVolumeResponse,
+    NodePublishVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
 };
 use crate::resource::crd::{DataNode, DataPod, MountAccess};
+use crate::util::error::{io_status, kube_status};
 use crate::util::mount_helper::{AccessMode, Mount, MountMode};
+use crate::util::mountinfo::is_mount_point;
 use crate::util::opendal::get_operator;
 use k8s_openapi::api::authorization::v1::{
     ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
@@ -36,7 +37,7 @@ pub struct PodInfo {
 pub struct NodeService {
     client: Client,
     node_id: String,
-    // Track mounted volumes for our dummy driver
+    /// Active mounts, keyed by target path.
     mounts: Arc<Mutex<HashMap<String, Mount>>>,
 }
 
@@ -56,18 +57,9 @@ impl Node for NodeService {
         &self,
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
-        // Advertise stage_unstage_volume capability
-        let stage_unstage = NodeServiceCapability {
-            r#type: Some(crate::csi::node_service_capability::Type::Rpc(
-                crate::csi::node_service_capability::Rpc {
-                    r#type: crate::csi::node_service_capability::rpc::Type::StageUnstageVolume
-                        .into(),
-                },
-            )),
-        };
-
+        // kubedal does all work in NodePublishVolume, so no optional node RPCs are offered.
         let response = NodeGetCapabilitiesResponse {
-            capabilities: vec![stage_unstage],
+            capabilities: vec![],
         };
 
         Ok(Response::new(response))
@@ -104,6 +96,18 @@ impl Node for NodeService {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
 
+        // The CSI spec requires NodePublishVolume to be idempotent.
+        let mut mounts = self.mounts.lock().await;
+        if let Some(existing) = mounts.get(&target_path) {
+            if existing.volume_id == volume_id {
+                return Ok(Response::new(NodePublishVolumeResponse {}));
+            }
+            return Err(Status::already_exists(format!(
+                "target path {target_path} is already used by volume {}",
+                existing.volume_id
+            )));
+        }
+
         let (full_data_source, mount_access) =
             get_full_data_mount(self.client.clone(), &request.volume_context).await?;
         let pod_info = get_pod_info(&request.volume_context)?;
@@ -130,16 +134,14 @@ impl Node for NodeService {
 
         let mut mount = Mount::new(
             volume_id.clone(),
-            target_path,
+            target_path.clone(),
             operator,
             mount_mode,
             access_mode,
         );
         mount.mount().await?;
 
-        // Track this mount in our in-memory state
-        let mut mounts = self.mounts.lock().await;
-        mounts.insert(volume_id, mount);
+        mounts.insert(target_path, mount);
 
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
@@ -162,10 +164,23 @@ impl Node for NodeService {
 
         tracing::info!("Unpublishing volume '{}' from '{}'", volume_id, target_path);
 
-        // Remove from our tracking
         let mut mounts = self.mounts.lock().await;
-        if let Some(mut mount) = mounts.remove(&volume_id) {
-            mount.unmount().await?;
+        if let Some(mut mount) = mounts.remove(&target_path) {
+            if let Err(err) = mount.unmount().await {
+                // Keep tracking the mount so that a retry can finish the work.
+                mounts.insert(target_path, mount);
+                return Err(err);
+            }
+        } else if is_mount_point(std::path::Path::new(&target_path)) {
+            // Unknown to this process (for example after a restart), but still mounted.
+            unmount_path(&target_path).await?;
+        }
+
+        // The spec asks the plugin to remove the target path. A missing path is fine.
+        match tokio::fs::remove_dir(&target_path).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => return Err(io_status(err, "failed to remove target path")),
         }
 
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
@@ -176,16 +191,14 @@ impl Node for NodeService {
         &self,
         _request: Request<crate::csi::NodeStageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeStageVolumeResponse>, Status> {
-        // Our simple driver doesn't support this
-        Ok(Response::new(crate::csi::NodeStageVolumeResponse {}))
+        Err(Status::unimplemented("NodeStageVolume is not supported"))
     }
 
     async fn node_unstage_volume(
         &self,
         _request: Request<crate::csi::NodeUnstageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeUnstageVolumeResponse>, Status> {
-        // Our simple driver doesn't support this
-        Ok(Response::new(crate::csi::NodeUnstageVolumeResponse {}))
+        Err(Status::unimplemented("NodeUnstageVolume is not supported"))
     }
 
     async fn node_expand_volume(
@@ -209,25 +222,19 @@ impl Node for NodeService {
 #[tracing::instrument]
 fn get_pod_info(volume_context: &HashMap<String, String>) -> Result<PodInfo, Status> {
     // Fetch Pod meta from context and check with SubjectAccessReview
-    let pod_name = volume_context
-        .get("csi.storage.k8s.io/pod.name")
-        .expect("Pod name not provided");
-    let pod_namespace = volume_context
-        .get("csi.storage.k8s.io/pod.namespace")
-        .expect("Pod namespace not provided");
-    let pod_service_account = volume_context
-        .get("csi.storage.k8s.io/serviceAccount.name")
-        .expect("Pod service account not provided");
-
-    let pod_uid = volume_context
-        .get("csi.storage.k8s.io/pod.uid")
-        .expect("Pod UID not provided");
+    let get = |key: &str| {
+        volume_context.get(key).cloned().ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "volume context is missing {key}; is podInfoOnMount enabled in the CSIDriver?"
+            ))
+        })
+    };
 
     Ok(PodInfo {
-        name: pod_name.clone(),
-        namespace: pod_namespace.clone(),
-        service_account: pod_service_account.clone(),
-        uid: pod_uid.clone(),
+        name: get("csi.storage.k8s.io/pod.name")?,
+        namespace: get("csi.storage.k8s.io/pod.namespace")?,
+        service_account: get("csi.storage.k8s.io/serviceAccount.name")?,
+        uid: get("csi.storage.k8s.io/pod.uid")?,
     })
 }
 
@@ -249,16 +256,16 @@ async fn get_full_data_mount(
     let data_pod_name = volume_context
         .get("kubedal.arunaengine.org/data-pod-name")
         .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode name not provided"))?;
+        .ok_or_else(|| Status::invalid_argument("DataPod name not provided"))?;
 
     let data_pod_namespace = volume_context
         .get("kubedal.arunaengine.org/data-pod-namespace")
         .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode namespace not provided"))?;
+        .ok_or_else(|| Status::invalid_argument("DataPod namespace not provided"))?;
 
     let mount_mode = match volume_context
         .get("kubedal.arunaengine.org/mount")
-        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?
+        .ok_or_else(|| Status::invalid_argument("Mount mode not provided"))?
         .as_str()
     {
         "cache" => MountAccess::CacheReadOnly,
@@ -273,15 +280,17 @@ async fn get_full_data_mount(
     // Fetch DataNode, DataPod, [optional] Secret
     let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &data_node_namespace);
     let data_node = data_node_api.get(&data_node_name).await.map_err(|e| {
-        tracing::error!("Error getting DataNode: {:?}", e);
-        Status::internal("Error getting DataNode")
+        kube_status(
+            e,
+            &format!("DataNode {data_node_namespace}/{data_node_name}"),
+        )
     })?;
 
     let data_pod_api: Api<DataPod> = Api::namespaced(client.clone(), &data_pod_namespace);
-    let data_pod = data_pod_api.get(&data_pod_name).await.map_err(|e| {
-        tracing::error!("Error getting DataPod: {:?}", e);
-        Status::internal("Error getting DataPod")
-    })?;
+    let data_pod = data_pod_api
+        .get(&data_pod_name)
+        .await
+        .map_err(|e| kube_status(e, &format!("DataPod {data_pod_namespace}/{data_pod_name}")))?;
 
     let secret = match data_node.spec.secret_ref.as_ref() {
         None => None,
@@ -296,7 +305,7 @@ async fn get_full_data_mount(
             let secret = secret_api
                 .get(secret_name)
                 .await
-                .map_err(|_| Status::not_found("Secret not found"))?;
+                .map_err(|e| kube_status(e, &format!("Secret {secret_ns}/{secret_name}")))?;
             Some(secret)
         }
     };
@@ -342,7 +351,7 @@ async fn check_access(
             },
         )
         .await
-        .map_err(|_| Status::internal("SubjectAccessReview failed"))?;
+        .map_err(|e| kube_status(e, "SubjectAccessReview"))?;
     tracing::info!("SubjectAccessReview response: {:#?}", &response);
 
     if let Some(status) = response.status {
@@ -395,7 +404,7 @@ async fn check_access(
                 },
             )
             .await
-            .map_err(|_| Status::internal("SubjectAccessReview failed"))?;
+            .map_err(|e| kube_status(e, "SubjectAccessReview"))?;
         tracing::info!("SubjectAccessReview response: {:#?}", &response);
 
         if let Some(status) = response.status {
@@ -419,7 +428,7 @@ async fn check_access(
         }
     }
 
-    return Ok(());
+    Ok(())
 }
 
 impl FullDataSource {
@@ -437,4 +446,15 @@ impl FullDataSource {
 
         Ok((get_operator(&client, &self.source).await?, mode, access))
     }
+}
+
+/// Unmount a path that kubedal does not track in memory.
+async fn unmount_path(target_path: &str) -> Result<(), Status> {
+    let path = target_path.to_string();
+    tokio::task::spawn_blocking(move || {
+        sys_mount::unmount(&path, sys_mount::UnmountFlags::DETACH)
+            .map_err(|e| io_status(e, "failed to unmount target path"))
+    })
+    .await
+    .map_err(|e| Status::internal(format!("unmount task failed: {e}")))?
 }

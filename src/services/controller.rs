@@ -33,6 +33,13 @@ impl ControllerService {
             volumes: Arc::new(Mutex::new(HashMap::new())),
         }
     }
+
+    /// Lock the volume map. A poisoned lock still holds valid data, so it is used as is.
+    fn lock_volumes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Volume>> {
+        self.volumes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
 }
 
 #[tonic::async_trait]
@@ -82,15 +89,11 @@ impl Controller for ControllerService {
             return Err(Status::invalid_argument("Volume name cannot be empty"));
         }
 
-        {
-            let volumes = self.volumes.lock().unwrap();
-            // Check if volume already exists
-            if volumes.contains_key(&request.name) {
-                let existing_volume = volumes.get(&request.name).unwrap().clone();
-                return Ok(Response::new(CreateVolumeResponse {
-                    volume: Some(existing_volume),
-                }));
-            }
+        // CreateVolume must be idempotent: return the volume created before.
+        if let Some(existing_volume) = self.lock_volumes().get(&request.name).cloned() {
+            return Ok(Response::new(CreateVolumeResponse {
+                volume: Some(existing_volume),
+            }));
         }
 
         let namespace = request.parameters.get("resourceNamespace").ok_or_else(|| {
@@ -125,8 +128,7 @@ impl Controller for ControllerService {
             volume_context: context,
         };
 
-        let mut volumes = self.volumes.lock().unwrap();
-        volumes.insert(request.name, volume.clone());
+        self.lock_volumes().insert(request.name, volume.clone());
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
@@ -150,7 +152,7 @@ impl Controller for ControllerService {
         // In a real driver, we would clean up any resources associated with this volume
         // For our dummy driver, we'll just remove it from our in-memory map
 
-        let mut volumes = self.volumes.lock().unwrap();
+        let mut volumes = self.lock_volumes();
 
         // Find and remove the volume by ID
         let volume_key = volumes
@@ -205,7 +207,7 @@ impl Controller for ControllerService {
         _request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         // List all volumes in our in-memory storage
-        let volumes = self.volumes.lock().unwrap();
+        let volumes = self.lock_volumes();
         let entries = volumes
             .values()
             .map(|v| crate::csi::list_volumes_response::Entry {

@@ -20,7 +20,9 @@ use super::controller::{Context, Error};
 
 #[instrument(skip(ctx, res), fields(trace_id))]
 pub async fn reconcile_dp(res: Arc<DataPod>, ctx: Arc<Context>) -> Result<Action, Error> {
-    let ns = res.namespace().unwrap(); // res is namespace scoped
+    let ns = res
+        .namespace()
+        .ok_or_else(|| Error::ReconcilerError(format!("{} has no namespace", res.name_any())))?;
     let dp: Api<DataPod> = Api::namespaced(ctx.client.clone(), &ns);
 
     info!("Reconciling DataPod \"{}\" in {}", res.name_any(), ns);
@@ -54,21 +56,14 @@ impl DataPod {
         let data_pod = data_pod_api.get(&name).await?;
 
         // Set path to DataPod uid if None, empty or "/"
-        let (new_path, generated) = if self
-            .spec
-            .path
-            .as_ref()
-            .map_or(true, |path| path.is_empty() || path == "/")
-        {
-            (
-                format!(
-                    "/{}",
-                    self.uid().expect("DataPods uid is missing.").as_str()
-                ),
-                true,
-            )
-        } else {
-            (self.spec.path.clone().unwrap(), false) // Cannot fail as the other branch collects all the other cases.
+        let (new_path, generated) = match self.spec.path.as_deref() {
+            Some(path) if !path.is_empty() && path != "/" => (path.to_string(), false),
+            _ => {
+                let uid = self
+                    .uid()
+                    .ok_or_else(|| Error::ReconcilerError(format!("DataPod {name} has no uid")))?;
+                (format!("/{uid}"), true)
+            }
         };
 
         // Set owner reference and datNodeRef depending on ref/selector
@@ -90,13 +85,17 @@ impl DataPod {
                 .list(&ListParams::default().labels(&selector_string))
                 .await?
                 .items
-                .first()
-                .expect("No nodes found with provided selector")
-                .clone()
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    Error::ReconcilerError(format!(
+                        "no DataNode matches the selector {selector_string} of DataPod {name}"
+                    ))
+                })?
         } else {
             return Err(Error::ReconcilerError(format!(
                 "DataPod {} has no DataNode reference/selector",
-                &name
+                name
             )));
         };
 
@@ -114,7 +113,7 @@ impl DataPod {
             "apiVersion": DataPod::api_version(&()),
             "kind": DataPod::kind(&()),
             "metadata": ObjectMeta {
-                name: Some(data_pod_clone.metadata.name.expect("DataPod is missing name.")),
+                name: Some(name.clone()),
                 namespace: data_pod_clone.metadata.namespace,
                 owner_references: Some(vec![owner]),
                 ..Default::default()
@@ -137,7 +136,7 @@ impl DataPod {
             .patch(&name, &PatchParams::apply("cntrlr").force(), &overall_patch)
             .await?;
 
-        if data_pod != new_data_pod.to_owned() {
+        if data_pod != new_data_pod {
             ctx.recorder
                 .publish(
                     &Event {
@@ -147,7 +146,7 @@ impl DataPod {
                             new_data_pod
                                 .status
                                 .as_ref()
-                                .map(|s| s.generated_path.clone())
+                                .map(|s| s.generated_path)
                                 .unwrap_or_default()
                         ),
                         action: "ReconciledSync".into(),

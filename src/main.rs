@@ -16,9 +16,8 @@ const NAME: &str = "kubedal.arunaengine.org";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or("none".into())
-        .add_directive("kubedal=trace".parse().unwrap());
+    // RUST_LOG controls the log level, for example "info" or "kubedal=debug".
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
         .with_file(true)
@@ -48,8 +47,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .get_matches();
 
-    let endpoint = matches.get_one::<String>("endpoint").unwrap();
-    let node_id = matches.get_one::<String>("node-id").unwrap();
+    // Both arguments have default values, so they are always present.
+    let endpoint = matches
+        .get_one::<String>("endpoint")
+        .cloned()
+        .unwrap_or_default();
+    let node_id = matches
+        .get_one::<String>("node-id")
+        .cloned()
+        .unwrap_or_default();
 
     tracing::info!("Starting KubeDAL CSI Driver v{}", VERSION);
     tracing::info!("Endpoint: {}", endpoint);
@@ -76,10 +82,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Ensure parent directory exists
-    if let Some(parent) = socket_path_obj.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = socket_path_obj.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     // Create a Unix domain socket
@@ -98,17 +104,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder
-        let node_service = NodeService::new(client, node_id);
+        let node_service = NodeService::new(client, &node_id);
         builder.add_service(NodeServer::new(node_service))
     };
 
     builder
-        .serve_with_incoming_shutdown(uds_stream, async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl+c signal");
-            tracing::info!("Received shutdown signal, stopping CSI server...");
-        })
+        .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
         .await?;
 
     // Clean up the socket file
@@ -118,4 +119,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("CSI server stopped successfully");
     Ok(())
+}
+
+/// Wait for SIGTERM (sent by Kubernetes) or SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::warn!("cannot listen for SIGTERM: {err}");
+            None
+        }
+    };
+    let terminate = async {
+        match terminate.as_mut() {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
+    tracing::info!("Received shutdown signal, stopping CSI server...");
 }

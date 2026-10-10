@@ -26,18 +26,16 @@ pub async fn get_operator(client: &Client, node: &DataNode) -> Result<Operator, 
             Some(secret)
         }
     };
-    if let Some(secret) = secret {
-        if let Some(data) = secret.data {
-            for (k, v) in data.into_iter() {
-                cfg.insert(
-                    k,
-                    std::str::from_utf8(&v.0)
-                        .map_err(|e| {
-                            Status::internal(format!("Failed to deserialize secret: {}", e))
-                        })?
-                        .to_string(),
-                );
-            }
+    if let Some(secret) = secret
+        && let Some(data) = secret.data
+    {
+        for (k, v) in data.into_iter() {
+            cfg.insert(
+                k,
+                std::str::from_utf8(&v.0)
+                    .map_err(|e| Status::internal(format!("Failed to deserialize secret: {}", e)))?
+                    .to_string(),
+            );
         }
     };
 

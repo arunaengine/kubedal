@@ -153,7 +153,7 @@ impl PathFilesystem for Filesystem {
         );
 
         if !self.op.info().capability().rename {
-            return Err(Errno::from(libc::ENOTSUP))?;
+            Err(Errno::from(libc::ENOTSUP))?;
         }
 
         let origin_path = PathBuf::from(origin_parent).join(origin_name);

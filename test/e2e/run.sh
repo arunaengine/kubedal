@@ -174,6 +174,53 @@ echo ok' | run_pod fuse-rw || true
 delete_pod fuse-rw || true
 expect_object results/fuse-rw/fuse.txt via-fuse
 
+log "FUSE file system behaviour with a kernel mount"
+inline_pod fuse-ops "dataNode: store
+path: results/fuse-ops
+mount: fuse-read-write" '
+cd /vol
+# Two handles append to the same file.
+printf x > two.txt
+exec 3>>two.txt 4>>two.txt
+printf A >&3
+printf B >&4
+exec 3>&- 4>&-
+test "$(cat two.txt)" = xAB
+# Read what was written before the writer is closed.
+exec 5>rw.txt
+printf hello >&5
+test "$(cat rw.txt)" = hello
+exec 5>&-
+# Truncate a file while a writer is open.
+exec 6>t.txt
+printf 12345 >&6
+truncate -s 2 t.txt
+exec 6>&-
+test "$(cat t.txt)" = 12
+# Remove a file while a writer is open; it must not come back.
+exec 7>u.txt
+printf data >&7
+rm u.txt
+printf more >&7
+exec 7>&-
+test ! -e u.txt
+# Append to a large file.
+dd if=/dev/zero of=big.bin bs=1M count=20 2>/dev/null
+printf tail >> big.bin
+test "$(stat -c %s big.bin)" = 20971524
+echo ok' | run_pod fuse-ops || true
+delete_pod fuse-ops || true
+expect_object results/fuse-ops/two.txt xAB
+expect_object results/fuse-ops/t.txt 12
+inline_pod fuse-ops-check "dataNode: store
+path: results/fuse-ops
+mount: cache-read-only" '
+test ! -e /vol/u.txt
+test "$(stat -c %s /vol/big.bin)" = 20971524
+test "$(tail -c 4 /vol/big.bin)" = tail
+echo ok' | run_pod fuse-ops-check || fail "FUSE results in storage are wrong"
+delete_pod fuse-ops-check || true
+
 log "file-list volume with upload"
 inline_pod file-list "dataNode: store
 manifest: jobs/1.json" '

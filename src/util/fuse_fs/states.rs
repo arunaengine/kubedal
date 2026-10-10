@@ -280,6 +280,14 @@ fn retire(state: &FileState, data: &mut StateData) -> std::io::Result<()> {
     Ok(())
 }
 
+/// Remove a spool data file and give its space back.
+fn remove_and_refund(path: &Path, budget: &SpoolBudget) {
+    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    if std::fs::remove_file(path).is_ok() {
+        budget.release(size);
+    }
+}
+
 async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<(), Status> {
     let file = tokio::fs::File::open(data_path)
         .await
@@ -630,7 +638,13 @@ impl States {
 /// unpublish), so content that could not be uploaded before, also from before a
 /// restart, is not lost. Data files without a JSON file are unfinished loads or
 /// belong to removed names; they are removed.
-pub async fn upload_pending(op: &Operator, dir: &Path) -> Result<usize, Status> {
+///
+/// Each removed spool file gives its space back to `budget`.
+pub async fn upload_pending(
+    op: &Operator,
+    dir: &Path,
+    budget: &SpoolBudget,
+) -> Result<usize, Status> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
@@ -648,14 +662,14 @@ pub async fn upload_pending(op: &Operator, dir: &Path) -> Result<usize, Status> 
             Ok(data) => serde_json::from_slice(&data)
                 .map_err(|e| Status::internal(format!("bad spool metadata {meta_path:?}: {e}")))?,
             Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                let _ = std::fs::remove_file(data_path);
+                remove_and_refund(data_path, budget);
                 continue;
             }
             Err(err) => return Err(io_status(err, "read spool metadata")),
         };
         upload_data_file(op, data_path, &meta.key).await?;
         let _ = std::fs::remove_file(&meta_path);
-        let _ = std::fs::remove_file(data_path);
+        remove_and_refund(data_path, budget);
         uploaded += 1;
     }
     for tmp in paths
@@ -709,7 +723,12 @@ mod tests {
         std::fs::write(dir.path().join("x.data"), "partial").unwrap();
         let op = Operator::new(Memory::default()).unwrap();
         op.write("original", "complete content").await.unwrap();
-        assert_eq!(upload_pending(&op, dir.path()).await.unwrap(), 0);
+        assert_eq!(
+            upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+                .await
+                .unwrap(),
+            0
+        );
         assert_eq!(
             op.read("original").await.unwrap().to_vec(),
             b"complete content"
@@ -742,7 +761,12 @@ mod tests {
         assert!(states.rename(&op, "a.tmp", "a").await.unwrap());
         drop(states);
         // The driver stopped before the upload. Replay uploads and cleans up.
-        assert_eq!(upload_pending(&op, dir.path()).await.unwrap(), 1);
+        assert_eq!(
+            upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+                .await
+                .unwrap(),
+            1
+        );
         assert_eq!(op.read("a").await.unwrap().to_vec(), b"new");
         assert!(!op.exists("a.tmp").await.unwrap());
     }
@@ -788,6 +812,20 @@ mod tests {
         joined.lock().await.write_at(b"12345", 0).unwrap();
         let _ = states.release(&op, &joined).await;
         assert!(!states.truncate("a", 2).await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn replay_gives_the_space_back() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("x.data"), "1234").unwrap();
+        std::fs::write(dir.path().join("x.json"), r#"{"key": "x"}"#).unwrap();
+        let budget = SpoolBudget::new(4);
+        budget.reserve(4).unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        upload_pending(&op, dir.path(), &budget).await.unwrap();
+        assert_eq!(budget.used(), 0);
+        // The next byte fits again.
+        budget.reserve(1).unwrap();
     }
 
     #[tokio::test]

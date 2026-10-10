@@ -15,6 +15,7 @@ use crate::node::state::{
 use crate::node::transfer::{self, ByteBudget};
 use crate::node::upload::{self, RetryPolicy, UploadReport};
 use crate::util::error::io_status;
+use crate::util::fuse_fs::SpoolBudget;
 use crate::util::fuse_fs::states;
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -66,6 +67,8 @@ pub struct VolumeManager {
     busy: Mutex<HashSet<String>>,
     retry: RetryPolicy,
     content: ContentCache,
+    /// Space budget of FUSE spool files on this node, shared with the mounter.
+    spool_budget: Arc<SpoolBudget>,
 }
 
 /// Marks a volume as busy while an operation runs on it.
@@ -99,11 +102,19 @@ impl VolumeManager {
             busy: Mutex::new(HashSet::new()),
             retry: RetryPolicy::default(),
             content,
+            spool_budget: Arc::new(SpoolBudget::new(u64::MAX)),
         })
     }
 
     /// Change how failed uploads are retried.
     /// Change the size limit of the node content cache.
+    /// Share the FUSE spool budget of the mounter, so replayed spool files give
+    /// their space back.
+    pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
+        self.spool_budget = budget;
+        self
+    }
+
     pub fn with_content_cache_limit(mut self, max_bytes: u64) -> Self {
         self.content.set_max_bytes(max_bytes);
         self
@@ -331,7 +342,7 @@ impl VolumeManager {
                         if !record.read_only {
                             // Content left from an earlier mount goes first, so it
                             // cannot overwrite newer writes later.
-                            states::upload_pending(&op, &spool_dir).await?;
+                            states::upload_pending(&op, &spool_dir, &self.spool_budget).await?;
                             record.upload = Some(UploadPlan {
                                 data_node: resolved.node.clone(),
                                 prefix: prefix.clone(),
@@ -430,7 +441,7 @@ impl VolumeManager {
         resolved.require_identity(plan.data_node_identity.as_deref())?;
         let op = resolved.operator(&plan.prefix)?;
         let spool_dir = self.spool_dir(id);
-        states::upload_pending(&op, &spool_dir).await?;
+        states::upload_pending(&op, &spool_dir, &self.spool_budget).await?;
         transfer::create_dir_all(target).await?;
         self.mounter.mount_fuse(op, target, false, &spool_dir).await
     }
@@ -537,7 +548,8 @@ impl VolumeManager {
         if record.mode == VolumeMode::Fuse {
             // FUSE writes went to storage already; only spool files are left.
             let op = resolved.operator(&plan.prefix)?;
-            let files = states::upload_pending(&op, &self.spool_dir(id)).await?;
+            let files =
+                states::upload_pending(&op, &self.spool_dir(id), &self.spool_budget).await?;
             return Ok(UploadReport {
                 files,
                 ..Default::default()

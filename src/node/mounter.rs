@@ -51,10 +51,10 @@ pub struct SystemMounter {
 }
 
 impl SystemMounter {
-    /// A mounter whose FUSE spool files may use at most `bytes` on this node.
-    pub fn with_spool_limit(bytes: u64) -> Self {
+    /// A mounter whose FUSE spool files share `budget` on this node.
+    pub fn with_spool_budget(budget: Arc<SpoolBudget>) -> Self {
         Self {
-            spool_budget: Some(Arc::new(SpoolBudget::new(bytes))),
+            spool_budget: Some(budget),
             ..Default::default()
         }
     }

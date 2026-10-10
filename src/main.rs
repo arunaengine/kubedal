@@ -155,15 +155,17 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .transpose()
             .map_err(|e| format!("invalid --fuse-spool-size: {e}"))?
             .unwrap_or(u64::MAX);
-        let mounter = Arc::new(SystemMounter::with_spool_limit(spool_size));
+        let spool_budget = Arc::new(kubedal::util::fuse_fs::SpoolBudget::new(spool_size));
+        let mounter = Arc::new(SystemMounter::with_spool_budget(spool_budget.clone()));
         let cache_size = matches
             .get_one::<String>("content-cache-size")
             .map(|s| kubedal::util::quantity::parse_bytes(s))
             .transpose()
             .map_err(|e| format!("invalid --content-cache-size: {e}"))?
             .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES);
-        let manager =
-            VolumeManager::new(&data_dir, cluster, mounter)?.with_content_cache_limit(cache_size);
+        let manager = VolumeManager::new(&data_dir, cluster, mounter)?
+            .with_content_cache_limit(cache_size)
+            .with_spool_budget(spool_budget);
         tracing::info!("Data directory: {}", data_dir.display());
         // Clean up what a previous run of the plugin left behind.
         let report = manager.reconcile().await?;

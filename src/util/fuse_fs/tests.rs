@@ -230,7 +230,7 @@ async fn content_that_cannot_be_uploaded_is_kept_on_disk() {
     // The storage works again, for example after a restart of the driver.
     std::fs::remove_file(&root).unwrap();
     std::fs::create_dir_all(&root).unwrap();
-    let uploaded = states::upload_pending(&make_op(), &spool_dir)
+    let uploaded = states::upload_pending(&make_op(), &spool_dir, &SpoolBudget::new(u64::MAX))
         .await
         .unwrap();
     assert_eq!(uploaded, 1);
@@ -389,7 +389,7 @@ async fn stopped_retry_workers_never_upload_late() {
     std::fs::remove_file(&root).unwrap();
     std::fs::create_dir_all(&root).unwrap();
     assert_eq!(
-        states::upload_pending(&make_op(), &spool_dir)
+        states::upload_pending(&make_op(), &spool_dir, &SpoolBudget::new(u64::MAX))
             .await
             .unwrap(),
         1
@@ -468,7 +468,7 @@ async fn rename_onto_an_open_file_retires_it_also_for_replay() {
     fs.release(req(), pb, wa, 0, 0, false).await.unwrap();
     // The driver stops before the old b is closed, then replays its spool.
     drop(fs);
-    states::upload_pending(&op, &dir.path().join("spool"))
+    states::upload_pending(&op, &dir.path().join("spool"), &SpoolBudget::new(u64::MAX))
         .await
         .unwrap();
     assert_eq!(op.read("b").await.unwrap().to_vec(), b"new content");

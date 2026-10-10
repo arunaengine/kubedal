@@ -242,7 +242,7 @@ async fn create_replica_data_pod(
     // Create DataPod
     let replica_pod = DataPod {
         metadata: ObjectMeta {
-            name: Some(format!("{}-replica-{}", drs_uid, index)),
+            name: Some(replica_name(&drs_uid, index)),
             namespace: Some(drs_ns.clone()),
             owner_references: Some(vec![drs_owner.clone()]),
             // Without the template labels the selector never counts the replicas,
@@ -251,7 +251,7 @@ async fn create_replica_data_pod(
             ..Default::default()
         },
         spec: DataPodSpec {
-            path: Some(format!("/replica-{}", index)),
+            path: Some(replica_path(&drs_uid, index)),
             data_node_ref: Some(Ref {
                 name: data_node.name_any(),
                 namespace: data_node.namespace(),
@@ -458,6 +458,17 @@ fn pvc_name(data_replica_set: &DataReplicaSet, data_pod: &DataPod) -> String {
     format!("{}-{}", data_replica_set.name_any(), data_pod.name_any())
 }
 
+/// Name of the replica DataPod with this index.
+fn replica_name(drs_uid: &str, index: usize) -> String {
+    format!("{drs_uid}-replica-{index}")
+}
+
+/// Folder of a replica in its DataNode. It holds the set UID, so two sets that
+/// use the same DataNode never write into the same folder.
+fn replica_path(drs_uid: &str, index: usize) -> String {
+    format!("/{drs_uid}/replica-{index}")
+}
+
 /// Name of the sync pod of this set.
 fn sync_pod_name(data_replica_set: &DataReplicaSet) -> String {
     format!("{}-sync", data_replica_set.name_any())
@@ -471,6 +482,12 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replica_folders_differ_between_sets() {
+        assert_ne!(replica_path("set-a", 0), replica_path("set-b", 0));
+        assert_eq!(replica_path("set-a", 1), "/set-a/replica-1");
+    }
 
     #[test]
     fn available_needs_all_replicas_and_a_running_sync_pod() {

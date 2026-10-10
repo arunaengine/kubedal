@@ -604,3 +604,91 @@ async fn shutdown_waits_for_running_callbacks_and_refuses_new_workers() {
             .any(|e| e.unwrap().path().extension().is_some_and(|x| x == "json"))
     );
 }
+
+/// Run `first` until it stops at `point`, start `second`, give `second` time to
+/// block, then let `first` go on.
+async fn forced<A, B>(
+    fs: &Filesystem,
+    point: &'static str,
+    first: A,
+    second: B,
+) -> (A::Output, B::Output)
+where
+    A: std::future::Future,
+    B: std::future::Future,
+{
+    let pause = fs.pause_points().arm(point);
+    let second = async {
+        pause.reached().await;
+        let second = second;
+        tokio::pin!(second);
+        // Let the second operation run until it waits for the state lock.
+        let quick = tokio::time::timeout(std::time::Duration::from_millis(30), &mut second).await;
+        pause.resume();
+        match quick {
+            Ok(out) => out,
+            Err(_) => second.await,
+        }
+    };
+    tokio::join!(first, second)
+}
+
+#[tokio::test]
+async fn forced_release_before_rename() {
+    let fs = fs_with("other", "").await;
+    let w = create(&fs, "a").await;
+    let p = Some(OsStr::new("/a"));
+    fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+    let root = OsStr::new("/");
+    let (released, renamed) = forced(
+        &fs,
+        "release_upload",
+        fs.release(req(), p, w, 0, 0, false),
+        fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b")),
+    )
+    .await;
+    released.unwrap();
+    renamed.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"data");
+    assert!(!fs.op.exists("a").await.unwrap());
+}
+
+#[tokio::test]
+async fn forced_rename_before_release() {
+    let fs = fs_with("other", "").await;
+    let w = create(&fs, "a").await;
+    let p = Some(OsStr::new("/a"));
+    fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+    let root = OsStr::new("/");
+    let (renamed, released) = forced(
+        &fs,
+        "rename_locked",
+        fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b")),
+        fs.release(req(), p, w, 0, 0, false),
+    )
+    .await;
+    renamed.unwrap();
+    released.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"data");
+    assert!(!fs.op.exists("a").await.unwrap());
+}
+
+#[tokio::test]
+async fn forced_release_before_truncate() {
+    let fs = fs_with("other", "").await;
+    let w = create(&fs, "t").await;
+    let p = Some(OsStr::new("/t"));
+    fs.write(req(), p, w, 0, b"12345", 0, 0).await.unwrap();
+    let (released, truncated) = forced(
+        &fs,
+        "release_upload",
+        fs.release(req(), p, w, 0, 0, false),
+        fs.setattr(req(), p, None, size(2)),
+    )
+    .await;
+    released.unwrap();
+    // The file closed first, so the truncate goes to storage, which cannot cut
+    // an object to 2 bytes: it fails instead of claiming success.
+    assert_eq!(truncated.unwrap_err(), Errno::from(libc::EOPNOTSUPP));
+    assert_eq!(fs.op.read("t").await.unwrap().to_vec(), b"12345");
+}

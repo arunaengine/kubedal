@@ -99,12 +99,11 @@ impl Cluster for KubeCluster {
 
         let cfg = data_node_config(&self.client, &data_node).await?;
         let backend = data_node.spec.backend.clone();
-        // The identity leaves out secret values, so rotated credentials keep it.
-        let identity = cache_scope(
+        let identity = identity(
             node,
             data_node.metadata.uid.as_deref().unwrap_or_default(),
             &data_node.spec.backend,
-            &data_node.spec.config,
+            &cfg,
         );
         let scope = cache_scope(
             node,
@@ -176,11 +175,78 @@ fn cache_scope(
     format!("{node}@{uid}#{}", &config_hash[..16])
 }
 
+/// Config keys that only hold credentials. They are left out of the identity,
+/// so rotated credentials do not count as another destination.
+fn is_credential_key(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    [
+        "secret",
+        "password",
+        "token",
+        "credential",
+        "access_key",
+        "account_key",
+        "sas",
+        "private_key",
+        "key_id",
+    ]
+    .iter()
+    .any(|word| key.contains(word))
+}
+
+/// Identity of a DataNode as a write-back destination: its UID, backend and the
+/// effective configuration (spec and secret merged) without credential keys.
+/// Destination settings from a secret (like bucket, root or endpoint) count.
+fn identity(
+    node: &DataNodeRef,
+    uid: &str,
+    backend: &crate::resource::crd::Backend,
+    cfg: &std::collections::HashMap<String, String>,
+) -> String {
+    let destination: std::collections::HashMap<String, String> = cfg
+        .iter()
+        .filter(|(k, _)| !is_credential_key(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    cache_scope(node, uid, backend, &destination)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::resource::crd::Backend;
     use std::collections::HashMap;
+
+    #[test]
+    fn identity_follows_the_destination_but_not_the_credentials() {
+        let node = DataNodeRef {
+            name: "store".into(),
+            namespace: "team".into(),
+        };
+        let merged = |bucket: &str, secret: &str| {
+            HashMap::from([
+                ("bucket".to_string(), bucket.to_string()),
+                ("access_key_id".to_string(), "AKIA".to_string()),
+                ("secret_access_key".to_string(), secret.to_string()),
+                ("session_token".to_string(), secret.to_string()),
+            ])
+        };
+        let base = identity(&node, "uid", &Backend::S3, &merged("a", "s1"));
+        // Rotated credentials keep the identity.
+        assert_eq!(
+            base,
+            identity(&node, "uid", &Backend::S3, &merged("a", "s2"))
+        );
+        // A bucket set in the secret changes it.
+        assert_ne!(
+            base,
+            identity(&node, "uid", &Backend::S3, &merged("b", "s1"))
+        );
+        assert!(is_credential_key("account_key"));
+        assert!(!is_credential_key("root"));
+        assert!(!is_credential_key("endpoint"));
+        assert!(!is_credential_key("account_name"));
+    }
 
     #[test]
     fn cache_scope_changes_with_uid_and_config() {

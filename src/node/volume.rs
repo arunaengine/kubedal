@@ -161,6 +161,34 @@ impl VolumeManager {
             .map_err(|e| io_status(e, "save volume state"))
     }
 
+    /// Run [`VolumeManager::publish`] in its own task and wait for it.
+    ///
+    /// If the caller stops waiting (for example a gRPC call that kubelet cancels
+    /// after a timeout), the work still runs to its end. So the volume stays
+    /// marked as busy until all started work, including blocking copies, is done,
+    /// and a retry cannot run on top of it.
+    pub async fn publish_detached(self: &Arc<Self>, req: PublishRequest) -> Result<(), Status> {
+        let manager = self.clone();
+        tokio::spawn(async move { manager.publish(req).await })
+            .await
+            .map_err(|e| Status::internal(format!("publish task failed: {e}")))?
+    }
+
+    /// Run [`VolumeManager::unpublish`] in its own task and wait for it.
+    /// See [`VolumeManager::publish_detached`].
+    pub async fn unpublish_detached(
+        self: &Arc<Self>,
+        volume_id: &str,
+        target_path: &Path,
+    ) -> Result<(), Status> {
+        let manager = self.clone();
+        let volume_id = volume_id.to_string();
+        let target_path = target_path.to_path_buf();
+        tokio::spawn(async move { manager.unpublish(&volume_id, &target_path).await })
+            .await
+            .map_err(|e| Status::internal(format!("unpublish task failed: {e}")))?
+    }
+
     pub async fn publish(&self, req: PublishRequest) -> Result<(), Status> {
         let target = req.target_path.to_string_lossy().to_string();
         let id = publish_id(&req.volume_id, &target);

@@ -274,3 +274,36 @@ async fn unpublish_of_unknown_volume_succeeds() {
     env.manager.unpublish("nothing", &target).await.unwrap();
     assert!(!target.exists());
 }
+
+#[tokio::test]
+async fn cancelled_publish_still_finishes_its_work() {
+    let env = Env::new();
+    env.add_store(None, false);
+    let target = env.target("p1");
+    let manager = std::sync::Arc::new(env.manager);
+    let req = tree_request("vol-1", &target, "data", TreeMode::Cache, false);
+
+    // The caller gives up at once, like a gRPC call that kubelet cancels.
+    let _ = tokio::time::timeout(
+        std::time::Duration::ZERO,
+        manager.publish_detached(req.clone()),
+    )
+    .await;
+
+    // The work goes on to the end, so the volume ends up published.
+    let id = publish_id("vol-1", &target.to_string_lossy());
+    for _ in 0..200 {
+        if manager
+            .state()
+            .load(&id)
+            .unwrap()
+            .is_some_and(|r| r.phase == Phase::Published)
+        {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+    let record = manager.state().load(&id).unwrap().unwrap();
+    assert_eq!(record.phase, Phase::Published);
+    manager.publish_detached(req).await.unwrap();
+}

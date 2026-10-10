@@ -155,7 +155,7 @@ impl Node for NodeService {
             request.target_path
         );
         self.manager
-            .publish(PublishRequest {
+            .publish_detached(PublishRequest {
                 volume_id: request.volume_id,
                 target_path: PathBuf::from(request.target_path),
                 read_only: request.readonly,
@@ -185,7 +185,7 @@ impl Node for NodeService {
             request.target_path
         );
         self.manager
-            .unpublish(&request.volume_id, &PathBuf::from(request.target_path))
+            .unpublish_detached(&request.volume_id, &PathBuf::from(request.target_path))
             .await?;
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }

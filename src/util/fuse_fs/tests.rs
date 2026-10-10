@@ -285,3 +285,56 @@ async fn renaming_a_folder_without_native_rename_asks_for_a_copy() {
         .unwrap_err();
     assert_eq!(err, Errno::from(libc::EXDEV));
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn rename_racing_the_last_release_never_loses_data() {
+    let fs = fs_with("other", "").await;
+    for i in 0..30 {
+        let (a, b) = (format!("a{i}"), format!("b{i}"));
+        let w = create(&fs, &a).await;
+        let pa = format!("/{a}");
+        let p = Some(OsStr::new(&pa));
+        fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
+        let (released, renamed) = tokio::join!(
+            fs.release(req(), p, w, 0, 0, false),
+            fs.rename(
+                req(),
+                OsStr::new("/"),
+                OsStr::new(&a),
+                OsStr::new("/"),
+                OsStr::new(&b)
+            )
+        );
+        released.unwrap();
+        renamed.unwrap();
+        assert_eq!(fs.op.read(&b).await.unwrap().to_vec(), b"data", "round {i}");
+        assert!(!fs.op.exists(&a).await.unwrap(), "round {i}");
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn truncate_racing_the_last_release_is_never_lost_silently() {
+    let fs = fs_with("other", "").await;
+    for i in 0..30 {
+        let name = format!("t{i}");
+        let path = format!("/{name}");
+        let p = Some(OsStr::new(&path));
+        let w = create(&fs, &name).await;
+        fs.write(req(), p, w, 0, b"12345", 0, 0).await.unwrap();
+        let (released, truncated) = tokio::join!(
+            fs.release(req(), p, w, 0, 0, false),
+            fs.setattr(req(), p, None, size(2))
+        );
+        released.unwrap();
+        let stored = fs.op.read(&name).await.unwrap().to_vec();
+        match truncated {
+            // The truncate reached the content before the upload.
+            Ok(_) => assert_eq!(stored, b"12", "round {i}"),
+            // The file was already closed; the truncate says it could not work.
+            Err(err) => {
+                assert_eq!(err, Errno::from(libc::EOPNOTSUPP), "round {i}");
+                assert_eq!(stored, b"12345", "round {i}");
+            }
+        }
+    }
+}

@@ -20,6 +20,7 @@ pub struct ResolvedNode {
     pub read_only: bool,
     factory: OperatorFactory,
     cache_scope: String,
+    identity: String,
 }
 
 impl ResolvedNode {
@@ -30,12 +31,40 @@ impl ResolvedNode {
         factory: OperatorFactory,
     ) -> Self {
         let cache_scope = node.to_string();
+        let identity = node.to_string();
         Self {
             node,
             limit,
             read_only,
             factory,
             cache_scope,
+            identity,
+        }
+    }
+
+    /// Set the identity of the DataNode object: its UID and a hash of its
+    /// backend and non-secret configuration. Output is only written back to a
+    /// DataNode with the identity it had when the volume was published.
+    pub fn with_identity(mut self, identity: String) -> Self {
+        self.identity = identity;
+        self
+    }
+
+    pub fn identity(&self) -> &str {
+        &self.identity
+    }
+
+    /// Fail if the DataNode is not the one a volume was published with.
+    pub fn require_identity(&self, expected: Option<&str>) -> Result<(), Status> {
+        match expected {
+            Some(expected) if expected != self.identity => {
+                Err(Status::failed_precondition(format!(
+                    "DataNode {} was replaced or reconfigured since the volume was published; \
+                     the output is kept on the node",
+                    self.node
+                )))
+            }
+            _ => Ok(()),
         }
     }
 

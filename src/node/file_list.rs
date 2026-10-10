@@ -83,15 +83,14 @@ impl VolumeManager {
                         .clone()
                         .unwrap_or_else(|| pod.namespace.clone()),
                 };
-                self.cluster()
-                    .resolve(&target, pod)
-                    .await?
-                    .require_writable()?;
+                let resolved_upload = self.cluster().resolve(&target, pod).await?;
+                resolved_upload.require_writable()?;
                 Some(UploadPlan {
                     data_node: target,
                     prefix: up.prefix.clone(),
                     local_path: up.path.clone(),
                     only_changed: false,
+                    data_node_identity: Some(resolved_upload.identity().to_string()),
                 })
             }
         };

@@ -62,10 +62,10 @@ async fn failed_upload_keeps_data_and_is_retried() {
     let id = publish_id("vol-1", &target.to_string_lossy());
     write(&env.manager.data_dir(&id).join("out.txt"), "precious");
 
-    // The DataNode is gone, so the upload fails.
-    env.cluster.remove_node("team", "store");
+    // The DataNode cannot be reached, so the upload fails.
+    env.cluster.set_unreachable("team", "store", true);
     let err = env.manager.unpublish("vol-1", &target).await.unwrap_err();
-    assert_eq!(err.code(), Code::NotFound);
+    assert_eq!(err.code(), Code::Unavailable);
     assert!(env.manager.data_dir(&id).join("out.txt").exists());
     let record = env.manager.state().load(&id).unwrap().unwrap();
     assert_eq!(record.phase, Phase::Unpublishing);
@@ -78,15 +78,7 @@ async fn failed_upload_keeps_data_and_is_retried() {
     assert_eq!(err.code(), Code::FailedPrecondition);
 
     // The DataNode is back, kubelet retries the unpublish.
-    env.cluster.add_node(
-        "team",
-        "store",
-        FakeNode {
-            root: bucket.clone(),
-            limit: None,
-            read_only: false,
-        },
-    );
+    env.cluster.set_unreachable("team", "store", false);
     env.manager.unpublish("vol-1", &target).await.unwrap();
     assert_eq!(
         std::fs::read_to_string(bucket.join("data/out.txt")).unwrap(),
@@ -112,19 +104,11 @@ async fn upload_survives_a_restart_between_retries() {
         .unwrap();
     let id = publish_id("vol-1", &target.to_string_lossy());
     write(&env.manager.data_dir(&id).join("out.txt"), "precious");
-    env.cluster.remove_node("team", "store");
+    env.cluster.set_unreachable("team", "store", true);
     assert!(env.manager.unpublish("vol-1", &target).await.is_err());
 
     env.restart();
-    env.cluster.add_node(
-        "team",
-        "store",
-        FakeNode {
-            root: bucket.clone(),
-            limit: None,
-            read_only: false,
-        },
-    );
+    env.cluster.set_unreachable("team", "store", false);
     env.manager.unpublish("vol-1", &target).await.unwrap();
     assert!(bucket.join("data/out.txt").exists());
 }
@@ -173,4 +157,45 @@ async fn fuse_spool_files_are_uploaded_on_unpublish() {
         "from the spool"
     );
     assert!(!env.manager.volume_dir(&id).exists());
+}
+
+#[tokio::test]
+async fn output_is_never_sent_to_a_replaced_data_node() {
+    let env = Env::new();
+    env.add_store(None, false);
+    let target = env.target("p1");
+    env.manager
+        .publish(tree_request(
+            "vol-1",
+            &target,
+            "data",
+            TreeMode::Cache,
+            true,
+        ))
+        .await
+        .unwrap();
+    let id = publish_id("vol-1", &target.to_string_lossy());
+    write(&env.manager.data_dir(&id).join("out.txt"), "precious");
+
+    // The DataNode is deleted and created again with the same name, but it is a
+    // new object (new UID) pointing to other storage.
+    let other = env.dir.path().join("other-storage");
+    env.cluster.remove_node("team", "store");
+    env.cluster.add_node(
+        "team",
+        "store",
+        FakeNode {
+            root: other.clone(),
+            limit: None,
+            read_only: false,
+        },
+    );
+    let err = env.manager.unpublish("vol-1", &target).await.unwrap_err();
+    assert_eq!(err.code(), Code::FailedPrecondition);
+    assert!(env.manager.data_dir(&id).join("out.txt").exists());
+    assert!(!other.join("data/out.txt").exists());
+    assert_eq!(
+        env.cluster.events().last().unwrap().reason,
+        "VolumeUploadFailed"
+    );
 }

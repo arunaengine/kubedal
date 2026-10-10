@@ -331,6 +331,7 @@ impl VolumeManager {
                                 prefix: prefix.clone(),
                                 local_path: String::new(),
                                 only_changed: false,
+                                data_node_identity: Some(resolved.identity().to_string()),
                             });
                         }
                         transfer::create_dir_all(&req.target_path).await?;
@@ -379,6 +380,7 @@ impl VolumeManager {
                 prefix: tree.base.clone(),
                 local_path: String::new(),
                 only_changed: true,
+                data_node_identity: Some(resolved.identity().to_string()),
             });
         }
 
@@ -499,6 +501,7 @@ impl VolumeManager {
     ) -> Result<UploadReport, Status> {
         let resolved = self.cluster.resolve(&plan.data_node, &record.pod).await?;
         resolved.require_writable()?;
+        resolved.require_identity(plan.data_node_identity.as_deref())?;
         if record.mode == VolumeMode::Fuse {
             // FUSE writes went to storage already; only spool files are left.
             let op = resolved.operator(&plan.prefix)?;

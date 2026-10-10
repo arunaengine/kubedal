@@ -37,6 +37,7 @@ pub struct FakeCluster {
     /// DataNodes with the UID they got when they were added.
     nodes: Mutex<HashMap<DataNodeRef, (FakeNode, String)>>,
     allowed: Mutex<Vec<(String, DataNodeRef)>>,
+    unreachable: Mutex<std::collections::HashSet<DataNodeRef>>,
     events: Mutex<Vec<RecordedEvent>>,
 }
 
@@ -86,6 +87,20 @@ impl FakeCluster {
             .remove(&key);
     }
 
+    /// Make a DataNode fail to resolve (or work again), like a broken API server.
+    pub fn set_unreachable(&self, namespace: &str, name: &str, unreachable: bool) {
+        let key = DataNodeRef {
+            name: name.into(),
+            namespace: namespace.into(),
+        };
+        let mut set = self.unreachable.lock().unwrap_or_else(|p| p.into_inner());
+        if unreachable {
+            set.insert(key);
+        } else {
+            set.remove(&key);
+        }
+    }
+
     /// Let pods in `pod_namespace` use a DataNode in another namespace.
     pub fn allow(&self, pod_namespace: &str, node: DataNodeRef) {
         self.allowed
@@ -125,6 +140,16 @@ impl Cluster for FakeCluster {
             .cloned()
             .ok_or_else(|| Status::not_found(format!("DataNode {node} not found")))?;
         let scope = self.cache_scope(&node.namespace, &node.name);
+        if self
+            .unreachable
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .contains(node)
+        {
+            return Err(Status::unavailable(format!(
+                "DataNode {node} is not reachable"
+            )));
+        }
         let root = fake.root.clone();
         let factory = Arc::new(move |sub: &str| {
             let dir = root.join(sub.trim_matches('/'));
@@ -134,7 +159,8 @@ impl Cluster for FakeCluster {
         });
         Ok(
             ResolvedNode::new(node.clone(), fake.limit, fake.read_only, factory)
-                .with_cache_scope(scope),
+                .with_cache_scope(scope.clone())
+                .with_identity(scope),
         )
     }
 

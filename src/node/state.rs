@@ -67,6 +67,10 @@ pub struct UploadPlan {
     /// Only upload files that are new or changed since the volume was prepared.
     #[serde(default)]
     pub only_changed: bool,
+    /// Identity of the DataNode at publish time (UID and configuration hash).
+    /// Write-back refuses a DataNode with another identity.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data_node_identity: Option<String>,
 }
 
 /// Everything kubedal remembers about one published volume.
@@ -188,6 +192,7 @@ pub(crate) mod tests {
                 prefix: "out/".into(),
                 local_path: String::new(),
                 only_changed: true,
+                data_node_identity: None,
             }),
         }
     }

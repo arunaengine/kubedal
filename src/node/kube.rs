@@ -99,7 +99,14 @@ impl Cluster for KubeCluster {
 
         let cfg = data_node_config(&self.client, &data_node).await?;
         let backend = data_node.spec.backend.clone();
-        let cache_scope = cache_scope(
+        // The identity leaves out secret values, so rotated credentials keep it.
+        let identity = cache_scope(
+            node,
+            data_node.metadata.uid.as_deref().unwrap_or_default(),
+            &data_node.spec.backend,
+            &data_node.spec.config,
+        );
+        let scope = cache_scope(
             node,
             data_node.metadata.uid.as_deref().unwrap_or_default(),
             &backend,
@@ -111,7 +118,8 @@ impl Cluster for KubeCluster {
 
         Ok(
             ResolvedNode::new(node.clone(), limit, data_node.spec.read_only, factory)
-                .with_cache_scope(cache_scope),
+                .with_cache_scope(scope)
+                .with_identity(identity),
         )
     }
 

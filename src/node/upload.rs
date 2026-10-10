@@ -20,12 +20,19 @@ use tonic::Status;
 /// Size of one upload part and of one read from disk.
 const CHUNK_SIZE: usize = 8 * 1024 * 1024;
 
-/// Size and modification time of a local file. Directories have no stamp values.
+/// Size, times and inode of a local file. Directories have no stamp values.
+///
+/// A program can set the modification time back, but not the change time
+/// (ctime), so a file only counts as unchanged if all values match.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct FileStamp {
     pub size: u64,
     pub mtime_ns: i128,
+    #[serde(default)]
+    pub ctime_ns: i128,
+    #[serde(default)]
+    pub inode: u64,
     #[serde(default)]
     pub dir: bool,
 }
@@ -106,6 +113,8 @@ pub fn snapshot_fd(root: &OwnedFd) -> std::io::Result<Baseline> {
                         FileStamp {
                             size: 0,
                             mtime_ns: 0,
+                            ctime_ns: 0,
+                            inode: 0,
                             dir: true,
                         },
                     );
@@ -119,6 +128,9 @@ pub fn snapshot_fd(root: &OwnedFd) -> std::io::Result<Baseline> {
                             size: stat.st_size as u64,
                             mtime_ns: i128::from(stat.st_mtime) * 1_000_000_000
                                 + i128::from(stat.st_mtime_nsec),
+                            ctime_ns: i128::from(stat.st_ctime) * 1_000_000_000
+                                + i128::from(stat.st_ctime_nsec),
+                            inode: stat.st_ino,
                             dir: false,
                         },
                     );
@@ -188,8 +200,8 @@ pub struct UploadReport {
 
 /// Upload everything below `folder` in `volume` to `prefix` in the operator.
 ///
-/// With a baseline, files with the same size and modification time as in the
-/// baseline are skipped. Empty directories are created as directory objects.
+/// With a baseline, files whose stamp (size, times and inode) did not change are
+/// skipped. Empty directories are created as directory objects.
 /// Files that were deleted locally are not deleted in storage.
 pub async fn upload_tree(
     op: &Operator,
@@ -400,6 +412,30 @@ mod tests {
         assert!(op.exists("changed.txt").await.unwrap());
         assert!(op.exists("new.txt").await.unwrap());
         assert!(!op.exists("same.txt").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn same_size_and_old_mtime_still_counts_as_changed() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("f.txt");
+        write(&path, "aaaa");
+        let mtime = std::fs::metadata(&path).unwrap().modified().unwrap();
+        let baseline = snapshot(dir.path()).unwrap();
+        // Replace the bytes with the same size and set the old mtime again.
+        std::thread::sleep(Duration::from_millis(20));
+        std::fs::write(&path, "bbbb").unwrap();
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(mtime)
+            .unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let report = upload_tree(&op, dir.path(), "", "", Some(&baseline), fast())
+            .await
+            .unwrap();
+        assert_eq!(report.files, 1);
+        assert_eq!(op.read("f.txt").await.unwrap().to_vec(), b"bbbb");
     }
 
     #[tokio::test]

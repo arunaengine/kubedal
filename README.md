@@ -298,7 +298,8 @@ the cache. The least recently used files are removed when the cache grows over
   event on the pod. The pod has to be restarted. Cache volumes are not affected.
 - FUSE read-write mode only supports writing whole files from start to end. Random
   writes do not work. Use `cache-read-write` for normal programs.
-- Write-back uploads new and changed files (compared by size and modification time).
+- Write-back uploads new and changed files (compared by size, modification time,
+  change time and inode).
   Files deleted in the pod are not deleted in storage. Symlinks and special files
   are not uploaded.
 - Object storage does not keep file modes. Cache volumes use 0644 for files and 0755

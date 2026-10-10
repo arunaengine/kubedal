@@ -88,6 +88,9 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyAttr> {
         tracing::debug!("setattr(path={path:?}, fh={fh:?}, set_attr={set_attr:?})");
 
+        if let Some(size) = set_attr.size {
+            self.truncate(path, fh, size).await?;
+        }
         self.getattr(_req, path, fh, 0).await
     }
 

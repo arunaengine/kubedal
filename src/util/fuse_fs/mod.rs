@@ -18,6 +18,8 @@
 mod dir;
 mod file;
 mod ops;
+#[cfg(test)]
+mod tests;
 
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
@@ -63,6 +65,51 @@ pub struct Filesystem {
 }
 
 impl Filesystem {
+    /// Change the size of a file. Object storage cannot change part of an object,
+    /// so only truncating to zero or to the current size is supported. Other sizes
+    /// fail with EOPNOTSUPP instead of claiming success.
+    async fn truncate(&self, path: Option<&OsStr>, fh: Option<u64>, size: u64) -> Result<()> {
+        if let Some(fh) = fh {
+            let writer = self
+                .get_opened_file(FileKey::try_from(fh)?, path)?
+                .inner_writer
+                .clone();
+            if let Some(writer) = writer {
+                // An open writer only supports the size it has written so far.
+                return if writer.lock().await.written == size {
+                    Ok(())
+                } else {
+                    Err(Errno::from(libc::EOPNOTSUPP))
+                };
+            }
+        }
+        let path = match (path, fh) {
+            (Some(path), _) => path.to_string_lossy().to_string(),
+            (None, Some(fh)) => self
+                .get_opened_file(FileKey::try_from(fh)?, None)?
+                .path
+                .to_string_lossy()
+                .to_string(),
+            (None, None) => return Err(Errno::from(libc::EINVAL)),
+        };
+        let current = self
+            .stat_entry(&path)
+            .await
+            .map_err(opendal_error2errno)?
+            .content_length();
+        if size == current {
+            return Ok(());
+        }
+        if size != 0 {
+            return Err(Errno::from(libc::EOPNOTSUPP));
+        }
+        self.op
+            .write(&path, Bytes::new())
+            .await
+            .map_err(opendal_error2errno)?;
+        Ok(())
+    }
+
     /// Stat a path. Object stores often have no object for a folder, so a missing
     /// path is tried again as a folder (with a trailing slash).
     async fn stat_entry(&self, path: &str) -> opendal::Result<Metadata> {

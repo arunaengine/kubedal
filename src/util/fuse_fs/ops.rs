@@ -495,11 +495,26 @@ impl PathFilesystem for Filesystem {
         origin_name: &OsStr,
         parent: &OsStr,
         name: &OsStr,
-        _flags: u32,
+        flags: u32,
     ) -> Result<()> {
         tracing::debug!(
-            "rename2(origin_parent={origin_parent:?}, origin_name={origin_name:?}, parent={parent:?}, name={name:?})"
+            "rename2(origin_parent={origin_parent:?}, origin_name={origin_name:?}, parent={parent:?}, name={name:?}, flags={flags})"
         );
+        match flags {
+            0 => {}
+            libc::RENAME_NOREPLACE => {
+                // Checked before the rename; not atomic against a file created
+                // at the same moment by another program.
+                let path = PathBuf::from(parent).join(name);
+                if self.spool_size(path.as_os_str()).await.is_some()
+                    || self.stat_entry(&key_of(path.as_os_str())).await.is_ok()
+                {
+                    return Err(Errno::from(libc::EEXIST));
+                }
+            }
+            // RENAME_EXCHANGE, RENAME_WHITEOUT and unknown flags.
+            _ => return Err(Errno::from(libc::EINVAL)),
+        }
         self.rename(req, origin_parent, origin_name, parent, name)
             .await
     }

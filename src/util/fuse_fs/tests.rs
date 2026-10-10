@@ -497,3 +497,46 @@ async fn closing_a_retired_file_never_overwrites_a_finished_rename() {
     fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"from a");
 }
+
+#[tokio::test]
+async fn rename2_honors_its_flags() {
+    let fs = fs_with("b", "existing").await;
+    fs.op.write("a", "a").await.unwrap();
+    let root = OsStr::new("/");
+    let err = fs
+        .rename2(
+            req(),
+            root,
+            OsStr::new("a"),
+            root,
+            OsStr::new("b"),
+            libc::RENAME_NOREPLACE,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::EEXIST));
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"existing");
+    let err = fs
+        .rename2(
+            req(),
+            root,
+            OsStr::new("a"),
+            root,
+            OsStr::new("b"),
+            libc::RENAME_EXCHANGE,
+        )
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::EINVAL));
+    fs.rename2(
+        req(),
+        root,
+        OsStr::new("a"),
+        root,
+        OsStr::new("c"),
+        libc::RENAME_NOREPLACE,
+    )
+    .await
+    .unwrap();
+    assert_eq!(fs.op.read("c").await.unwrap().to_vec(), b"a");
+}

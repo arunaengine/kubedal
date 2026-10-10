@@ -768,31 +768,29 @@ async fn failed_closed_file_rename_keeps_the_open_destination() {
 }
 
 #[tokio::test]
-async fn failed_retirement_leaves_a_usable_state() {
+async fn failed_retirement_in_unlink_stops_changes_without_hanging() {
     use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let (fs, op) = fs_in(dir.path()).await;
     let p = Some(OsStr::new("/f"));
     let w = create(&fs, "f").await;
     fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
-    // The journal cannot be removed, so the unlink fails.
+    // The journal cannot be removed after the object was deleted in storage.
     let spool = dir.path().join("spool");
     std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
     let result = fs.unlink(req(), OsStr::new("/"), OsStr::new("f")).await;
     std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
-    assert!(result.is_err());
-    // The state is still alive: a new handle joins it at once (no waiting loop).
-    let w2 = tokio::time::timeout(
+    assert_eq!(result.unwrap_err(), Errno::from(libc::EIO));
+    // Later opens fail at once instead of waiting on a dead state.
+    let open = tokio::time::timeout(
         std::time::Duration::from_secs(5),
         fs.open(req(), OsStr::new("/f"), libc::O_WRONLY as u32),
     )
     .await
-    .expect("open must not hang")
-    .unwrap()
-    .fh;
-    fs.release(req(), p, w2, 0, 0, false).await.unwrap();
-    fs.release(req(), p, w, 0, 0, false).await.unwrap();
-    assert_eq!(op.read("f").await.unwrap().to_vec(), b"data");
+    .expect("open must not hang");
+    assert!(open.is_err());
+    assert!(fs.release(req(), p, w, 0, 0, false).await.is_err());
+    assert!(!op.exists("f").await.unwrap());
 }
 
 #[tokio::test]
@@ -907,4 +905,37 @@ async fn a_failed_folder_sync_during_unlink_stops_all_changes() {
             .unwrap_err(),
         Errno::from(libc::EIO)
     );
+}
+
+#[tokio::test]
+async fn failed_retirement_after_a_closed_file_rename_stops_the_old_destination() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    op.write("a", "SOURCE").await.unwrap();
+    let pb = Some(OsStr::new("/b"));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"OLDDEST", 0, 0).await.unwrap();
+    // The journal of b cannot be removed (a folder in its place).
+    let spool = dir.path().join("spool");
+    let meta = std::fs::read_dir(&spool)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|x| x == "json"))
+        .unwrap();
+    std::fs::remove_file(&meta).unwrap();
+    std::fs::create_dir(&meta).unwrap();
+    let root = OsStr::new("/");
+    assert!(
+        fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+            .await
+            .is_err()
+    );
+    assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
+    // The old destination can never overwrite the rename.
+    assert_eq!(
+        fs.flush(req(), pb, wb, 0).await.unwrap_err(),
+        Errno::from(libc::EIO)
+    );
+    assert!(fs.release(req(), pb, wb, 0, 0, false).await.is_err());
+    assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
 }

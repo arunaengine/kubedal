@@ -798,7 +798,15 @@ impl States {
         };
         let mut data = state.lock().await;
         delete(vec![data.key.clone()]).await?;
-        retire(&state, &mut data).map_err(|e| io_status(e, "remove spool journal"))?;
+        // The object is gone in storage. If the journal cannot be removed, the
+        // name could come back from memory: fail closed.
+        if let Err(err) = retire(&state, &mut data) {
+            mark_broken(
+                &self.broken,
+                &format!("retiring {key} during unlink failed: {err}"),
+            );
+            return Err(broken_status());
+        }
         self.unmap(key, &state);
         Ok(true)
     }
@@ -843,24 +851,27 @@ impl States {
             }
             return Err(io_status(err, "write spool metadata"));
         }
-        let undo = |data: &mut StateData| {
-            if let Err(err) = data.write_meta_for(from) {
-                tracing::error!("cannot restore the journal of {from}: {err}");
-            }
-        };
+        // The journal already names the new key. Any failure from here on has no
+        // clean way back: fail closed, the replay follows the newest journal.
         match op.delete(from).await {
             Ok(()) => {}
             Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
             Err(err) => {
-                undo(&mut src_data);
-                return Err(opendal_status(err, "remove old name"));
+                mark_broken(
+                    &self.broken,
+                    &format!("removing {from} during a rename failed: {err}"),
+                );
+                return Err(broken_status());
             }
         }
         if let (Some(dst), Some(mut dst_data)) = (&dst, dst_data)
             && let Err(err) = retire(dst, &mut dst_data)
         {
-            undo(&mut src_data);
-            return Err(io_status(err, "retire old file"));
+            mark_broken(
+                &self.broken,
+                &format!("retiring {to} during a rename failed: {err}"),
+            );
+            return Err(broken_status());
         }
         // Only now the state changes in memory.
         {
@@ -888,12 +899,21 @@ impl States {
         F: FnOnce() -> Fut,
         Fut: std::future::Future<Output = Result<(), E>>,
     {
+        self.check_broken().map_err(&on_status)?;
         let Some(dst) = self.live(ns, to).await else {
             return backend().await;
         };
         let mut data = dst.lock().await;
         backend().await?;
-        retire(&dst, &mut data).map_err(|e| on_status(io_status(e, "retire old file")))?;
+        // The renamed object is in storage now. If the old file cannot be
+        // retired, it must never upload again: fail closed.
+        if let Err(err) = retire(&dst, &mut data) {
+            mark_broken(
+                &self.broken,
+                &format!("retiring {to} after a rename failed: {err}"),
+            );
+            return Err(on_status(broken_status()));
+        }
         self.unmap(to, &dst);
         Ok(())
     }
@@ -1059,6 +1079,54 @@ mod tests {
         );
         assert_eq!(op.read("a").await.unwrap().to_vec(), b"new");
         assert!(!op.exists("a.tmp").await.unwrap());
+    }
+
+    /// Make the journal of `key` impossible to remove (a folder in its place).
+    fn block_journal(dir: &Path, key: &str) {
+        let meta = std::fs::read_dir(dir)
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .find(|p| {
+                p.extension().is_some_and(|x| x == "json")
+                    && std::fs::read_to_string(p)
+                        .unwrap()
+                        .contains(&format!("\"{key}\""))
+            })
+            .unwrap();
+        std::fs::remove_file(&meta).unwrap();
+        std::fs::create_dir(&meta).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failed_retirement_in_a_live_rename_keeps_the_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        a.lock().await.write_at(b"SOURCE", 0).unwrap();
+        states.upload(&op, &a).await.unwrap();
+        let b = states.open_write(&op, "b", false).await.unwrap();
+        b.lock().await.write_at(b"OLDDEST", 0).unwrap();
+        block_journal(dir.path(), "b");
+        let ns = states.lock_namespace().await;
+        assert!(states.rename(&ns, &op, "a", "b").await.is_err());
+        drop(ns);
+        assert!(states.is_broken());
+        // The release neither uploads nor removes the only copy of the source.
+        assert!(states.release(&op, &a).await.0.is_err());
+        assert!(!a.lock().await.closed);
+        drop((a, b));
+        // Remove the blocked journal folder, then replay: the source wins.
+        for e in std::fs::read_dir(dir.path()).unwrap() {
+            let p = e.unwrap().path();
+            if p.is_dir() {
+                std::fs::remove_dir(&p).unwrap();
+            }
+        }
+        upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
     }
 
     #[tokio::test]

@@ -72,103 +72,116 @@ impl DataReplicaSet {
             .list(&ListParams::default().labels(&selector))
             .await?;
 
-        // Create source DataPod replicas with refs to other DataNodes
-        let existing = drs_data_pods.items.len();
-        if existing >= drs_replicas {
-            //TODO: Check if metadata/spec has changed and patch if necessary (?)
-            //TODO: Scale down when there are more replicas than requested.
-            self.patch_status(&ctx, true).await?;
-            return Ok(Action::requeue(Duration::from_secs(5 * 60)));
-        } else {
-            let dn_api: Api<DataNode> = Api::namespaced(client.clone(), &drs_ns);
+        let dn_api: Api<DataNode> = Api::namespaced(client.clone(), &drs_ns);
+        let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &drs_ns);
+        let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
 
-            // Fetch source DataPod and its DataNode
-            let source_data_pod = dp_api.get(&self.spec.source_pod.name).await?;
-            let source_data_node = dn_api
-                .get(
-                    &source_data_pod
-                        .owner_references()
-                        .first()
-                        .ok_or_else(|| {
-                            Error::ReconcilerError(format!(
-                                "DataPod {} is missing owner ref",
-                                source_data_pod.name_any()
-                            ))
-                        })?
-                        .name,
-                )
-                .await?;
+        // Fetch source DataPod and its DataNode
+        let source_data_pod = dp_api.get(&self.spec.source_pod.name).await?;
+        let source_data_node = dn_api
+            .get(
+                &source_data_pod
+                    .owner_references()
+                    .first()
+                    .ok_or_else(|| {
+                        Error::ReconcilerError(format!(
+                            "DataPod {} is missing owner ref",
+                            source_data_pod.name_any()
+                        ))
+                    })?
+                    .name,
+            )
+            .await?;
 
-            // Fetch other available DataNodes
+        // Create missing replica DataPods on DataNodes that hold no copy yet.
+        //TODO: Scale down when there are more replicas than requested.
+        //TODO: Update the sync pod when the set of replicas changes.
+        let mut replicas = drs_data_pods.items;
+        if replicas.len() < drs_replicas {
+            let used: Vec<String> = replicas
+                .iter()
+                .filter_map(|dp| dp.spec.data_node_ref.as_ref().map(|r| r.name.clone()))
+                .collect();
             let mut available_data_nodes = dn_api
                 .list(&ListParams::default())
                 .await?
                 .into_iter()
                 .filter(|node| node.metadata.uid != source_data_node.metadata.uid)
+                .filter(|node| !used.contains(&node.name_any()))
                 .collect::<Vec<_>>();
-
-            // Do ... stuff
-            let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &drs_ns);
-            let mut replica_resources = vec![];
-            for index in drs_data_pods.items.len()..drs_replicas {
-                match available_data_nodes.pop() {
-                    Some(replica_data_node) => {
-                        let replica_data_pod =
-                            create_replica_data_pod(index, self, &replica_data_node, &dp_api)
-                                .await?;
-                        let replica_pvc = create_replica_pvc(
-                            &replica_data_pod,
-                            &replica_data_node,
-                            self,
-                            MountAccess::FuseReadWrite,
-                            &pvc_api,
-                        )
-                        .await?;
-                        replica_resources.push((replica_data_pod, replica_pvc));
-                    }
-                    None => break,
-                }
+            for index in replicas.len()..drs_replicas {
+                let Some(replica_data_node) = available_data_nodes.pop() else {
+                    warn!("DataReplicaSet {drs_name}: no free DataNode for replica {index}");
+                    break;
+                };
+                replicas
+                    .push(create_replica_data_pod(index, self, &replica_data_node, &dp_api).await?);
             }
+        }
+        if replicas.is_empty() {
+            // Do not start a sync pod without replicas.
+            self.patch_status(&ctx, false).await?;
+            return Ok(Action::requeue(Duration::from_secs(5 * 60)));
+        }
 
-            if replica_resources.is_empty() {
-                // No other DataNode is free. Do not start a sync pod without replicas.
-                warn!(
-                    "DataReplicaSet {drs_name}: no DataNode available for {} more replicas",
-                    drs_replicas - existing
-                );
-                self.patch_status(&ctx, false).await?;
-                return Ok(Action::requeue(Duration::from_secs(5 * 60)));
-            }
-            let created = replica_resources.len();
-
-            // The sync pod only reads from the source.
-            let source_pvc = create_replica_pvc(
-                &source_data_pod,
-                &source_data_node,
+        // Make sure every PVC exists, also when an earlier reconcile failed halfway.
+        let source_ref = Ref {
+            name: source_data_node.name_any(),
+            namespace: source_data_node.namespace(),
+        };
+        let source_pvc = ensure_replica_pvc(
+            &source_data_pod,
+            &source_ref,
+            self,
+            MountAccess::FuseReadOnly,
+            &pvc_api,
+        )
+        .await?;
+        let mut replica_resources = vec![];
+        for replica in replicas {
+            let node_ref = replica.spec.data_node_ref.clone().ok_or_else(|| {
+                Error::ReconcilerError(format!(
+                    "replica DataPod {} has no DataNode",
+                    replica.name_any()
+                ))
+            })?;
+            let pvc = ensure_replica_pvc(
+                &replica,
+                &node_ref,
                 self,
-                MountAccess::FuseReadOnly,
+                MountAccess::FuseReadWrite,
                 &pvc_api,
             )
             .await?;
-
-            //Create Pod with read-only mount to source DataPod and read-write mounts to replica DataPods
-            //TODO: Interval poll source mount for changes and sync to replica mounts
-            let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
-            let pod = create_replica_pod(
-                self,
-                &source_data_pod,
-                &source_pvc,
-                replica_resources,
-                &pod_api,
-            )
-            .await?;
-            info!("Successfully created replica pod: {}", pod.name_any());
-            self.patch_status(&ctx, existing + created >= drs_replicas)
-                .await?;
+            replica_resources.push((replica, pvc));
         }
+        let replica_count = replica_resources.len();
 
-        // Patch status and reschedule reconcile in 5 minutes
-        Ok(Action::requeue(Duration::from_secs(5 * 60)))
+        // Make sure the sync pod exists.
+        //TODO: Interval poll source mount for changes and sync to replica mounts
+        let pod = match pod_api.get_opt(&sync_pod_name(self)).await? {
+            Some(pod) => pod,
+            None => {
+                let pod = create_replica_pod(
+                    self,
+                    &source_data_pod,
+                    &source_pvc,
+                    replica_resources,
+                    &pod_api,
+                )
+                .await?;
+                info!("Created replica sync pod: {}", pod.name_any());
+                pod
+            }
+        };
+
+        let phase = pod.status.as_ref().and_then(|s| s.phase.as_deref());
+        self.patch_status(
+            &ctx,
+            replica_set_available(drs_replicas, replica_count, phase),
+        )
+        .await?;
+        Ok(Action::requeue(Duration::from_secs(60)))
     }
 
     /// Record whether all requested replicas exist.
@@ -254,15 +267,18 @@ async fn create_replica_data_pod(
         .await?)
 }
 
-async fn create_replica_pvc(
+/// Get the PVC of a DataPod in this set, or create it if it is missing.
+async fn ensure_replica_pvc(
     data_pod: &DataPod,
-    data_node: &DataNode,
+    data_node: &Ref,
     data_replica_set: &DataReplicaSet,
     mount_access: MountAccess,
     pvc_api: &Api<PersistentVolumeClaim>,
 ) -> Result<PersistentVolumeClaim, Error> {
-    // Create PVC for source mount
-    let rand_suffix = random_suffix();
+    let name = pvc_name(data_replica_set, data_pod);
+    if let Some(pvc) = pvc_api.get_opt(&name).await? {
+        return Ok(pvc);
+    }
 
     let replica_owner = data_replica_set.owner_ref(&()).ok_or_else(|| {
         Error::ReconcilerError(format!(
@@ -273,26 +289,22 @@ async fn create_replica_pvc(
 
     let pvc = PersistentVolumeClaim {
         metadata: ObjectMeta {
-            name: Some(format!(
-                "pvc-{}-{}",
-                data_replica_set
-                    .metadata
-                    .uid
-                    .clone()
-                    .unwrap_or(data_replica_set.name_any()),
-                rand_suffix
-            )),
+            name: Some(name),
             namespace: data_replica_set.namespace(),
             owner_references: Some(vec![replica_owner.clone()]),
             annotations: Some(
                 vec![
                     (
                         "kubedal.arunaengine.org/data-node-name".to_string(),
-                        data_node.name_any(),
+                        data_node.name.clone(),
                     ),
                     (
                         "kubedal.arunaengine.org/data-node-namespace".to_string(),
-                        data_node.metadata.namespace.clone().unwrap_or_default(),
+                        data_node
+                            .namespace
+                            .clone()
+                            .or_else(|| data_pod.metadata.namespace.clone())
+                            .unwrap_or_default(),
                     ),
                     (
                         "kubedal.arunaengine.org/data-pod-name".to_string(),
@@ -338,8 +350,6 @@ async fn create_replica_pod(
     replica_resources: Vec<(DataPod, PersistentVolumeClaim)>,
     pod_api: &Api<Pod>,
 ) -> Result<Pod, Error> {
-    let rand_suffix = random_suffix();
-
     let replica_owner = data_replica_set.owner_ref(&()).ok_or_else(|| {
         Error::ReconcilerError(format!(
             "Failed to create owner ref from DataReplicaSet: {}",
@@ -424,7 +434,7 @@ async fn create_replica_pod(
 
     let pod = Pod {
         metadata: ObjectMeta {
-            name: Some(format!("{}-{}", data_replica_set.name_any(), rand_suffix)),
+            name: Some(sync_pod_name(data_replica_set)),
             namespace: data_replica_set.namespace(),
             owner_references: Some(vec![replica_owner]),
             labels: None,      //TODO
@@ -442,7 +452,32 @@ async fn create_replica_pod(
     Ok(pod_api.create(&PostParams::default(), &pod).await?)
 }
 
-/// Short random lowercase suffix for generated resource names.
-fn random_suffix() -> String {
-    uuid::Uuid::new_v4().simple().to_string()[..8].to_string()
+/// Name of the PVC for a DataPod of this set. Fixed names let a later reconcile
+/// find the PVCs and create the ones that are missing.
+fn pvc_name(data_replica_set: &DataReplicaSet, data_pod: &DataPod) -> String {
+    format!("{}-{}", data_replica_set.name_any(), data_pod.name_any())
+}
+
+/// Name of the sync pod of this set.
+fn sync_pod_name(data_replica_set: &DataReplicaSet) -> String {
+    format!("{}-sync", data_replica_set.name_any())
+}
+
+/// The set is available when all replicas exist and the sync pod runs.
+fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option<&str>) -> bool {
+    replicas >= desired && sync_pod_phase == Some("Running")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn available_needs_all_replicas_and_a_running_sync_pod() {
+        assert!(replica_set_available(2, 2, Some("Running")));
+        assert!(!replica_set_available(2, 1, Some("Running")));
+        assert!(!replica_set_available(2, 2, Some("Pending")));
+        assert!(!replica_set_available(2, 2, Some("Failed")));
+        assert!(!replica_set_available(2, 2, None));
+    }
 }

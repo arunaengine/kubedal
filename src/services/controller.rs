@@ -104,7 +104,7 @@ impl Controller for ControllerService {
         );
 
         // Create a new volume entry
-        let volume_id = format!("kubedal-{}", uuid::Uuid::new_v4());
+        let volume_id = volume_id_for(&request.name, &request.parameters);
         let capacity_bytes = request
             .capacity_range
             .map_or(5 * 1024 * 1024 * 1024, |range| range.required_bytes);
@@ -279,6 +279,27 @@ impl Controller for ControllerService {
     }
 }
 
+/// The volume ID for a CreateVolume request. It only depends on the request
+/// name and parameters, so retries, overlapping calls and calls after a restart
+/// all get the same ID.
+fn volume_id_for(name: &str, parameters: &HashMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<_> = parameters.iter().collect();
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    for (key, value) in entries {
+        hasher.update([0u8]);
+        hasher.update(key.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(value.as_bytes());
+    }
+    format!(
+        "kubedal-{}",
+        &crate::node::paths::to_hex(&hasher.finalize())[..32]
+    )
+}
+
 /// Find the PVC that a CreateVolume call is for.
 ///
 /// With the csi-provisioner flag `--extra-create-metadata`, the parameters hold the
@@ -378,6 +399,16 @@ mod tests {
             ),
             ..Default::default()
         }
+    }
+
+    #[test]
+    fn volume_id_is_stable_per_request() {
+        let params = HashMap::from([("a".to_string(), "1".to_string())]);
+        let id = volume_id_for("pvc-1", &params);
+        assert_eq!(id, volume_id_for("pvc-1", &params.clone()));
+        assert_ne!(id, volume_id_for("pvc-2", &params));
+        assert_ne!(id, volume_id_for("pvc-1", &HashMap::new()));
+        assert!(id.starts_with("kubedal-"));
     }
 
     #[test]

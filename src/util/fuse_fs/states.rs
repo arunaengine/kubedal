@@ -735,16 +735,28 @@ impl States {
         Ok(true)
     }
 
-    /// Retire the live state of `key`, because another file takes its name (a
-    /// rename of a closed file onto it). Its handles keep working, but it never
-    /// uploads under that name again.
-    pub async fn retire(&self, ns: &NsGuard<'_>, key: &str) -> Result<(), Status> {
-        let Some(state) = self.live(ns, key).await else {
-            return Ok(());
+    /// Rename a closed file onto `to` with `backend` (a storage rename or copy).
+    /// A live state at `to` stays locked during `backend`, so it cannot upload in
+    /// between, and it is retired only if `backend` succeeds. On failure nothing
+    /// changes.
+    pub async fn rename_closed<F, Fut, E>(
+        &self,
+        ns: &NsGuard<'_>,
+        to: &str,
+        backend: F,
+        on_status: impl Fn(Status) -> E,
+    ) -> Result<(), E>
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = Result<(), E>>,
+    {
+        let Some(dst) = self.live(ns, to).await else {
+            return backend().await;
         };
-        let mut data = state.lock().await;
-        retire(&state, &mut data).map_err(|e| io_status(e, "retire old file"))?;
-        self.unmap(key, &state);
+        let mut data = dst.lock().await;
+        backend().await?;
+        retire(&dst, &mut data).map_err(|e| on_status(io_status(e, "retire old file")))?;
+        self.unmap(to, &dst);
         Ok(())
     }
 }

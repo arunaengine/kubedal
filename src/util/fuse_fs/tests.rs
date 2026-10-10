@@ -746,3 +746,23 @@ async fn rename_with_a_failing_journal_changes_nothing() {
     fs.release(req(), pa, w, 0, 0, false).await.unwrap();
     assert_eq!(op.read("a").await.unwrap().to_vec(), b"data!");
 }
+
+#[tokio::test]
+async fn failed_closed_file_rename_keeps_the_open_destination() {
+    let fs = fs_with("other", "").await;
+    let pb = Some(OsStr::new("/b"));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"pending edits", 0, 0)
+        .await
+        .unwrap();
+    // The source does not exist, so the rename fails.
+    let root = OsStr::new("/");
+    let err = fs
+        .rename(req(), root, OsStr::new("missing"), root, OsStr::new("b"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOENT));
+    // The open destination keeps its pending edits and uploads them.
+    fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"pending edits");
+}

@@ -220,17 +220,25 @@ impl PathFilesystem for Filesystem {
             return Ok(());
         }
 
-        // A file open under the new name loses it; it must never upload over
-        // the renamed file later.
-        self.states.retire(&ns, &to).await.map_err(status_errno)?;
-        if self.op.info().capability().rename {
-            return self
-                .op
-                .rename(&from, &to)
-                .await
-                .map_err(opendal_error2errno);
-        }
-        self.rename_by_copy(&from, &to).await
+        // A file open under the new name loses it, but only once the storage
+        // rename worked; it must never upload over the renamed file later.
+        self.states
+            .rename_closed(
+                &ns,
+                &to,
+                || async {
+                    if self.op.info().capability().rename {
+                        return self
+                            .op
+                            .rename(&from, &to)
+                            .await
+                            .map_err(opendal_error2errno);
+                    }
+                    self.rename_by_copy(&from, &to).await
+                },
+                status_errno,
+            )
+            .await
     }
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {

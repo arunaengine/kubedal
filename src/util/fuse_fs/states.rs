@@ -48,9 +48,6 @@ use tonic::Status;
 struct SpoolMeta {
     /// Object key, relative to the root of the FUSE file system.
     key: String,
-    /// Old keys of the content (after renames). They are removed after upload.
-    #[serde(default)]
-    old_keys: Vec<String>,
 }
 
 /// Limits the space all spool files of a node may use.
@@ -118,8 +115,6 @@ pub struct FileState {
 pub struct StateData {
     /// Object key the content belongs to.
     pub key: String,
-    /// Keys the content had before renames. They are removed after the upload.
-    old_keys: Vec<String>,
     file: File,
     data_path: PathBuf,
     meta_path: PathBuf,
@@ -157,7 +152,6 @@ impl StateData {
         self.file.sync_all()?;
         let data = serde_json::to_vec(&SpoolMeta {
             key: self.key.clone(),
-            old_keys: self.old_keys.clone(),
         })
         .map_err(std::io::Error::other)?;
         let tmp = self.meta_path.with_extension("json.tmp");
@@ -228,7 +222,7 @@ impl StateData {
         Ok(())
     }
 
-    /// Upload the content to its key and remove its old keys.
+    /// Upload the content to its key.
     async fn upload(&mut self, op: &Operator) -> Result<(), Status> {
         if !self.dirty {
             return Ok(());
@@ -238,14 +232,6 @@ impl StateData {
                 .map_err(|e| io_status(e, "write spool metadata"))?;
         }
         upload_data_file(op, &self.data_path, &self.key).await?;
-        for old in std::mem::take(&mut self.old_keys) {
-            if let Err(err) = op.delete(&old).await
-                && err.kind() != opendal::ErrorKind::NotFound
-            {
-                self.old_keys.push(old);
-                return Err(opendal_status(err, "remove old name"));
-            }
-        }
         self.dirty = false;
         Ok(())
     }
@@ -358,7 +344,6 @@ impl States {
             unlinked: AtomicBool::new(false),
             data: Mutex::new(StateData {
                 key: key.to_string(),
-                old_keys: Vec::new(),
                 file,
                 data_path,
                 meta_path,
@@ -514,12 +499,9 @@ impl States {
         let Some(mut data) = state.lock_alive().await else {
             return Ok(false);
         };
-        let mut keys = vec![data.key.clone()];
-        keys.extend(data.old_keys.iter().cloned());
-        delete(keys).await?;
+        delete(vec![data.key.clone()]).await?;
         state.unlinked.store(true, Ordering::SeqCst);
         data.dirty = false;
-        data.old_keys.clear();
         if let Err(err) = std::fs::remove_file(&data.meta_path)
             && err.kind() != std::io::ErrorKind::NotFound
         {
@@ -531,14 +513,24 @@ impl States {
     }
 
     /// Rename the live state of `from` to `to`. Returns false if there is none.
-    /// The object under the old name is removed by the next upload.
-    pub async fn rename(&self, from: &str, to: &str) -> std::io::Result<bool> {
+    ///
+    /// The object under the old name is removed from storage right away, while
+    /// the state is locked. Removing it later could remove a new file that was
+    /// created under the old name in the meantime. The content stays in the spool
+    /// and is uploaded under the new name.
+    pub async fn rename(&self, op: &Operator, from: &str, to: &str) -> Result<bool, Status> {
         let Some(state) = self.get(from) else {
             return Ok(false);
         };
         let Some(mut data) = state.lock_alive().await else {
             return Ok(false);
         };
+        self.pause.hit("rename_locked").await;
+        match op.delete(from).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+            Err(err) => return Err(opendal_status(err, "remove old name")),
+        }
         {
             let mut map = self.map();
             if map.get(from).is_some_and(|s| Arc::ptr_eq(s, &state)) {
@@ -549,13 +541,10 @@ impl States {
                 replaced.unlinked.store(true, Ordering::SeqCst);
             }
         }
-        if !data.old_keys.iter().any(|k| k == from) {
-            data.old_keys.push(from.to_string());
-        }
-        data.old_keys.retain(|k| k != to);
         data.key = to.to_string();
         data.dirty = true;
-        data.write_meta()?;
+        data.write_meta()
+            .map_err(|e| io_status(e, "write spool metadata"))?;
         Ok(true)
     }
 }
@@ -590,13 +579,6 @@ pub async fn upload_pending(op: &Operator, dir: &Path) -> Result<usize, Status> 
             Err(err) => return Err(io_status(err, "read spool metadata")),
         };
         upload_data_file(op, data_path, &meta.key).await?;
-        for old in &meta.old_keys {
-            match op.delete(old).await {
-                Ok(()) => {}
-                Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
-                Err(err) => return Err(opendal_status(err, "remove old name")),
-            }
-        }
         let _ = std::fs::remove_file(&meta_path);
         let _ = std::fs::remove_file(data_path);
         uploaded += 1;
@@ -682,7 +664,7 @@ mod tests {
         let states = states(dir.path());
         let joined = states.open_write(&op, "a.tmp", false).await.unwrap();
         joined.lock().await.write_at(b"new", 0).unwrap();
-        assert!(states.rename("a.tmp", "a").await.unwrap());
+        assert!(states.rename(&op, "a.tmp", "a").await.unwrap());
         drop(states);
         // The driver stopped before the upload. Replay uploads and cleans up.
         assert_eq!(upload_pending(&op, dir.path()).await.unwrap(), 1);
@@ -718,7 +700,7 @@ mod tests {
         assert!(result.is_ok());
         // The last release won the race: rename finds no live state, so the
         // caller renames the uploaded object instead.
-        assert!(!states.rename("a", "b").await.unwrap());
+        assert!(!states.rename(&op, "a", "b").await.unwrap());
         assert_eq!(op.read("a").await.unwrap().to_vec(), b"data");
     }
 

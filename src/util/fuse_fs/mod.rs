@@ -293,12 +293,12 @@ impl Filesystem {
     }
 
     /// Move the live state of `from` to `to`, if `from` has one. The old object
-    /// is removed by the next upload.
+    /// is removed right away.
     async fn rename_state(&self, from: &OsStr, to: &OsStr) -> Result<bool> {
         self.states
-            .rename(&key_of(from), &key_of(to))
+            .rename(&self.op, &key_of(from), &key_of(to))
             .await
-            .map_err(io_errno)
+            .map_err(status_errno)
     }
 
     /// Rename a closed file on a backend without native rename (S3, GCS, Azure

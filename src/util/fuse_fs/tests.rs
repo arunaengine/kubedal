@@ -411,3 +411,29 @@ async fn writes_past_the_spool_limit_fail_with_enospc() {
     let err = fs.write(req(), p, w, 4, b"5", 0, 0).await.unwrap_err();
     assert_eq!(err, Errno::from(libc::ENOSPC));
 }
+
+#[tokio::test]
+async fn renaming_an_open_file_never_removes_a_later_file_with_the_old_name() {
+    let fs = fs_with("other", "").await;
+    let pa = Some(OsStr::new("/a"));
+    let pb = Some(OsStr::new("/b"));
+    let w = create(&fs, "a").await;
+    fs.write(req(), pa, w, 0, b"moved", 0, 0).await.unwrap();
+    fs.rename(
+        req(),
+        OsStr::new("/"),
+        OsStr::new("a"),
+        OsStr::new("/"),
+        OsStr::new("b"),
+    )
+    .await
+    .unwrap();
+    // A new file gets the old name and is closed first.
+    let w2 = create(&fs, "a").await;
+    fs.write(req(), pa, w2, 0, b"new a", 0, 0).await.unwrap();
+    fs.release(req(), pa, w2, 0, 0, false).await.unwrap();
+    // Closing the renamed file must not touch the new file.
+    fs.release(req(), pb, w, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"new a");
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"moved");
+}

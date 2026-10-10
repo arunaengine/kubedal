@@ -87,9 +87,15 @@ pub fn snapshot_fd(root: &OwnedFd) -> std::io::Result<Baseline> {
             if name_bytes == b"." || name_bytes == b".." {
                 continue;
             }
+            // Object keys are UTF-8. Fail instead of skipping, so the data is kept.
             let Ok(name) = std::str::from_utf8(name_bytes).map(str::to_string) else {
-                tracing::warn!("skipping file with a non UTF-8 name in {prefix:?}");
-                continue;
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    format!(
+                        "file name {:?} in folder {prefix:?} is not UTF-8 and cannot be uploaded",
+                        String::from_utf8_lossy(name_bytes)
+                    ),
+                ));
             };
             let relative = format!("{prefix}{name}");
             let stat = statat(&dir, name.as_str(), AtFlags::SYMLINK_NOFOLLOW)?;
@@ -429,6 +435,20 @@ mod tests {
         assert!(open_upload_root(dir.path(), "out/").unwrap().is_some());
         assert!(open_upload_root(dir.path(), "missing").unwrap().is_none());
         assert!(open_upload_root(dir.path(), "../x").is_err());
+    }
+
+    #[tokio::test]
+    async fn non_utf8_names_fail_the_upload() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let name = std::ffi::OsStr::from_bytes(b"bad\xffname");
+        std::fs::write(dir.path().join(name), "x").unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        assert!(
+            upload_tree(&op, dir.path(), "", "", None, fast())
+                .await
+                .is_err()
+        );
     }
 
     #[tokio::test]

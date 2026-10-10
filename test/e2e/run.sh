@@ -205,6 +205,18 @@ rm u.txt
 printf more >&7
 exec 7>&-
 test ! -e u.txt
+# Write a temp file, close it, then rename it to its final name.
+printf final > result.tmp
+mv result.tmp result.txt
+test ! -e result.tmp
+test "$(cat result.txt)" = final
+# A reader that opens while a writer appends sees the new bytes.
+printf x > ra.txt
+exec 8>>ra.txt
+exec 9<ra.txt
+printf A >&8
+test "$(cat <&9)" = xA
+exec 8>&- 9<&-
 # Append to a large file.
 dd if=/dev/zero of=big.bin bs=1M count=20 2>/dev/null
 printf tail >> big.bin
@@ -213,10 +225,13 @@ echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB
 expect_object results/fuse-ops/t.txt 12
+expect_object results/fuse-ops/result.txt final
+expect_object results/fuse-ops/ra.txt xA
 inline_pod fuse-ops-check "dataNode: store
 path: results/fuse-ops
 mount: cache-read-only" '
 test ! -e /vol/u.txt
+test ! -e /vol/result.tmp
 test "$(stat -c %s /vol/big.bin)" = 20971524
 test "$(tail -c 4 /vol/big.bin)" = tail
 echo ok' | run_pod fuse-ops-check || fail "FUSE results in storage are wrong"

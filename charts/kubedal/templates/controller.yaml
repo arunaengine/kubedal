@@ -56,6 +56,7 @@ spec:
           imagePullPolicy: {{ .Values.image.pullPolicy }}
           args:
             - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
             - --node-id=controller
           env:
             - name: RUST_LOG

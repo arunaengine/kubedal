@@ -53,6 +53,7 @@ spec:
             privileged: true
           args:
             - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
             - --node-id=$(NODE_ID)
             - --data-dir={{ include "kubedal.dataDir" . }}
             - --content-cache-size={{ .Values.node.contentCacheSize }}

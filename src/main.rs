@@ -16,7 +16,8 @@ use tracing_subscriber::EnvFilter;
 use kubedal::services::{ControllerService, IdentityService, NodeService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const NAME: &str = "kubedal.arunaengine.org";
+/// Default CSI driver name. It must match the name of the CSIDriver object.
+const DEFAULT_NAME: &str = "kubedal.arunaengine.org";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
@@ -65,6 +66,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("10Gi")
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("driver-name")
+                .long("driver-name")
+                .help("CSI driver name, must match the CSIDriver object")
+                .default_value(DEFAULT_NAME)
+                .value_parser(clap::value_parser!(String)),
+        )
         .get_matches();
 
     // Both arguments have default values, so they are always present.
@@ -90,7 +98,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
 
     // Create service instances
-    let identity_service = IdentityService::new(NAME, VERSION);
+    let driver_name = matches
+        .get_one::<String>("driver-name")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_NAME.to_string());
+    tracing::info!("Driver name: {}", driver_name);
+    let identity_service = IdentityService::new(&driver_name, VERSION);
 
     // Parse the endpoint
     if !endpoint.starts_with("unix://") {

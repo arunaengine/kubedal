@@ -100,16 +100,35 @@ impl DataReplicaSet {
             .into_iter()
             .filter(|dp| (0..drs_replicas).any(|i| replica_name(&drs_uid, i) == dp.name_any()))
             .collect();
+        let all_nodes = dn_api.list(&ListParams::default()).await?.items;
+
+        // A read-only DataNode cannot hold a replica. Remove replicas on one; they
+        // are created again on a writable DataNode once they are gone.
+        let (on_read_only, kept): (Vec<DataPod>, Vec<DataPod>) = replicas
+            .into_iter()
+            .partition(|dp| on_read_only_node(dp, &all_nodes, &drs_ns));
+        replicas = kept;
+        if !on_read_only.is_empty() {
+            for dp in &on_read_only {
+                info!("Moving replica {} off a read-only DataNode", dp.name_any());
+                let _ = pvc_api
+                    .delete(&pvc_name(self, dp), &Default::default())
+                    .await;
+                dp_api.delete(&dp.name_any(), &Default::default()).await?;
+            }
+            self.patch_status(&ctx, false).await?;
+            return Ok(Action::requeue(Duration::from_secs(10)));
+        }
+
         if !missing.is_empty() {
             let used: Vec<String> = replicas
                 .iter()
                 .filter_map(|dp| dp.spec.data_node_ref.as_ref().map(|r| r.name.clone()))
                 .collect();
-            let mut available_data_nodes = dn_api
-                .list(&ListParams::default())
-                .await?
+            let mut available_data_nodes = all_nodes
                 .into_iter()
                 .filter(|node| node.metadata.uid != source_data_node.metadata.uid)
+                .filter(|node| !node.spec.read_only)
                 .filter(|node| !used.contains(&node.name_any()))
                 .collect::<Vec<_>>();
             for index in missing {
@@ -515,6 +534,19 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
     crate::node::paths::to_hex(&hasher.finalize())[..16].to_string()
 }
 
+/// True if the replica lives on a DataNode (in namespace `ns`) that is read-only.
+fn on_read_only_node(replica: &DataPod, nodes: &[DataNode], ns: &str) -> bool {
+    let Some(node_ref) = replica.spec.data_node_ref.as_ref() else {
+        return false;
+    };
+    let node_ns = node_ref.namespace.as_deref().unwrap_or(ns);
+    nodes.iter().any(|n| {
+        n.name_any() == node_ref.name
+            && n.namespace().as_deref().unwrap_or(ns) == node_ns
+            && n.spec.read_only
+    })
+}
+
 /// The DataNode of the source DataPod, with its namespace filled in.
 fn source_node_ref(source: &DataPod, default_namespace: &str) -> Result<Ref, Error> {
     let node_ref = source.spec.data_node_ref.as_ref().ok_or_else(|| {
@@ -575,6 +607,41 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn replicas_on_read_only_data_nodes_are_found() {
+        use crate::resource::crd::{Backend, DataNodeSpec};
+        let node = |name: &str, read_only: bool| {
+            let mut n = DataNode::new(
+                name,
+                DataNodeSpec {
+                    backend: Backend::S3,
+                    read_only,
+                    secret_ref: None,
+                    config: Default::default(),
+                    limit: None,
+                },
+            );
+            n.metadata.namespace = Some("team".into());
+            n
+        };
+        let nodes = vec![node("ro", true), node("rw", false)];
+        let replica = |node: &str| {
+            DataPod::new(
+                "r",
+                DataPodSpec {
+                    data_node_ref: Some(Ref {
+                        name: node.into(),
+                        namespace: Some("team".into()),
+                    }),
+                    ..Default::default()
+                },
+            )
+        };
+        assert!(on_read_only_node(&replica("ro"), &nodes, "team"));
+        assert!(!on_read_only_node(&replica("rw"), &nodes, "team"));
+        assert!(!on_read_only_node(&replica("missing"), &nodes, "team"));
+    }
 
     #[test]
     fn source_data_node_comes_from_the_reference() {

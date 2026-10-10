@@ -169,8 +169,8 @@ impl DataReplicaSet {
         // Make sure the sync pod exists and mounts exactly the current PVCs.
         //TODO: Interval poll source mount for changes and sync to replica mounts
         let members = members_hash(
-            &source_pvc.name_any(),
-            replica_resources.iter().map(|(_, pvc)| pvc.name_any()),
+            &member_id(&source_data_pod, &source_pvc),
+            replica_resources.iter().map(|(dp, pvc)| member_id(dp, pvc)),
         );
         let pod = match pod_api.get_opt(&sync_pod_name(self)).await? {
             Some(pod) if pod_members(&pod) == Some(members.as_str()) => pod,
@@ -524,6 +524,24 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
     crate::node::paths::to_hex(&hasher.finalize())[..16].to_string()
 }
 
+/// What a sync pod mount depends on: the DataPod object (UID), its DataNode, its
+/// path and the PVC. If any of these change, the sync pod must be recreated.
+fn member_id(data_pod: &DataPod, pvc: &PersistentVolumeClaim) -> String {
+    let node = data_pod
+        .spec
+        .data_node_ref
+        .as_ref()
+        .map(|r| format!("{}/{}", r.namespace.clone().unwrap_or_default(), r.name))
+        .unwrap_or_default();
+    format!(
+        "{}|{}|{}|{}",
+        data_pod.metadata.uid.clone().unwrap_or_default(),
+        node,
+        data_pod.spec.path.clone().unwrap_or_default(),
+        pvc.name_any()
+    )
+}
+
 /// The members hash of a sync pod, if it has one.
 fn pod_members(pod: &Pod) -> Option<&str> {
     pod.metadata
@@ -546,6 +564,39 @@ fn replica_set_available(desired: usize, replicas: usize, sync_pod_phase: Option
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn members_change_when_a_replica_is_recreated_elsewhere() {
+        let pvc = PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some("set-replica-0".into()),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let replica = |uid: &str, node: &str| {
+            let mut dp = DataPod::new(
+                "u-replica-0",
+                DataPodSpec {
+                    path: Some("/u/replica-0".into()),
+                    data_node_ref: Some(Ref {
+                        name: node.into(),
+                        namespace: Some("team".into()),
+                    }),
+                    ..Default::default()
+                },
+            );
+            dp.metadata.uid = Some(uid.into());
+            dp
+        };
+        // Same names, but the replica was deleted and created on another DataNode.
+        let before = member_id(&replica("uid-1", "node-a"), &pvc);
+        let after = member_id(&replica("uid-2", "node-b"), &pvc);
+        assert_ne!(
+            members_hash("src", [before].into_iter()),
+            members_hash("src", [after].into_iter())
+        );
+    }
 
     #[test]
     fn members_hash_changes_with_the_replicas() {

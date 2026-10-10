@@ -31,7 +31,7 @@ see them.
   - `fuse-read-only` and `fuse-read-write`: files are served directly from storage
     through FUSE, without copying.
 - A content cache on each node for file-list volumes: a file with a SHA-256 digest is
-  downloaded once per node, even if many pods use it.
+  downloaded once per node and DataNode, even if many pods use it.
 - A size limit per DataNode (`limit`), checked before and during downloads.
 - Volume state is stored on the node. A restart of the node plugin does not lose
   track of volumes or of pending uploads.
@@ -285,7 +285,8 @@ Rules:
 
 Files with a `sha256` go through a cache on each node, below `node.dataDir`. On a
 miss, the file is downloaded, checked against the digest, made read-only, and stored
-under its digest. Each volume then gets its own copy of the cached file. On file
+under its digest and its DataNode. A cache hit needs the same DataNode, so knowing
+a digest is not enough to get content from another DataNode. Each volume then gets its own copy of the cached file. On file
 systems with reflink support (XFS, Btrfs), this copy shares the data blocks and is
 cheap. Elsewhere it is a normal copy. A pod that writes to its copy cannot change
 the cache. The least recently used files are removed when the cache grows over
@@ -296,8 +297,10 @@ the cache. The least recently used files are removed when the cache grows over
 - **FUSE mounts end when the node plugin restarts**, for example on a DaemonSet
   update. kubedal unmounts the stale mount on start and records a `FuseMountLost`
   event on the pod. The pod has to be restarted. Cache volumes are not affected.
-- FUSE read-write mode only supports writing whole files from start to end. Random
-  writes do not work. Use `cache-read-write` for normal programs.
+- In FUSE read-write mode, a file that is open for writing lives in a local spool
+  file. The whole file is uploaded on every `close` and `fsync`, and upload errors
+  are returned there. Opening an existing file for writing needs `O_TRUNC` or
+  `O_APPEND`. Use `cache-read-write` for programs that write a lot.
 - Write-back uploads new and changed files (compared by size, modification time,
   change time and inode).
   Files deleted in the pod are not deleted in storage. Symlinks and special files

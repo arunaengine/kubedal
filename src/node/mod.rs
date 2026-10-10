@@ -1,6 +1,8 @@
 pub mod cluster;
+pub mod kube;
 pub mod mounter;
 pub mod paths;
+pub mod request;
 pub mod state;
 pub mod testing;
 pub mod transfer;

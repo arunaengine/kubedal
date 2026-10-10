@@ -275,6 +275,8 @@ async fn upload_data_file(op: &Operator, data_path: &Path, key: &str) -> Result<
 
 /// All file states of one FUSE file system.
 pub struct States {
+    /// Pause points for tests that force an order of operations.
+    pub pause: Arc<super::pause::PausePoints>,
     dir: PathBuf,
     budget: Arc<SpoolBudget>,
     next_id: AtomicU64,
@@ -284,6 +286,7 @@ pub struct States {
 impl States {
     pub fn new(dir: PathBuf, budget: Arc<SpoolBudget>) -> Self {
         Self {
+            pause: Arc::default(),
             dir,
             budget,
             next_id: AtomicU64::new(1),

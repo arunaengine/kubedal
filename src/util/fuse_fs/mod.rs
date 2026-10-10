@@ -18,6 +18,7 @@
 mod dir;
 mod file;
 mod ops;
+pub mod pause;
 pub mod states;
 #[cfg(test)]
 mod tests;
@@ -240,6 +241,11 @@ impl Filesystem {
     pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
         self.states = Arc::new(States::new(self.spool_dir.clone(), budget));
         self
+    }
+
+    /// Pause points for tests that force an order of operations.
+    pub fn pause_points(&self) -> Arc<pause::PausePoints> {
+        self.states.pause.clone()
     }
 
     /// The background workers of this file system. Stop them with

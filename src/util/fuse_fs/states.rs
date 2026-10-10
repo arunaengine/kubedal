@@ -48,6 +48,27 @@ use tonic::Status;
 struct SpoolMeta {
     /// Object key, relative to the root of the FUSE file system.
     key: String,
+    /// Generation from a per-volume counter that only grows. Each journal write
+    /// gets a new, higher number. Replay uploads only the newest journal of each
+    /// key; older ones are obsolete.
+    #[serde(default)]
+    generation: u64,
+}
+
+/// Highest journal generation found in `dir`, or 0.
+fn max_generation(dir: &Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return 0;
+    };
+    entries
+        .filter_map(Result::ok)
+        .map(|e| e.path())
+        .filter(|p| p.extension().is_some_and(|x| x == "json"))
+        .filter_map(|p| std::fs::read(p).ok())
+        .filter_map(|data| serde_json::from_slice::<SpoolMeta>(&data).ok())
+        .map(|m| m.generation)
+        .max()
+        .unwrap_or(0)
 }
 
 /// Limits the space all spool files of a node may use.
@@ -199,6 +220,8 @@ pub struct StateData {
     complete: bool,
     /// Bytes charged to the budget for this spool file.
     charged: u64,
+    /// Per-volume journal generation counter (the next free number).
+    generations: Arc<AtomicU64>,
     /// The spool data file was removed from disk.
     data_removed: bool,
     /// Test hook: the next write writes this many bytes and then fails.
@@ -234,8 +257,10 @@ impl StateData {
     /// synced. After a crash the journal is either the old or the new one.
     fn write_meta_for(&mut self, key: &str) -> std::io::Result<()> {
         self.file.sync_all()?;
+        let generation = self.generations.fetch_add(1, Ordering::SeqCst);
         let data = serde_json::to_vec(&SpoolMeta {
             key: key.to_string(),
+            generation,
         })
         .map_err(std::io::Error::other)?;
         let tmp = self.meta_path.with_extension("json.tmp");
@@ -435,11 +460,14 @@ pub struct States {
     dir: PathBuf,
     budget: Arc<SpoolBudget>,
     next_id: AtomicU64,
+    /// Next journal generation. It starts above every journal already on disk.
+    generations: Arc<AtomicU64>,
     map: std::sync::Mutex<HashMap<String, Arc<FileState>>>,
 }
 
 impl States {
     pub fn new(dir: PathBuf, budget: Arc<SpoolBudget>) -> Self {
+        let generations = Arc::new(AtomicU64::new(max_generation(&dir) + 1));
         Self {
             ns: Mutex::new(()),
             pause: Arc::default(),
@@ -447,6 +475,7 @@ impl States {
             dir,
             budget,
             next_id: AtomicU64::new(1),
+            generations,
             map: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -542,6 +571,7 @@ impl States {
                 #[cfg(test)]
                 fail_after: None,
                 budget: self.budget.clone(),
+                generations: self.generations.clone(),
             }),
         });
         // The caller holds the namespace lock, so nobody else adds this key now.
@@ -819,9 +849,11 @@ pub async fn upload_pending(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(io_status(err, "list spool folder")),
     };
-    let mut paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    paths.sort();
-    let mut uploaded = 0;
+    let paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    // Group complete spools by key. Only the newest generation of a key is
+    // uploaded; the order never depends on file names.
+    let mut newest: HashMap<String, (u64, PathBuf)> = HashMap::new();
+    let mut obsolete: Vec<PathBuf> = Vec::new();
     for data_path in paths
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "data"))
@@ -836,9 +868,28 @@ pub async fn upload_pending(
             }
             Err(err) => return Err(io_status(err, "read spool metadata")),
         };
-        upload_data_file(op, data_path, &meta.key).await?;
-        let _ = std::fs::remove_file(&meta_path);
-        remove_and_refund(data_path, budget);
+        match newest.get(&meta.key) {
+            Some((generation, _)) if *generation > meta.generation => {
+                obsolete.push(data_path.clone());
+            }
+            _ => {
+                if let Some((_, older)) =
+                    newest.insert(meta.key.clone(), (meta.generation, data_path.clone()))
+                {
+                    obsolete.push(older);
+                }
+            }
+        }
+    }
+    for data_path in obsolete {
+        let _ = std::fs::remove_file(data_path.with_extension("json"));
+        remove_and_refund(&data_path, budget);
+    }
+    let mut uploaded = 0;
+    for (key, (_, data_path)) in newest {
+        upload_data_file(op, &data_path, &key).await?;
+        let _ = std::fs::remove_file(data_path.with_extension("json"));
+        remove_and_refund(&data_path, budget);
         uploaded += 1;
     }
     for tmp in paths
@@ -1025,6 +1076,52 @@ mod tests {
         // The limit still holds for the other volume.
         let err = b.lock().await.write_at(&[2u8; 61], 40).unwrap_err();
         assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+    }
+
+    fn journal(dir: &Path, name: &str, key: &str, generation: u64, content: &str) {
+        std::fs::write(dir.join(format!("{name}.data")), content).unwrap();
+        let meta = serde_json::json!({"key": key, "generation": generation});
+        std::fs::write(dir.join(format!("{name}.json")), meta.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_uploads_only_the_newest_journal_of_a_key() {
+        // Both file name orders: the newest generation wins either way.
+        for (old_name, new_name) in [("a", "z"), ("z", "a")] {
+            let dir = tempfile::tempdir().unwrap();
+            journal(dir.path(), old_name, "b", 5, "old destination");
+            journal(dir.path(), new_name, "b", 9, "renamed source");
+            let op = Operator::new(Memory::default()).unwrap();
+            let budget = SpoolBudget::new(u64::MAX);
+            budget.reserve(29).unwrap();
+            assert_eq!(upload_pending(&op, dir.path(), &budget).await.unwrap(), 1);
+            assert_eq!(op.read("b").await.unwrap().to_vec(), b"renamed source");
+            let left: Vec<_> = std::fs::read_dir(dir.path())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect();
+            assert!(left.is_empty(), "{left:?}");
+            assert_eq!(budget.used(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn generations_keep_growing_across_restarts() {
+        let dir = tempfile::tempdir().unwrap();
+        journal(dir.path(), "x", "k", 41, "data");
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "new", false).await.unwrap();
+        drop(joined);
+        let generations: Vec<u64> = std::fs::read_dir(dir.path())
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|x| x == "json"))
+            .map(|p| serde_json::from_slice::<SpoolMeta>(&std::fs::read(p).unwrap()).unwrap())
+            .map(|m| m.generation)
+            .collect();
+        assert!(generations.contains(&41));
+        assert!(generations.iter().any(|g| *g > 41));
     }
 
     #[tokio::test]

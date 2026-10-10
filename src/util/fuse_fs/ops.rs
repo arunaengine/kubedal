@@ -204,12 +204,24 @@ impl PathFilesystem for Filesystem {
             None
         };
 
+        let size = if is_read && inner_writer.is_none() {
+            let meta = self
+                .op
+                .stat(&path.to_string_lossy())
+                .await
+                .map_err(opendal_error2errno)?;
+            Some(meta.content_length())
+        } else {
+            None
+        };
+
         let key = self
             .opened_files
             .insert(OpenedFile {
                 path: path.into(),
                 is_read,
                 inner_writer,
+                size,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 
@@ -229,19 +241,22 @@ impl PathFilesystem for Filesystem {
     ) -> Result<ReplyData> {
         tracing::debug!("read(path={path:?}, fh={fh}, offset={offset}, size={size})");
 
-        let file_path = {
+        let (file_path, file_size) = {
             let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
             if !file.is_read {
                 Err(Errno::from(libc::EACCES))?;
             }
-            file.path.to_string_lossy().to_string()
+            (file.path.to_string_lossy().to_string(), file.size)
         };
 
-        let result = self
-            .op
-            .read_with(&file_path)
-            .range(offset..offset.saturating_add(u64::from(size)))
-            .await;
+        let mut end = offset.saturating_add(u64::from(size));
+        if let Some(file_size) = file_size {
+            if offset >= file_size {
+                return Ok(ReplyData { data: Bytes::new() });
+            }
+            end = end.min(file_size);
+        }
+        let result = self.op.read_with(&file_path).range(offset..end).await;
         let data = match result {
             Ok(buffer) => buffer.to_bytes(),
             // A read at or after the end of the file returns no data.
@@ -310,15 +325,25 @@ impl PathFilesystem for Filesystem {
             "release(path={path:?}, fh={fh}, flags=0x{flags:x}, lock_owner={lock_owner}, flush={flush})"
         );
 
-        // Just take and forget it.
-        let _ = self.opened_files.take(FileKey::try_from(fh)?.0);
+        let file = self
+            .opened_files
+            .take(FileKey::try_from(fh)?.0)
+            .ok_or(Errno::from(libc::EBADF))?;
+
+        // Release comes once, after the last file descriptor is closed. Only then
+        // no more writes can follow, so the object is finished here.
+        if let Some(inner_writer) = file.inner_writer {
+            let mut lock = inner_writer.lock().await;
+            if let Err(err) = lock.writer.close().await {
+                tracing::error!("finishing {:?} failed: {err}", file.path);
+                return Err(opendal_error2errno(err));
+            }
+        }
         Ok(())
     }
 
-    /// In design, flush could be called multiple times for a single open. But there is the only
-    /// place that we can handle the write operations.
-    ///
-    /// So we only support the use case that flush only be called once.
+    /// Flush is called on every close of a file descriptor, also for duplicated
+    /// descriptors. More writes can follow, so the writer stays open until release.
     async fn flush(
         &self,
         _req: Request,
@@ -327,22 +352,7 @@ impl PathFilesystem for Filesystem {
         lock_owner: u64,
     ) -> Result<()> {
         tracing::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
-
-        let file = self
-            .opened_files
-            .take(FileKey::try_from(fh)?.0)
-            .ok_or(Errno::from(libc::EBADF))?;
-
-        if let Some(inner_writer) = file.inner_writer {
-            let mut lock = inner_writer.lock().await;
-            let res = lock.writer.close().await.map_err(opendal_error2errno);
-            return res.map(|_| ());
-        }
-
-        if matches!(path, Some(ref p) if p != &file.path) {
-            Err(Errno::from(libc::EBADF))?;
-        }
-
+        self.get_opened_file(FileKey::try_from(fh)?, path)?;
         Ok(())
     }
 
@@ -406,6 +416,7 @@ impl PathFilesystem for Filesystem {
                 path: path.into(),
                 is_read,
                 inner_writer,
+                size: None,
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 

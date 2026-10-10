@@ -31,6 +31,9 @@ pub struct OpenedFile {
     pub path: OsString,
     pub is_read: bool,
     pub inner_writer: Option<Arc<Mutex<InnerWriter>>>,
+    /// Size of the file when it was opened for reading. Reads are limited to it,
+    /// because some backends fail when a range reaches past the end.
+    pub size: Option<u64>,
 }
 
 /// # FIXME

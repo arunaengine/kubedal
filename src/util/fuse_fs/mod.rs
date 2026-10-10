@@ -50,8 +50,10 @@ const TTL: Duration = Duration::from_secs(1); // 1 second
 ///
 /// This code is vendored from the `fuse3_opendal` crate (Apache-2.0), because that
 /// crate does not yet support the OpenDAL and fuse3 versions used by kubedal.
-/// Changes: adapted to opendal 0.59 and fuse3 0.9, and `read` only fetches the
-/// requested byte range instead of the rest of the file.
+/// Changes: adapted to opendal 0.59 and fuse3 0.9; `read` only fetches the
+/// requested byte range and stops at the end of the file; the writer of a file
+/// is finished in `release` instead of `flush`, so writes through duplicated
+/// file descriptors (like shell redirects) work.
 pub struct Filesystem {
     op: Operator,
     gid: u32,

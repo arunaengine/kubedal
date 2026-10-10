@@ -994,3 +994,27 @@ async fn mkdir_and_rmdir_are_refused_after_shutdown() {
     let err = fs.rmdir(req(), root, OsStr::new("dir")).await.unwrap_err();
     assert_eq!(err, Errno::from(libc::ENOTCONN));
 }
+
+#[tokio::test]
+async fn rmdir_sees_files_that_exist_only_in_the_spool() {
+    let fs = fs_with("other", "").await;
+    let w = fs
+        .create(
+            req(),
+            OsStr::new("/dir"),
+            OsStr::new("a"),
+            0o644,
+            WRITE_FLAGS,
+        )
+        .await
+        .unwrap()
+        .fh;
+    let err = fs
+        .rmdir(req(), OsStr::new("/"), OsStr::new("dir"))
+        .await
+        .unwrap_err();
+    assert_eq!(err, Errno::from(libc::ENOTEMPTY));
+    fs.release(req(), Some(OsStr::new("/dir/a")), w, 0, 0, false)
+        .await
+        .unwrap();
+}

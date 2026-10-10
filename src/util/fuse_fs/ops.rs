@@ -205,6 +205,13 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("rmdir(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
+        // A folder with files that exist only in the spool (not uploaded yet) is
+        // not empty; removing it would let their upload create it again.
+        let ns = self.states.lock_namespace().await;
+        let prefix = format!("{}/", key_of(path.as_os_str()));
+        if self.states.has_live_under(&ns, &prefix).await {
+            return Err(Errno::from(libc::ENOTEMPTY));
+        }
         self.op
             .delete(&path.to_string_lossy())
             .await

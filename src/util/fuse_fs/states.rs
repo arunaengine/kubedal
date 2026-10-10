@@ -573,6 +573,22 @@ impl States {
         Ok(())
     }
 
+    /// True if a live state has a key below `prefix` (like `dir/`).
+    pub async fn has_live_under(&self, ns: &NsGuard<'_>, prefix: &str) -> bool {
+        let keys: Vec<String> = self
+            .map()
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect();
+        for key in keys {
+            if self.live(ns, &key).await.is_some() {
+                return true;
+            }
+        }
+        false
+    }
+
     /// Take the namespace lock.
     pub async fn lock_namespace(&self) -> NsGuard<'_> {
         NsGuard(self.ns.lock().await)

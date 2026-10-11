@@ -8,9 +8,11 @@
 //! - `sleep_duration`: seconds to wait between two passes
 //!
 //! Each pass copies new and changed files from the source to every replica.
-//! Files deleted in the source are not deleted in the replicas.
+//! Files deleted in the source are not deleted in the replicas. Symlinks are
+//! never followed, so nothing outside the source is copied.
 
 use std::collections::HashMap;
+use std::os::unix::fs::OpenOptionsExt;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
@@ -79,8 +81,12 @@ fn sync_entry(
     copied: &mut Copied,
     folders: &mut Vec<PathBuf>,
 ) -> std::io::Result<()> {
-    let meta = std::fs::metadata(source.join(path))?;
+    let meta = std::fs::symlink_metadata(source.join(path))?;
     let target = replica.join(path);
+    if meta.file_type().is_symlink() {
+        tracing::warn!("skip symlink {}", path.display());
+        return Ok(());
+    }
     if meta.is_dir() {
         std::fs::create_dir_all(&target)?;
         folders.push(path.to_path_buf());
@@ -111,8 +117,13 @@ fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
     let name = to.file_name().unwrap_or_default().to_string_lossy();
     let temp = to.with_file_name(format!(".{name}.kubedal-copy"));
     let result = (|| {
-        let mut input = std::fs::File::open(from)?;
-        let mut output = std::fs::File::create(&temp)?;
+        let mut input = open_no_follow(from)?;
+        let mut output = std::fs::File::options()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(&temp)?;
         std::io::copy(&mut input, &mut output)?;
         // On kubedal FUSE volumes, fsync and close upload the file, so their
         // errors must count.
@@ -124,6 +135,14 @@ fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Open a file for reading, but fail if it is a symlink.
+fn open_no_follow(path: &Path) -> std::io::Result<std::fs::File> {
+    std::fs::File::options()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)
 }
 
 /// Close a file and report the error of `close`, which dropping a file hides.
@@ -141,7 +160,7 @@ fn close_file(file: std::fs::File) -> std::io::Result<()> {
 /// True if both files have the same bytes.
 fn same_content(a: &Path, b: &Path) -> std::io::Result<bool> {
     use std::io::Read;
-    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut a, mut b) = (open_no_follow(a)?, open_no_follow(b)?);
     let (mut buf_a, mut buf_b) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
     loop {
         let n = a.read(&mut buf_a)?;
@@ -244,6 +263,27 @@ mod tests {
         sync_once(&source, &replica, &mut copied);
         assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"data");
         assert!(copied.contains_key(Path::new("f")));
+    }
+
+    #[test]
+    fn symlinks_are_never_followed() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        let outside = dir.path().join("outside");
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(outside.join("secret"), "secret").unwrap();
+        std::fs::write(source.join("f"), "data").unwrap();
+        std::os::unix::fs::symlink(outside.join("secret"), source.join("file-link")).unwrap();
+        std::os::unix::fs::symlink(&outside, source.join("dir-link")).unwrap();
+        sync_once(&source, &replica, &mut Copied::new());
+        assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"data");
+        assert!(!replica.join("file-link").exists());
+        assert!(!replica.join("dir-link").exists());
+        // A symlink given as a file to copy is refused too.
+        assert!(copy_file(&source.join("file-link"), &replica.join("x")).is_err());
+        assert!(!replica.join("x").exists());
     }
 
     #[test]

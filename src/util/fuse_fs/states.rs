@@ -314,7 +314,26 @@ impl StateData {
         Ok(())
     }
 
+    /// Write a change. The first change after the content was published gets a
+    /// journal before the write reports success, so a replay keeps it.
     pub fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
+        self.write_spool(data, offset)?;
+        self.mark_dirty()
+    }
+
+    /// Mark the content as changed. If it has no journal (it was loaded from
+    /// storage or uploaded since), write one durably now: the spool data is
+    /// complete content at this point.
+    fn mark_dirty(&mut self) -> std::io::Result<()> {
+        self.dirty = true;
+        if !self.complete {
+            self.write_meta()?;
+        }
+        Ok(())
+    }
+
+    /// Write into the spool file without marking the content as changed.
+    fn write_spool(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
         let end = offset
             .checked_add(data.len() as u64)
             .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
@@ -329,7 +348,6 @@ impl StateData {
             return Err(err);
         }
         self.len = self.len.max(end);
-        self.dirty = true;
         Ok(())
     }
 
@@ -361,8 +379,7 @@ impl StateData {
             return Err(err);
         }
         self.len = len;
-        self.dirty = true;
-        Ok(())
+        self.mark_dirty()
     }
 
     /// Copy the current object content into the spool file, in chunks.
@@ -378,7 +395,7 @@ impl StateData {
         while let Some(chunk) = stream.next().await {
             let chunk = chunk.map_err(|e| io_status(e, &format!("read {key}")))?;
             let offset = self.len;
-            self.write_at(&chunk, offset)
+            self.write_spool(&chunk, offset)
                 .map_err(|e| io_status(e, "write spool file"))?;
         }
         self.dirty = false;

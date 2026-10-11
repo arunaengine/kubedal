@@ -1052,3 +1052,49 @@ async fn a_failed_delete_after_a_rename_copy_stops_changes() {
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"source");
     assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"source");
 }
+
+/// Break the file system with a failed folder sync while `other` flushes, shut
+/// it down, and replay its spool.
+async fn break_and_replay(fs: Filesystem, op: &Operator, dir: &std::path::Path) {
+    let other = create(&fs, "other").await;
+    fs.write(req(), Some(OsStr::new("/other")), other, 0, b"OTHER", 0, 0)
+        .await
+        .unwrap();
+    fs.pause_points().fail_once("dir_fsync");
+    assert!(fs.flush(req(), None, other, 0).await.is_err());
+    assert!(fs.states.is_broken());
+    fs.workers().shutdown().await;
+    drop(fs);
+    let budget = states::SpoolBudget::new(u64::MAX);
+    states::upload_pending(op, &dir.join("spool"), &budget)
+        .await
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_change_to_a_published_file_survives_a_broken_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    op.write("victim", "OLD").await.unwrap();
+    let fh = open(&fs, "/victim", libc::O_RDWR).await;
+    fs.write(req(), Some(OsStr::new("/victim")), fh, 0, b"NEW", 0, 0)
+        .await
+        .unwrap();
+    break_and_replay(fs, &op, dir.path()).await;
+    assert_eq!(op.read("victim").await.unwrap().to_vec(), b"NEW");
+}
+
+#[tokio::test]
+async fn a_change_after_a_flush_survives_a_broken_mount() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let p = Some(OsStr::new("/victim"));
+    let fh = create(&fs, "victim").await;
+    fs.write(req(), p, fh, 0, b"first", 0, 0).await.unwrap();
+    fs.flush(req(), p, fh, 0).await.unwrap();
+    assert_eq!(op.read("victim").await.unwrap().to_vec(), b"first");
+    // The flush removed the journal; the next change needs a new one.
+    fs.write(req(), p, fh, 0, b"later", 0, 0).await.unwrap();
+    break_and_replay(fs, &op, dir.path()).await;
+    assert_eq!(op.read("victim").await.unwrap().to_vec(), b"later");
+}

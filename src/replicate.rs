@@ -114,14 +114,28 @@ fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
         let mut input = std::fs::File::open(from)?;
         let mut output = std::fs::File::create(&temp)?;
         std::io::copy(&mut input, &mut output)?;
+        // On kubedal FUSE volumes, fsync and close upload the file, so their
+        // errors must count.
         output.sync_all()?;
-        drop(output);
+        close_file(output)?;
         std::fs::rename(&temp, to)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(&temp);
     }
     result
+}
+
+/// Close a file and report the error of `close`, which dropping a file hides.
+fn close_file(file: std::fs::File) -> std::io::Result<()> {
+    use std::os::fd::IntoRawFd;
+    // SAFETY: the descriptor comes from `into_raw_fd`, so nothing else owns or
+    // closes it.
+    if unsafe { libc::close(file.into_raw_fd()) } == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
 }
 
 /// True if both files have the same bytes.
@@ -211,6 +225,25 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"good");
         let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
         assert_eq!(names.len(), 1);
+    }
+
+    #[test]
+    fn a_failed_copy_is_not_recorded_and_tried_again() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(source.join("f"), "data").unwrap();
+        let mode = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(&replica, mode(0o555)).unwrap();
+        let mut copied = Copied::new();
+        sync_once(&source, &replica, &mut copied);
+        assert!(copied.is_empty());
+        std::fs::set_permissions(&replica, mode(0o755)).unwrap();
+        sync_once(&source, &replica, &mut copied);
+        assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"data");
+        assert!(copied.contains_key(Path::new("f")));
     }
 
     #[test]

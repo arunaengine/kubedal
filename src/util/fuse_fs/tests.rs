@@ -1478,3 +1478,28 @@ async fn a_failed_preservation_keeps_the_reader_for_a_retry() {
     fs.unlink(req(), root, OsStr::new("f")).await.unwrap();
     assert_eq!(read_all(&fs, "/f", fh).await, b"original");
 }
+
+#[tokio::test]
+async fn read_only_handles_follow_renames_and_lose_links_only_after_commit() {
+    let fs = fs_with("f", "original").await;
+    let fh = open(&fs, "/f", libc::O_RDONLY).await;
+    let root = OsStr::new("/");
+    let nlink = || async {
+        fs.getattr(req(), None, Some(fh), 0)
+            .await
+            .unwrap()
+            .attr
+            .nlink
+    };
+    fs.rename(req(), root, OsStr::new("f"), root, OsStr::new("g"))
+        .await
+        .unwrap();
+    assert_eq!(nlink().await, 1);
+    // a failed unlink of the new name changes nothing
+    fs.states.pause.fail_once("delete_fails");
+    assert!(fs.unlink(req(), root, OsStr::new("g")).await.is_err());
+    assert_eq!(nlink().await, 1);
+    fs.unlink(req(), root, OsStr::new("g")).await.unwrap();
+    assert_eq!(nlink().await, 0);
+    assert_eq!(read_all(&fs, "/f", fh).await, b"original");
+}

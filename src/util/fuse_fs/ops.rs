@@ -198,10 +198,11 @@ impl PathFilesystem for Filesystem {
 
         let path = PathBuf::from(parent).join(name);
         // Read-only handles that read the object keep a copy of it.
-        self.preserve_readers(&key_of(path.as_os_str())?, true)
-            .await?;
+        let key = key_of(path.as_os_str())?;
+        self.preserve_readers(&key).await?;
         // Open handles keep their content, but it must never be uploaded again.
         self.unlink_state(path.as_os_str()).await?;
+        self.name_gone(&key);
         Ok(())
     }
 
@@ -258,8 +259,8 @@ impl PathFilesystem for Filesystem {
         // Read-only handles that read the source or the replaced target object
         // keep a copy of what they opened.
         if from != to {
-            self.preserve_readers(&from, false).await?;
-            self.preserve_readers(&to, true).await?;
+            self.preserve_readers(&from).await?;
+            self.preserve_readers(&to).await?;
         }
         // A file with a spool holds its whole content, so the rename only moves
         // the spool to the new key and removes the old object.
@@ -269,6 +270,9 @@ impl PathFilesystem for Filesystem {
             .await
             .map_err(status_errno)?
         {
+            if from != to {
+                self.name_moved(&from, &to);
+            }
             return Ok(());
         }
 
@@ -302,7 +306,12 @@ impl PathFilesystem for Filesystem {
                 },
                 status_errno,
             )
-            .await
+            .await?;
+        // Only now the names changed.
+        if from != to {
+            self.name_moved(&from, &to);
+        }
+        Ok(())
     }
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {

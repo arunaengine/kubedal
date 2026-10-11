@@ -245,34 +245,29 @@ impl Filesystem {
 
     /// Before the object `key` is removed or replaced in storage, give every
     /// read-only handle without a state that still sees it a private copy, so
-    /// it keeps reading the content it opened. With `name_removed`, those
-    /// handles have no links left (unlink, or replaced by a rename).
-    async fn preserve_readers(&self, key: &str, name_removed: bool) -> Result<()> {
-        // The handles stay tracked until the copy is attached: after a failure
-        // a retry must find them again.
+    /// it keeps reading the content it opened. The handles stay tracked, so a
+    /// later name change still reaches them.
+    async fn preserve_readers(&self, key: &str) -> Result<()> {
         let Some(files) = self.readers().get(key).cloned() else {
             return Ok(());
         };
         let current = match self.op.stat(key).await {
             Ok(meta) => meta.etag().map(str::to_string),
             // Nothing left to copy; such handles fail as before.
-            Err(err) if err.kind() == ErrorKind::NotFound => {
-                self.readers().remove(key);
-                return Ok(());
-            }
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
             Err(err) => return Err(opendal_error2errno(err)),
         };
-        // A handle that saw another version gets ESTALE anyway.
+        // A handle that has a copy already needs none; one that saw another
+        // version gets ESTALE anyway.
         let files: Vec<usize> = files
             .into_iter()
             .filter(|file| {
-                self.opened_files
-                    .get(*file)
-                    .is_some_and(|h| h.etag.is_none() || h.etag == current)
+                self.opened_files.get(*file).is_some_and(|h| {
+                    h.snapshot.get().is_none() && (h.etag.is_none() || h.etag == current)
+                })
             })
             .collect();
         if files.is_empty() {
-            self.readers().remove(key);
             return Ok(());
         }
         if self.states.pause.should_fail("preserve_fails") {
@@ -283,18 +278,37 @@ impl Filesystem {
             .snapshot(&self.op, key)
             .await
             .map_err(status_errno)?;
-        self.readers().remove(key);
         for file in files {
             if let Some(handle) = self.opened_files.get(file) {
                 let _ = handle.snapshot.set(copy.clone());
-                if name_removed {
-                    handle
-                        .name_removed
-                        .store(true, std::sync::atomic::Ordering::SeqCst);
-                }
             }
         }
         Ok(())
+    }
+
+    /// The name `key` is gone (unlink, or replaced by a rename): its read-only
+    /// handles have no links left and are no longer tracked under it.
+    fn name_gone(&self, key: &str) {
+        let Some(files) = self.readers().remove(key) else {
+            return;
+        };
+        for file in files {
+            if let Some(handle) = self.opened_files.get(file) {
+                handle
+                    .name_removed
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+            }
+        }
+    }
+
+    /// A rename of `from` to `to` worked: readers of the old `to` lost their
+    /// name, and readers of `from` are now found under `to`.
+    fn name_moved(&self, from: &str, to: &str) {
+        self.name_gone(to);
+        let mut readers = self.readers();
+        if let Some(files) = readers.remove(from) {
+            readers.entry(to.to_string()).or_default().extend(files);
+        }
     }
 
     /// Size of the spool content of `path`, if the file is being written.

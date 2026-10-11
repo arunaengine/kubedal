@@ -346,6 +346,13 @@ helm lint charts/kubedal
 `tests/s3_minio.rs` runs against a real S3 compatible server when
 `KUBEDAL_TEST_S3_ENDPOINT` is set. See the comment at the top of the file.
 
+kubedal builds fuse3 from the fork <https://github.com/arunaengine/fuse3> (set in
+`[patch.crates-io]` in `Cargo.toml`). fuse3 0.9.0 gives an inode number to a new
+file while an unlinked file with that number is still open, so the kernel mixes
+the two files (attributes and cached pages). The fork keeps a number until the
+kernel forgets the inode. The change is planned for upstream fuse3; once it is
+released there, the patch entry goes away.
+
 After changing the CRD types, run `cargo run --bin crdgen` to regenerate
 `charts/kubedal/crds/kubedal-crds.yaml`. After changing the manifest types, run
 `UPDATE_SCHEMA=1 cargo test schema_file` to regenerate the JSON schema.

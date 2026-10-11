@@ -248,6 +248,20 @@ ls -l /vol > /dev/null
 test "$(wc -c < grow.txt)" -eq 9
 test "$(cat grow.txt)" = 123456789
 exec 3>&-
+# An open file whose name was removed stays its own file next to a new file:
+# the kernel must not get the same inode for both.
+exec 4<>keep.txt
+printf old-content >&4
+exec 6<keep.txt
+rm keep.txt
+exec 7<>other.txt
+printf new >&7
+exec 8<other.txt
+test "$(cat <&6)" = old-content
+test "$(cat <&8)" = new
+test "$(stat -L -c %i /proc/self/fd/6)" != "$(stat -L -c %i /proc/self/fd/8)"
+exec 4>&- 6<&- 7>&- 8<&-
+test ! -e keep.txt
 echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB
@@ -258,6 +272,7 @@ expect_object results/fuse-ops/moved.txt "one two"
 expect_object results/fuse-ops/excl.txt excl
 expect_object results/fuse-ops/clobber.txt new
 expect_object results/fuse-ops/grow.txt 123456789
+expect_object results/fuse-ops/other.txt new
 inline_pod fuse-ops-check "dataNode: store
 path: results/fuse-ops
 mount: cache-read-only" '

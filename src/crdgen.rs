@@ -36,6 +36,7 @@ fn main() {
                 name: "my-secret".to_string(),
                 namespace: Some("my-secret-namespace".into()),
             }),
+            config_map_ref: None,
             read_only: false,
             config: {
                 let mut map = std::collections::HashMap::new();

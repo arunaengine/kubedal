@@ -55,7 +55,7 @@ rules:
       - datareplicasets/status
     verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
   - apiGroups: [""]
-    resources: ["secrets"]
+    resources: ["secrets", "configmaps"]
     verbs: ["get"]
   # DataReplicaSet creates sync pods
   - apiGroups: [""]
@@ -90,6 +90,10 @@ rules:
   # Credentials of DataNodes. Only the node plugin reads them; pods never see them.
   - apiGroups: [""]
     resources: ["secrets"]
+    verbs: ["get"]
+  # Shared DataNode settings (configMapRef).
+  - apiGroups: [""]
+    resources: ["configmaps"]
     verbs: ["get"]
   # Check if a pod may use a DataNode in another namespace.
   - apiGroups: ["authorization.k8s.io"]

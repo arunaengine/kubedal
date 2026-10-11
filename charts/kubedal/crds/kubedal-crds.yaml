@@ -35,6 +35,22 @@ spec:
                   type: string
                 description: Additional config options for the backend
                 type: object
+              configMapRef:
+                description: |-
+                  Shared, non-secret config options for the backend in a Kubernetes
+                  ConfigMap. Values from the Secret and from `config` override them.
+                nullable: true
+                properties:
+                  name:
+                    description: Name of the resource
+                    type: string
+                  namespace:
+                    description: Namespace of the resource (optional, defaults to resource namespace)
+                    nullable: true
+                    type: string
+                required:
+                - name
+                type: object
               limit:
                 description: Maximum storage capacity
                 nullable: true

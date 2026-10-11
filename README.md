@@ -120,7 +120,10 @@ with the packaged chart attached.
 
 A DataNode describes a storage location. `config` takes any
 [OpenDAL option](https://opendal.apache.org/docs/rust/opendal/services/index.html)
-of the backend. Values from the Secret in `secretRef` are merged in.
+of the backend. Settings can also come from a ConfigMap (`configMapRef`), so
+several DataNodes can share them, and credentials from a Secret (`secretRef`).
+If a key is set in more than one place, the Secret beats the ConfigMap, and
+`config` beats both.
 
 ```yaml
 apiVersion: v1
@@ -133,6 +136,15 @@ stringData:
   access_key_id: "..."
   secret_access_key: "..."
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-shared
+  namespace: team-a
+data:
+  endpoint: https://s3.example.com
+  region: us-east-1
+---
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: DataNode
 metadata:
@@ -144,10 +156,10 @@ spec:
   limit: 10Gi          # largest amount of data one volume may copy to a node
   secretRef:
     name: s3-credentials   # must be in the namespace of the DataNode
+  configMapRef:
+    name: s3-shared        # optional, must be in the namespace of the DataNode
   config:
     bucket: my-bucket
-    endpoint: https://s3.example.com
-    region: us-east-1
     root: /projects/a      # optional folder inside the bucket
 ```
 
@@ -159,7 +171,8 @@ spec:
   permission to `get` that DataNode (a Role and RoleBinding in the namespace of the
   DataNode). kubedal checks this with a SubjectAccessReview.
 - Pods never need access to the Secret.
-- The Secret of a DataNode must be in the same namespace as the DataNode.
+- The Secret and the ConfigMap of a DataNode must be in the same namespace as
+  the DataNode.
 
 ## Inline volumes
 

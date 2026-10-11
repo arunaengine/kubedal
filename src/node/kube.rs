@@ -195,8 +195,9 @@ fn is_credential_key(key: &str) -> bool {
 }
 
 /// Identity of a DataNode as a write-back destination: its UID, backend and the
-/// effective configuration (spec and secret merged) without credential keys.
-/// Destination settings from a secret (like bucket, root or endpoint) count.
+/// effective configuration (ConfigMap, secret and spec merged) without credential
+/// keys. Destination settings from a ConfigMap or a secret (like bucket, root or
+/// endpoint) count.
 fn identity(
     node: &DataNodeRef,
     uid: &str,
@@ -246,6 +247,24 @@ mod tests {
         assert!(!is_credential_key("root"));
         assert!(!is_credential_key("endpoint"));
         assert!(!is_credential_key("account_name"));
+    }
+
+    #[test]
+    fn identity_counts_destination_fields_from_the_config_map() {
+        let node = DataNodeRef {
+            name: "store".into(),
+            namespace: "team".into(),
+        };
+        let from_map = |bucket: &str, key: &str| {
+            let map = HashMap::from([
+                ("bucket".to_string(), bucket.to_string()),
+                ("secret_access_key".to_string(), key.to_string()),
+            ]);
+            let cfg = crate::util::opendal::merge_config(map, HashMap::new(), &HashMap::new());
+            identity(&node, "uid", &Backend::S3, &cfg)
+        };
+        assert_eq!(from_map("a", "k1"), from_map("a", "k2"));
+        assert_ne!(from_map("a", "k1"), from_map("b", "k1"));
     }
 
     #[test]

@@ -1075,6 +1075,7 @@ mod tests {
                     backend: Backend::S3,
                     read_only,
                     secret_ref: None,
+                    config_map_ref: None,
                     config: Default::default(),
                     limit: None,
                 },

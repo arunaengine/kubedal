@@ -324,11 +324,12 @@ impl StateData {
         self.after_change(written)
     }
 
-    /// Reserve space for `bytes`, then write the first journal. If the journal
-    /// fails, the reservation is given back.
+    /// Reserve space for growing to `bytes`, then write the first journal. If
+    /// the journal fails, the reservation is given back. A shrink keeps its
+    /// charge here; it is refunded only after the shrink worked.
     fn reserved_journal_first(&mut self, bytes: u64) -> std::io::Result<()> {
         let before = self.charged;
-        self.charge_to(bytes)?;
+        self.charge_to(bytes.max(before))?;
         if let Err(err) = self.journal_first() {
             let _ = self.charge_to(before);
             return Err(err);
@@ -433,11 +434,20 @@ impl StateData {
     fn resize(&mut self, len: u64) -> Result<(), (std::io::Error, bool)> {
         checked_end(len, 0).map_err(|e| (e, false))?;
         let before = self.charged;
-        self.charge_to(len).map_err(|e| (e, false))?;
-        if let Err(err) = self.file.set_len(len) {
-            let _ = self.charge_to(before);
+        // Reserve only growth; a shrink is refunded after it worked.
+        self.charge_to(len.max(before)).map_err(|e| (e, false))?;
+        let resized = if self.hooks.should_fail("resize") {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            self.file.set_len(len)
+        };
+        if let Err(err) = resized {
+            // Charge what is really on disk.
+            let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(before);
+            let _ = self.charge_to(on_disk);
             return Err((err, true));
         }
+        let _ = self.charge_to(len);
         self.len = len;
         Ok(())
     }
@@ -2191,6 +2201,64 @@ mod tests {
         data.fail_after = Some(1);
         assert!(data.write_at(b"xyz", 0).is_err());
         assert!(states.is_broken());
+    }
+
+    /// Open `f` (content `content` in storage) with a budget of `limit`, run
+    /// `change`, then check the charge right after and after a replay.
+    async fn charge_after_failed_resize(
+        content: &str,
+        limit: u64,
+        change: impl FnOnce(&mut StateData) -> std::io::Result<()>,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("f", content.to_string()).await.unwrap();
+        let budget = Arc::new(SpoolBudget::new(limit));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let f = states.open_write(&op, "f", true).await.unwrap();
+        let mut data = f.lock().await;
+        assert!(change(&mut data).is_err());
+        let on_disk = data.file.metadata().unwrap().len();
+        assert_eq!(on_disk, content.len() as u64);
+        assert_eq!(budget.used(), on_disk);
+        assert_eq!(data.charged, on_disk);
+        // Like a crash: the state is never dropped, then the spool is replayed.
+        drop(data);
+        std::mem::forget(f);
+        std::mem::forget(states);
+        upload_pending(&op, dir.path(), &budget).await.unwrap();
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_failed_growth_charges_what_is_on_disk() {
+        charge_after_failed_resize("abc", u64::MAX, |data| {
+            data.hooks.fail_once("resize");
+            data.set_len(200)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_shrink_charges_what_is_on_disk() {
+        charge_after_failed_resize("12345", u64::MAX, |data| {
+            data.hooks.fail_once("resize");
+            data.set_len(1)
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn a_failed_shrink_journal_keeps_the_charge_in_a_full_budget() {
+        // The budget is full, so a refund before the journal could be taken
+        // by another volume and never come back.
+        charge_after_failed_resize("12345", 5, |data| {
+            block_journal_tmp(&data.meta_path);
+            let result = data.set_len(3);
+            std::fs::remove_dir(data.meta_path.with_extension("json.tmp")).unwrap();
+            result
+        })
+        .await;
     }
 
     #[tokio::test]

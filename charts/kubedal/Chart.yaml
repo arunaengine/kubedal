@@ -2,8 +2,8 @@ apiVersion: v2
 name: kubedal
 description: CSI driver that places data from object storage (S3, GCS, Azure Blob, HTTP) into pods, built on Apache OpenDAL
 type: application
-version: 0.1.0
-appVersion: "0.1.0"
+version: 0.2.0
+appVersion: "0.2.0"
 home: https://github.com/arunaengine/kubedal
 sources:
   - https://github.com/arunaengine/kubedal

@@ -53,4 +53,4 @@ path = "src/crdgen.rs"
 # fuse3 0.9.0 reuses an inode number while an unlinked file is still open. The
 # fork keeps a number until the kernel forgets the inode. See the README.
 [patch.crates-io]
-fuse3 = { git = "https://github.com/arunaengine/fuse3", rev = "2c84c96e618c9b9f98db0ed5adf18c9e5d5cbd28" }
+fuse3 = { git = "https://github.com/arunaengine/fuse3", rev = "15c812c42d58a642b7f4883496713fbcb7b7f234" }

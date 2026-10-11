@@ -291,8 +291,8 @@ impl Mounter for FakeMounter {
         Ok(())
     }
 
-    fn is_mounted(&self, target: &Path) -> bool {
-        self.get(target).is_some()
+    fn is_mounted(&self, target: &Path) -> Result<bool, Status> {
+        Ok(self.get(target).is_some())
     }
 
     async fn has_fuse_session(&self, target: &Path) -> bool {

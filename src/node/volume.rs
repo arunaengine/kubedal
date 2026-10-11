@@ -324,7 +324,7 @@ impl VolumeManager {
                         Ok(false)
                     }
                     VolumeMode::Cache | VolumeMode::FileList => {
-                        if self.mounter.is_mounted(target) {
+                        if self.mounter.is_mounted(target)? {
                             return Ok(true);
                         }
                         let data = self.data_dir(id);

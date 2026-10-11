@@ -1131,3 +1131,28 @@ async fn forced_truncate_waiting_while_a_flush_breaks_changes_nothing() {
     assert_eq!(result.unwrap_err(), Errno::from(libc::EIO));
     assert_eq!(op.read("victim").await.unwrap().to_vec(), b"KEEP");
 }
+
+#[tokio::test]
+async fn a_failed_first_journal_leaves_the_file_unchanged() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    op.write("victim", "OLD").await.unwrap();
+    let p = Some(OsStr::new("/victim"));
+    let fh = open(&fs, "/victim", libc::O_RDWR).await;
+    // Block the temp file of the journal with a folder of the same name.
+    let spool = dir.path().join("spool");
+    let data = std::fs::read_dir(&spool)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .find(|p| p.extension().is_some_and(|e| e == "data"))
+        .unwrap();
+    let blocker = data.with_extension("json.tmp");
+    std::fs::create_dir(&blocker).unwrap();
+    assert!(fs.write(req(), p, fh, 0, b"BAD", 0, 0).await.is_err());
+    std::fs::remove_dir(&blocker).unwrap();
+    // Nothing changed: the flush publishes nothing and the handle reads OLD.
+    fs.flush(req(), p, fh, 0).await.unwrap();
+    assert_eq!(op.read("victim").await.unwrap().to_vec(), b"OLD");
+    assert_eq!(read_all(&fs, "/victim", fh).await, b"OLD");
+    assert!(!fs.states.is_broken());
+}

@@ -317,35 +317,56 @@ impl StateData {
     /// Write a change. The first change after the content was published gets a
     /// journal before the write reports success, so a replay keeps it.
     pub fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
-        self.write_spool(data, offset)?;
-        self.mark_dirty()
+        self.journal_first()?;
+        let written = self.write_spool(data, offset);
+        self.after_change(written)
     }
 
-    /// Mark the content as changed. If it has no journal (it was loaded from
-    /// storage or uploaded since), write one durably now: the spool data is
-    /// complete content at this point.
-    fn mark_dirty(&mut self) -> std::io::Result<()> {
-        self.dirty = true;
+    /// Before the first change after the content was published (loaded from
+    /// storage or uploaded), write a journal durably. The spool data is complete
+    /// content at this point. If this fails, nothing has changed yet.
+    fn journal_first(&mut self) -> std::io::Result<()> {
         if !self.complete {
             self.write_meta()?;
         }
         Ok(())
     }
 
-    /// Write into the spool file without marking the content as changed.
-    fn write_spool(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
+    /// Finish a change. A failure that may have changed the spool file in part
+    /// leaves a journal over unknown content: stop the file system.
+    fn after_change(&mut self, result: Result<(), (std::io::Error, bool)>) -> std::io::Result<()> {
+        match result {
+            Ok(()) => {
+                self.dirty = true;
+                Ok(())
+            }
+            Err((err, touched)) => {
+                if touched && self.complete {
+                    mark_broken(
+                        &self.broken,
+                        &format!("changing the spool file of {} failed: {err}", self.key),
+                    );
+                }
+                Err(err)
+            }
+        }
+    }
+
+    /// Write into the spool file without marking the content as changed. An
+    /// error says whether the file may have changed.
+    fn write_spool(&mut self, data: &[u8], offset: u64) -> Result<(), (std::io::Error, bool)> {
         let end = offset
             .checked_add(data.len() as u64)
-            .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))?;
+            .ok_or_else(|| (std::io::Error::from_raw_os_error(libc::EFBIG), false))?;
         let before = self.charged;
-        self.charge_to(self.len.max(end))?;
+        self.charge_to(self.len.max(end)).map_err(|e| (e, false))?;
         if let Err(err) = self.write_file(data, offset) {
             // The write may have extended the file in part. Cut it back to the
             // old length and charge what is really on disk.
             let _ = self.file.set_len(self.len);
             let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(before);
             let _ = self.charge_to(on_disk);
-            return Err(err);
+            return Err((err, true));
         }
         self.len = self.len.max(end);
         Ok(())
@@ -372,14 +393,22 @@ impl StateData {
     }
 
     pub fn set_len(&mut self, len: u64) -> std::io::Result<()> {
+        self.journal_first()?;
+        let resized = self.resize(len);
+        self.after_change(resized)
+    }
+
+    /// Change the length of the spool file without marking the content as
+    /// changed. An error says whether the file may have changed.
+    fn resize(&mut self, len: u64) -> Result<(), (std::io::Error, bool)> {
         let before = self.charged;
-        self.charge_to(len)?;
+        self.charge_to(len).map_err(|e| (e, false))?;
         if let Err(err) = self.file.set_len(len) {
             let _ = self.charge_to(before);
-            return Err(err);
+            return Err((err, true));
         }
         self.len = len;
-        self.mark_dirty()
+        Ok(())
     }
 
     /// Copy the current object content into the spool file, in chunks.
@@ -396,7 +425,7 @@ impl StateData {
             let chunk = chunk.map_err(|e| io_status(e, &format!("read {key}")))?;
             let offset = self.len;
             self.write_spool(&chunk, offset)
-                .map_err(|e| io_status(e, "write spool file"))?;
+                .map_err(|(e, _)| io_status(e, "write spool file"))?;
         }
         self.dirty = false;
         Ok(())
@@ -1891,6 +1920,8 @@ mod tests {
         assert_eq!(on_disk, 2);
         assert_eq!(budget.used(), on_disk);
         assert_eq!(data.len, 2);
+        // The journal now covers content that changed in part: stop.
+        assert!(states.is_broken());
     }
 
     #[tokio::test]

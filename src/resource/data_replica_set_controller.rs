@@ -206,7 +206,7 @@ impl DataReplicaSet {
             self,
             MountAccess::FuseReadOnly,
             &pvc_api,
-            &ctx.storage_class,
+            &ctx,
         )
         .await?;
         let mut replica_resources = vec![];
@@ -223,7 +223,7 @@ impl DataReplicaSet {
                 self,
                 MountAccess::FuseReadWrite,
                 &pvc_api,
-                &ctx.storage_class,
+                &ctx,
             )
             .await?;
             replica_resources.push((replica, pvc));
@@ -363,10 +363,18 @@ async fn ensure_replica_pvc(
     data_replica_set: &DataReplicaSet,
     mount_access: MountAccess,
     pvc_api: &Api<PersistentVolumeClaim>,
-    storage_class: &str,
+    ctx: &Context,
 ) -> Result<PersistentVolumeClaim, Error> {
+    let storage_class = ctx.storage_class.as_str();
     let name = pvc_name(data_replica_set, data_pod);
     if let Some(pvc) = pvc_api.get_opt(&name).await? {
+        // A claim with this name that is not ours must never become a sync
+        // source or target.
+        if let Some(problem) = claim_mismatch(&pvc, data_replica_set, data_pod, storage_class) {
+            warn!("DataReplicaSet {}: {problem}", data_replica_set.name_any());
+            data_replica_set.patch_status(ctx, false).await?;
+            return Err(Error::ReconcilerError(problem));
+        }
         return Ok(pvc);
     }
 
@@ -636,6 +644,40 @@ fn is_owned_by<K: Resource>(item: &K, uid: &str) -> bool {
     !uid.is_empty() && item.owner_references().iter().any(|o| o.uid == uid)
 }
 
+/// Why an existing claim with the expected name does not belong to this set
+/// and DataPod, or None if it does.
+fn claim_mismatch(
+    pvc: &PersistentVolumeClaim,
+    data_replica_set: &DataReplicaSet,
+    data_pod: &DataPod,
+    storage_class: &str,
+) -> Option<String> {
+    let name = pvc.name_any();
+    let uid = data_replica_set.metadata.uid.as_deref().unwrap_or_default();
+    if !is_owned_by(pvc, uid) {
+        return Some(format!("PVC {name} exists but is not owned by this set"));
+    }
+    let pod = pvc
+        .annotations()
+        .get("kubedal.arunaengine.org/data-pod-name");
+    if pod.map(String::as_str) != Some(data_pod.name_any().as_str()) {
+        return Some(format!(
+            "PVC {name} exists but is not for DataPod {}",
+            data_pod.name_any()
+        ));
+    }
+    let class = pvc
+        .spec
+        .as_ref()
+        .and_then(|s| s.storage_class_name.as_deref());
+    if class != Some(storage_class) {
+        return Some(format!(
+            "PVC {name} exists but does not use StorageClass {storage_class}"
+        ));
+    }
+    None
+}
+
 /// The replica DataPods of the set with `drs_uid`: owned by it and named as its
 /// replicas.
 fn owned_replicas(drs_uid: &str, data_pods: Vec<DataPod>) -> Vec<DataPod> {
@@ -816,6 +858,55 @@ mod tests {
         let names: Vec<_> = owned_by(&items, "u").iter().map(|d| d.name_any()).collect();
         assert_eq!(names, vec!["old-labels"]);
         assert!(owned_by(&items, "").is_empty());
+    }
+
+    #[test]
+    fn a_foreign_claim_with_the_expected_name_is_refused() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let mut drs = DataReplicaSet::new(
+            "set",
+            serde_json::from_value(json!({
+                "replicas": 1,
+                "selector": {"matchLabels": {}},
+                "sourceDataPodRef": {"name": "source"},
+                "template": {"metadata": {}, "spec": {}}
+            }))
+            .unwrap(),
+        );
+        drs.metadata.uid = Some("u".into());
+        let source = DataPod::new("source", DataPodSpec::default());
+        let claim = |owner: &str, pod: &str, class: &str| PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some("set-source".into()),
+                owner_references: Some(vec![OwnerReference {
+                    uid: owner.into(),
+                    ..Default::default()
+                }]),
+                annotations: Some(
+                    [(
+                        "kubedal.arunaengine.org/data-pod-name".to_string(),
+                        pod.to_string(),
+                    )]
+                    .into(),
+                ),
+                ..Default::default()
+            },
+            spec: Some(PersistentVolumeClaimSpec {
+                storage_class_name: Some(class.into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        let check = |pvc| claim_mismatch(&pvc, &drs, &source, "kubedal");
+        assert_eq!(check(claim("u", "source", "kubedal")), None);
+        for (pvc, why) in [
+            (claim("other", "source", "kubedal"), "not owned"),
+            (claim("u", "elsewhere", "kubedal"), "not for DataPod"),
+            (claim("u", "source", "fast"), "StorageClass"),
+        ] {
+            let problem = check(pvc).unwrap();
+            assert!(problem.contains(why), "{problem}");
+        }
     }
 
     #[test]

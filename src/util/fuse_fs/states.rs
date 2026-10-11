@@ -951,8 +951,10 @@ impl States {
         let loaded = if keep {
             match data.fill_from(op, None).await {
                 Ok(()) => Ok(()),
-                // A missing object is a new, empty file.
-                Err(err) if err.code() == tonic::Code::NotFound => {
+                // A missing object is a new, empty file. A NotFound after some
+                // bytes arrived (for example a retried range read) is an error:
+                // the loaded part must never be published as the whole file.
+                Err(err) if err.code() == tonic::Code::NotFound && data.len == 0 => {
                     data.dirty = true;
                     Ok(())
                 }

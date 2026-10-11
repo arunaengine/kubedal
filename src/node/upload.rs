@@ -222,6 +222,19 @@ pub async fn upload_tree(
         .map_err(|e| Status::internal(format!("walk task failed: {e}")))?
         .map_err(|e| io_status(e, "walk volume content"))?;
 
+    // Every local name must reach its own object. A name that storage would
+    // change (like "x " becoming "x") could overwrite another file, and the
+    // local files are removed after the upload: refuse before anything starts.
+    if let Some(relative) = current
+        .keys()
+        .find(|relative| !crate::util::opendal::is_exact_key(&format!("{prefix}{relative}")))
+    {
+        return Err(Status::failed_precondition(format!(
+            "the local name {relative:?} cannot be stored under its own name; \
+             nothing was uploaded and the volume content is kept"
+        )));
+    }
+
     let mut non_empty_dirs = std::collections::HashSet::new();
     for path in current.keys() {
         let mut parent = path.as_str();
@@ -392,6 +405,50 @@ mod tests {
             vec!["out/a.txt", "out/empty/", "out/sub/b.txt"]
         );
         assert_eq!(op.read("out/sub/b.txt").await.unwrap().to_vec(), b"bb");
+    }
+
+    #[tokio::test]
+    async fn names_that_storage_would_change_fail_the_upload() {
+        for name in ["x ", "sub/y\u{2003}"] {
+            let dir = tempfile::tempdir().unwrap();
+            write(&dir.path().join("x"), "first");
+            write(&dir.path().join(name), "second");
+            let op = Operator::new(Memory::default()).unwrap();
+            let err = upload_tree(&op, dir.path(), "", "out/", None, fast())
+                .await
+                .unwrap_err();
+            assert_eq!(err.code(), tonic::Code::FailedPrecondition, "{name:?}");
+            // Nothing was uploaded and the local files are still there.
+            assert!(list_keys(&op, "").await.unwrap().is_empty(), "{name:?}");
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join("x")).unwrap(),
+                "first"
+            );
+            assert_eq!(
+                std::fs::read_to_string(dir.path().join(name)).unwrap(),
+                "second"
+            );
+        }
+    }
+
+    #[test]
+    fn exact_keys_are_the_ones_storage_keeps() {
+        use crate::util::opendal::is_exact_key;
+        for key in ["", "a", "a/b", "dir/", "a b/c", "out/x.txt"] {
+            assert!(is_exact_key(key), "{key:?}");
+        }
+        for key in [
+            "x ",
+            " x",
+            "a//b",
+            "/a",
+            "a/./b",
+            "a/../b",
+            "y\u{2003}",
+            ".",
+        ] {
+            assert!(!is_exact_key(key), "{key:?}");
+        }
     }
 
     #[tokio::test]

@@ -7,6 +7,18 @@ use opendal::{Builder, Operator, services};
 use std::collections::HashMap;
 use tonic::Status;
 
+/// True if OpenDAL uses `key` exactly as it is, so two different keys never
+/// reach the same object. Such a key has no leading "/", no white space at its
+/// ends, and no empty, "." or ".." parts (a trailing "/" for a folder is fine).
+/// The empty key is the root.
+pub fn is_exact_key(key: &str) -> bool {
+    if key.is_empty() {
+        return true;
+    }
+    let dots = key.split('/').any(|part| part == "." || part == "..");
+    !key.starts_with('/') && !dots && opendal::raw::normalize_path(key) == key
+}
+
 /// Build an operator for the root of a DataNode.
 pub async fn get_operator(client: &Client, node: &DataNode) -> Result<Operator, Status> {
     let cfg = data_node_config(client, node).await?;

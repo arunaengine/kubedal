@@ -469,11 +469,7 @@ const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) ->
 fn key_of(path: &OsStr) -> Result<String> {
     let raw = path.to_str().ok_or_else(|| Errno::from(libc::EILSEQ))?;
     let key = raw.trim_start_matches('/');
-    if key.is_empty() {
-        return Ok(String::new());
-    }
-    let dots = key.split('/').any(|part| part == "." || part == "..");
-    if dots || normalize_path(key) != key {
+    if !crate::util::opendal::is_exact_key(key) {
         return Err(Errno::from(libc::EINVAL));
     }
     Ok(key.to_string())

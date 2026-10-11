@@ -379,7 +379,9 @@ the cache. The least recently used files are removed when the cache grows over
   second it copies new and changed files from the source to the replicas. Files
   deleted in the source stay in the replicas. The sync pods use the chart
   `imagePullSecrets` too (controller flag `--sync-image-pull-secret`), and such
-  a secret must exist in the namespace of the DataReplicaSet.
+  a secret must exist in the namespace of the DataReplicaSet. Each file is
+  copied to a temporary file `.kdc-<32 hex digits>` next to it first. If the
+  sync pod is killed during a copy, that temporary file stays in the replica.
 
 ## Development
 

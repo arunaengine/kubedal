@@ -33,11 +33,6 @@ pub fn run_from_env() -> Result<(), String> {
         .parse::<u64>()
         .map_err(|e| format!("variable sleep_duration: {e}"))?;
     tracing::info!("replicating {} to {replicas:?}", source.display());
-    // A sync pod that was killed in the middle of a copy can leave a temporary
-    // file behind. A running pod removes its own on failure.
-    for replica in &replicas {
-        remove_stale_temps(replica);
-    }
     let mut copied: Vec<Copied> = vec![Copied::new(); replicas.len()];
     loop {
         for (replica, copied) in replicas.iter().zip(copied.iter_mut()) {
@@ -92,13 +87,6 @@ fn sync_entry(
         tracing::warn!("skip symlink {}", path.display());
         return Ok(());
     }
-    if meta.is_file() && is_temp_name(path) {
-        tracing::warn!(
-            "skip {}: it has the name of a temporary copy",
-            path.display()
-        );
-        return Ok(());
-    }
     if meta.is_dir() {
         std::fs::create_dir_all(&target)?;
         folders.push(path.to_path_buf());
@@ -124,41 +112,6 @@ fn sync_entry(
 
 /// Start of the names of temporary copy files, followed by 32 hex digits.
 const TEMP_PREFIX: &str = ".kdc-";
-
-/// True if the file name of `path` is exactly that of a temporary copy file.
-fn is_temp_name(path: &Path) -> bool {
-    let name = path.file_name().unwrap_or_default().to_string_lossy();
-    name.strip_prefix(TEMP_PREFIX).is_some_and(|hex| {
-        hex.len() == 32 && hex.bytes().all(|b| matches!(b, b'0'..=b'9' | b'a'..=b'f'))
-    })
-}
-
-/// Remove the temporary copy files below `replica`. Symlinks are not followed.
-fn remove_stale_temps(replica: &Path) {
-    let mut folders = vec![replica.to_path_buf()];
-    while let Some(folder) = folders.pop() {
-        let entries = match std::fs::read_dir(&folder) {
-            Ok(entries) => entries,
-            Err(err) => {
-                tracing::warn!("cannot list {}: {err}", folder.display());
-                continue;
-            }
-        };
-        for entry in entries.filter_map(Result::ok) {
-            let path = entry.path();
-            match entry.file_type() {
-                Ok(kind) if kind.is_dir() => folders.push(path),
-                Ok(kind) if kind.is_file() && is_temp_name(&path) => {
-                    tracing::info!("remove stale temporary file {}", path.display());
-                    if let Err(err) = std::fs::remove_file(&path) {
-                        tracing::warn!("cannot remove {}: {err}", path.display());
-                    }
-                }
-                _ => {}
-            }
-        }
-    }
-}
 
 /// A new, short and unique name for a temporary copy file.
 fn temp_name() -> String {
@@ -398,24 +351,15 @@ mod tests {
     }
 
     #[test]
-    fn stale_temporary_files_are_removed_and_never_replicated() {
+    fn a_file_with_a_temporary_looking_name_is_replicated() {
         let dir = tempfile::tempdir().unwrap();
         let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
-        std::fs::create_dir_all(source.join("sub")).unwrap();
-        std::fs::create_dir_all(replica.join("sub")).unwrap();
-        let temp = temp_name();
-        std::fs::write(replica.join("sub").join(&temp), "half").unwrap();
-        // Names that only look similar stay.
-        std::fs::write(replica.join("sub/.kdc-1234"), "keep").unwrap();
-        std::fs::write(replica.join(format!("{temp}x")), "keep").unwrap();
-        remove_stale_temps(&replica);
-        assert!(!replica.join("sub").join(&temp).exists());
-        assert!(replica.join("sub/.kdc-1234").exists());
-        assert!(replica.join(format!("{temp}x")).exists());
-
-        std::fs::write(source.join(&temp), "source").unwrap();
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        let name = temp_name();
+        std::fs::write(source.join(&name), "real data").unwrap();
         sync_once(&source, &replica, &mut Copied::new());
-        assert!(!replica.join(&temp).exists());
+        assert_eq!(std::fs::read(replica.join(&name)).unwrap(), b"real data");
     }
 
     #[test]

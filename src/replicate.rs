@@ -110,29 +110,40 @@ fn sync_entry(
     Ok(())
 }
 
+/// Start of the names of temporary copy files, followed by 32 hex digits.
+const TEMP_PREFIX: &str = ".kdc-";
+
+/// A new, short and unique name for a temporary copy file.
+fn temp_name() -> String {
+    format!("{TEMP_PREFIX}{}", uuid::Uuid::new_v4().simple())
+}
+
 /// Copy `from` to a temporary file next to `to`, then rename it over `to`.
 /// A copy that fails midway never replaces a good file; the temporary file is
 /// removed.
 fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
-    let name = to.file_name().unwrap_or_default().to_string_lossy();
-    let temp = to.with_file_name(format!(".{name}.kubedal-copy"));
+    copy_file_via(from, to, &to.with_file_name(temp_name()))
+}
+
+/// Like [`copy_file`] with the temporary file `temp`. It must not exist yet:
+/// only a file that this copy created is ever removed.
+fn copy_file_via(from: &Path, to: &Path, temp: &Path) -> std::io::Result<()> {
+    let mut input = open_no_follow(from)?;
+    let mut output = std::fs::File::options()
+        .write(true)
+        .create_new(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(temp)?;
     let result = (|| {
-        let mut input = open_no_follow(from)?;
-        let mut output = std::fs::File::options()
-            .write(true)
-            .create(true)
-            .truncate(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&temp)?;
         std::io::copy(&mut input, &mut output)?;
         // On kubedal FUSE volumes, fsync and close upload the file, so their
         // errors must count.
         output.sync_all()?;
         close_file(output)?;
-        std::fs::rename(&temp, to)
+        std::fs::rename(temp, to)
     })();
     if result.is_err() {
-        let _ = std::fs::remove_file(&temp);
+        let _ = std::fs::remove_file(temp);
     }
     result
 }
@@ -284,6 +295,50 @@ mod tests {
         // A symlink given as a file to copy is refused too.
         assert!(copy_file(&source.join("file-link"), &replica.join("x")).is_err());
         assert!(!replica.join("x").exists());
+    }
+
+    #[test]
+    fn a_copy_never_touches_a_file_with_the_temporary_name() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("src"), "new").unwrap();
+        std::fs::write(dir.path().join("f"), "old").unwrap();
+        let temp = dir.path().join(temp_name());
+        std::fs::write(&temp, "keep").unwrap();
+        assert!(copy_file_via(&dir.path().join("src"), &dir.path().join("f"), &temp).is_err());
+        assert_eq!(std::fs::read(&temp).unwrap(), b"keep");
+        assert_eq!(std::fs::read(dir.path().join("f")).unwrap(), b"old");
+    }
+
+    #[test]
+    fn files_named_like_old_temporary_files_are_kept() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(source.join("f"), "one").unwrap();
+        std::fs::write(source.join(".f.kubedal-copy"), "real data").unwrap();
+        let mut copied = Copied::new();
+        sync_once(&source, &replica, &mut copied);
+        std::fs::remove_file(source.join(".f.kubedal-copy")).unwrap();
+        std::fs::write(source.join("f"), "changed").unwrap();
+        sync_once(&source, &replica, &mut copied);
+        assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"changed");
+        assert_eq!(
+            std::fs::read(replica.join(".f.kubedal-copy")).unwrap(),
+            b"real data"
+        );
+    }
+
+    #[test]
+    fn a_file_with_a_long_name_is_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        let name = "n".repeat(250);
+        std::fs::write(source.join(&name), "data").unwrap();
+        sync_once(&source, &replica, &mut Copied::new());
+        assert_eq!(std::fs::read(replica.join(&name)).unwrap(), b"data");
     }
 
     #[test]

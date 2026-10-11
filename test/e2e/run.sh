@@ -228,6 +228,17 @@ exec 8>&- 9<&-
 dd if=/dev/zero of=big.bin bs=1M count=20 2>/dev/null
 printf tail >> big.bin
 test "$(stat -c %s big.bin)" = 20971524
+# An exclusive create works (mktemp opens with O_EXCL).
+tmp=$(mktemp /vol/excl.XXXXXX)
+printf excl > "$tmp"
+test "$(cat "$tmp")" = excl
+mv "$tmp" excl.txt
+# With noclobber the shell creates a new file but never overwrites one.
+set -C
+printf new > clobber.txt
+if printf again > clobber.txt; then exit 1; fi
+set +C
+test "$(cat clobber.txt)" = new
 echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB
@@ -235,6 +246,8 @@ expect_object results/fuse-ops/t.txt 12
 expect_object results/fuse-ops/result.txt final
 expect_object results/fuse-ops/ra.txt xA
 expect_object results/fuse-ops/moved.txt "one two"
+expect_object results/fuse-ops/excl.txt excl
+expect_object results/fuse-ops/clobber.txt new
 inline_pod fuse-ops-check "dataNode: store
 path: results/fuse-ops
 mount: cache-read-only" '

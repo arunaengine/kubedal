@@ -279,7 +279,8 @@ impl PathFilesystem for Filesystem {
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         tracing::debug!("opendir(path={path:?}, flags=0x{flags:x})");
-        Ok(ReplyOpen { fh: 0, flags })
+        // Reply flags are FOPEN_* bits, not the O_* flags of the request.
+        Ok(ReplyOpen { fh: 0, flags: 0 })
     }
 
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
@@ -330,9 +331,11 @@ impl PathFilesystem for Filesystem {
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 
+        // Reply flags are FOPEN_* bits, not the O_* flags of the request (O_EXCL
+        // would read as FOPEN_PASSTHROUGH, which the kernel refuses).
         Ok(ReplyOpen {
             fh: FileKey(key).to_fh(),
-            flags,
+            flags: 0,
         })
     }
 
@@ -560,7 +563,8 @@ impl PathFilesystem for Filesystem {
             attr,
             generation: 0,
             fh: FileKey(key).to_fh(),
-            flags,
+            // FOPEN_* bits, not the O_* flags of the request.
+            flags: 0,
         })
     }
 

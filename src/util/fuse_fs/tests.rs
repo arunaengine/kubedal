@@ -1328,3 +1328,22 @@ async fn names_that_storage_would_change_are_refused() {
     assert_eq!(fs.op.read("f\u{fffd}").await.unwrap().to_vec(), b"OTHER");
     assert!(!fs.op.exists("x").await.unwrap());
 }
+
+#[tokio::test]
+async fn replies_set_no_fopen_flags_from_the_request() {
+    let fs = fs_with("f", "content").await;
+    let exclusive = (libc::O_RDWR | libc::O_CREAT | libc::O_EXCL) as u32;
+    let created = fs
+        .create(req(), OsStr::new("/"), OsStr::new("new"), 0o600, exclusive)
+        .await
+        .unwrap();
+    assert_eq!(created.flags, 0);
+    let flags = (libc::O_RDWR | libc::O_APPEND | libc::O_TRUNC | libc::O_DIRECT) as u32;
+    let opened = fs.open(req(), OsStr::new("/f"), flags).await.unwrap();
+    assert_eq!(opened.flags, 0);
+    let dir = fs
+        .opendir(req(), OsStr::new("/"), libc::O_DIRECTORY as u32)
+        .await
+        .unwrap();
+    assert_eq!(dir.flags, 0);
+}

@@ -1,0 +1,64 @@
+# Creates the bucket and uploads test files with plain signed S3 requests.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: seed
+  namespace: e2e
+data:
+  hello.txt: "hello"
+  world.txt: "world"
+  run.sh: |
+    #!/bin/sh
+    echo tool works
+  manifest.json: |
+    {
+      "version": 1,
+      "files": [
+        {"path": "in/hello.txt", "source": "data/hello.txt",
+         "sha256": "2cf24dba5fb0a30e26e83b2ac5b9e29e1b161e5c1fa7425e73043362938b9824", "size": 5},
+        {"path": "in/deep/world.txt", "source": "data/sub/world.txt"},
+        {"path": "bin/run.sh", "source": "tools/run.sh", "executable": true}
+      ],
+      "directories": ["out"],
+      "upload": {"dataNode": "store", "prefix": "results/file-list", "path": "out"}
+    }
+  seed.sh: |
+    set -eu
+    S3=http://s3.e2e.svc:9000
+    put() {
+      curl -sSf --aws-sigv4 "aws:amz:us-east-1:s3" --user e2e-access:e2e-secret-key \
+        -X PUT "$@"
+    }
+    until put "$S3/e2e" -o /dev/null; do
+      # The bucket may exist already, or the server is not ready yet.
+      curl -sf -o /dev/null --aws-sigv4 "aws:amz:us-east-1:s3" \
+        --user e2e-access:e2e-secret-key "$S3/e2e?list-type=2" && break
+      sleep 2
+    done
+    put -T /seed/hello.txt "$S3/e2e/data/hello.txt"
+    put -T /seed/world.txt "$S3/e2e/data/sub/world.txt"
+    put -T /seed/run.sh "$S3/e2e/tools/run.sh"
+    put -T /seed/manifest.json "$S3/e2e/jobs/1.json"
+    echo seeded
+---
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: seed
+  namespace: e2e
+spec:
+  backoffLimit: 10
+  template:
+    spec:
+      restartPolicy: OnFailure
+      containers:
+        - name: seed
+          image: curlimages/curl:8.16.0
+          command: ["sh", "/seed/seed.sh"]
+          volumeMounts:
+            - name: seed
+              mountPath: /seed
+      volumes:
+        - name: seed
+          configMap:
+            name: seed

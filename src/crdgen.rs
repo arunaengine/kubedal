@@ -13,7 +13,7 @@ fn main() {
 
     let path = std::env::args()
         .nth(1)
-        .unwrap_or("./yamls/crd.yaml".to_string());
+        .unwrap_or("./charts/kubedal/crds/kubedal-crds.yaml".to_string());
 
     let mut file = std::fs::File::create(path).expect("Failed to create file");
 

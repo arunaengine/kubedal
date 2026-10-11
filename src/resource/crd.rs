@@ -36,7 +36,7 @@ impl fmt::Display for MountAccess {
     namespaced
 )]
 pub struct DataNodeSpec {
-    /// Storage backend scheme (s3, azblob, gcs, etc.)
+    /// Storage backend: S3 (also S3 compatible like MinIO), GCS, Azblob or HTTP
     pub backend: Backend,
 
     /// Is the resource read-only
@@ -148,6 +148,10 @@ pub enum Backend {
     S3,
     /// HTTP storage, read-only
     HTTP,
+    /// Google Cloud Storage
+    GCS,
+    /// Azure Blob Storage
+    Azblob,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, JsonSchema, PartialEq)]

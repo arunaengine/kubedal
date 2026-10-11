@@ -2,7 +2,11 @@ use clap::{Arg, Command};
 use kubedal::csi::{
     controller_server::ControllerServer, identity_server::IdentityServer, node_server::NodeServer,
 };
+use kubedal::node::kube::KubeCluster;
+use kubedal::node::mounter::SystemMounter;
+use kubedal::node::volume::{DEFAULT_CONTENT_CACHE_BYTES, VolumeManager};
 use std::path::PathBuf;
+use std::sync::Arc;
 use tokio::net::UnixListener;
 use tokio::signal;
 use tokio_stream::wrappers::UnixListenerStream;
@@ -12,15 +16,17 @@ use tracing_subscriber::EnvFilter;
 use kubedal::services::{ControllerService, IdentityService, NodeService};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const NAME: &str = "kubedal.arunaengine.org";
+/// Default CSI driver name. It must match the name of the CSIDriver object.
+const DEFAULT_NAME: &str = "kubedal.arunaengine.org";
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    let filter = EnvFilter::try_from_default_env()
-        .unwrap_or("none".into())
-        .add_directive("kubedal=trace".parse().unwrap());
+    // RUST_LOG controls the log level, for example "info" or "kubedal=debug".
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
 
     tracing_subscriber::fmt()
+        // Colors only on a terminal, not in container logs.
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_file(true)
         .with_line_number(true)
         .with_env_filter(filter)
@@ -46,10 +52,56 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("node-1")
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("data-dir")
+                .long("data-dir")
+                .help("Directory for volume data and state on the node")
+                .default_value("/var/lib/kubelet/plugins/kubedal.arunaengine.org")
+                .value_parser(clap::value_parser!(PathBuf)),
+        )
+        .arg(
+            Arg::new("fuse-spool-size")
+                .long("fuse-spool-size")
+                .help("Space limit for FUSE files that are written but not uploaded yet, like 10Gi")
+                .default_value("10Gi")
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
+            Arg::new("content-cache-size")
+                .long("content-cache-size")
+                .help("Size limit of the node content cache for file-list volumes, like 10Gi")
+                .default_value("10Gi")
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
+            Arg::new("driver-name")
+                .long("driver-name")
+                .help("CSI driver name, must match the CSIDriver object")
+                .default_value(DEFAULT_NAME)
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
+            Arg::new("storage-class")
+                .long("storage-class")
+                .help("StorageClass of the PVCs that DataReplicaSets create")
+                .default_value("kubedal")
+                .value_parser(clap::value_parser!(String)),
+        )
         .get_matches();
 
-    let endpoint = matches.get_one::<String>("endpoint").unwrap();
-    let node_id = matches.get_one::<String>("node-id").unwrap();
+    // Both arguments have default values, so they are always present.
+    let endpoint = matches
+        .get_one::<String>("endpoint")
+        .cloned()
+        .unwrap_or_default();
+    let node_id = matches
+        .get_one::<String>("node-id")
+        .cloned()
+        .unwrap_or_default();
+    let data_dir = matches
+        .get_one::<PathBuf>("data-dir")
+        .cloned()
+        .unwrap_or_default();
 
     tracing::info!("Starting KubeDAL CSI Driver v{}", VERSION);
     tracing::info!("Endpoint: {}", endpoint);
@@ -60,7 +112,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let client = kube::Client::try_default().await?;
 
     // Create service instances
-    let identity_service = IdentityService::new(NAME, VERSION);
+    let driver_name = matches
+        .get_one::<String>("driver-name")
+        .cloned()
+        .unwrap_or_else(|| DEFAULT_NAME.to_string());
+    tracing::info!("Driver name: {}", driver_name);
+    let identity_service = IdentityService::new(&driver_name, VERSION);
 
     // Parse the endpoint
     if !endpoint.starts_with("unix://") {
@@ -76,10 +133,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     // Ensure parent directory exists
-    if let Some(parent) = socket_path_obj.parent() {
-        if !parent.exists() {
-            std::fs::create_dir_all(parent)?;
-        }
+    if let Some(parent) = socket_path_obj.parent()
+        && !parent.exists()
+    {
+        std::fs::create_dir_all(parent)?;
     }
 
     // Create a Unix domain socket
@@ -94,21 +151,42 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let builder = if is_controller {
         // Is a controller node
-        let controller_service = ControllerService::new(client.clone()).await;
+        let storage_class = matches
+            .get_one::<String>("storage-class")
+            .cloned()
+            .unwrap_or_default();
+        let controller_service = ControllerService::new(client.clone(), storage_class).await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder
-        let node_service = NodeService::new(client, node_id);
+        let cluster = Arc::new(KubeCluster::new(client.clone(), &node_id));
+        let spool_size = matches
+            .get_one::<String>("fuse-spool-size")
+            .map(|s| kubedal::util::quantity::parse_bytes(s))
+            .transpose()
+            .map_err(|e| format!("invalid --fuse-spool-size: {e}"))?
+            .unwrap_or(u64::MAX);
+        let spool_budget = Arc::new(kubedal::util::fuse_fs::SpoolBudget::new(spool_size));
+        let mounter = Arc::new(SystemMounter::with_spool_budget(spool_budget.clone()));
+        let cache_size = matches
+            .get_one::<String>("content-cache-size")
+            .map(|s| kubedal::util::quantity::parse_bytes(s))
+            .transpose()
+            .map_err(|e| format!("invalid --content-cache-size: {e}"))?
+            .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES);
+        let manager = VolumeManager::new(&data_dir, cluster, mounter)?
+            .with_content_cache_limit(cache_size)
+            .with_spool_budget(spool_budget);
+        tracing::info!("Data directory: {}", data_dir.display());
+        // Clean up what a previous run of the plugin left behind.
+        let report = manager.reconcile().await?;
+        tracing::info!("Startup reconcile: {report:?}");
+        let node_service = NodeService::new(client, &node_id, Arc::new(manager));
         builder.add_service(NodeServer::new(node_service))
     };
 
     builder
-        .serve_with_incoming_shutdown(uds_stream, async {
-            signal::ctrl_c()
-                .await
-                .expect("Failed to listen for ctrl+c signal");
-            tracing::info!("Received shutdown signal, stopping CSI server...");
-        })
+        .serve_with_incoming_shutdown(uds_stream, shutdown_signal())
         .await?;
 
     // Clean up the socket file
@@ -118,4 +196,28 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     tracing::info!("CSI server stopped successfully");
     Ok(())
+}
+
+/// Wait for SIGTERM (sent by Kubernetes) or SIGINT (Ctrl+C).
+async fn shutdown_signal() {
+    let mut terminate = match signal::unix::signal(signal::unix::SignalKind::terminate()) {
+        Ok(stream) => Some(stream),
+        Err(err) => {
+            tracing::warn!("cannot listen for SIGTERM: {err}");
+            None
+        }
+    };
+    let terminate = async {
+        match terminate.as_mut() {
+            Some(stream) => {
+                stream.recv().await;
+            }
+            None => std::future::pending::<()>().await,
+        }
+    };
+    tokio::select! {
+        _ = signal::ctrl_c() => {}
+        _ = terminate => {}
+    }
+    tracing::info!("Received shutdown signal, stopping CSI server...");
 }

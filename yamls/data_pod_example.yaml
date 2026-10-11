@@ -1,4 +1,18 @@
-# Example DataNode for S3
+# Persistent volume example: a DataNode, a DataPod and a PVC that uses them.
+#
+# Credentials for the backend. The keys are OpenDAL options of the backend.
+# The secret must be in the namespace of the DataNode.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: s3-credentials
+  namespace: default
+type: Opaque
+stringData:
+  access_key_id: "minioadmin"
+  secret_access_key: "minioadmin"
+---
+# A DataNode points to a bucket (or a folder in it) in object storage.
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: DataNode
 metadata:
@@ -7,65 +21,50 @@ metadata:
   labels:
     region: us-east
 spec:
-  backend: S3 # Currently only S3 and HTTP are supported
+  backend: S3 # S3 (and S3 compatible servers), GCS, Azblob or HTTP
   read_only: false
-  limit: 10G
-  # You can specify any valid OpenDAL configuration entries either:
-  # 1. Directly in the config field
-  # 2. As a key/values in the referenced Secret (for sensitive information)
+  limit: 10Gi # Largest amount of data one volume may copy to a node
   secretRef:
     name: s3-credentials
-    namespace: default
+  # Any OpenDAL option of the backend. Secret values are merged in.
   config:
     bucket: my-bucket
     endpoint: http://minio-service.default.svc.cluster.local:9000
     region: us-east-1
 ---
-# Example Secret with credentials
-apiVersion: v1
-kind: Secret
-metadata:
-  name: s3-credentials
-  namespace: default
-type: Kubedal
-stringData:
-  access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
-  secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
----
-# Example DataPod for S3
+# A DataPod is a folder inside a DataNode. The controller fills in a generated
+# path if none is given.
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: DataPod
 metadata:
   name: example-data-pod
+  namespace: default
 spec:
   path: /data
   dataNodeRef:
     name: example-s3-node
-    namespace: default
+  # Instead of a reference, a selector picks the first matching DataNode:
   #dataNodeSelector:
-  #  region: eu-central
+  #  region: us-east
 ---
-# Example PVC that references the resource
+# A PVC that uses the DataPod. The mount annotation is one of cache-read-only
+# (default), cache-read-write, fuse-read-only or fuse-read-write.
 apiVersion: v1
 kind: PersistentVolumeClaim
 metadata:
   name: example-dataset-pvc
   namespace: default
   annotations:
-    kubedal.arunaengine.org/data-node-name: example-s3-node #TODO: Remove -> Use dataNodeRef in DataPod spec
-    kubedal.arunaengine.org/data-node-namespace: default    #TODO: Remove -> Use dataNodeRef in DataPod spec
     kubedal.arunaengine.org/data-pod-name: example-data-pod
-    kubedal.arunaengine.org/data-pod-namespace: default
-    kubedal.arunaengine.org/mount: fuse-read-write
+    kubedal.arunaengine.org/mount: cache-read-only
 spec:
   accessModes:
-    - ReadWriteMany
+    - ReadOnlyMany
   storageClassName: kubedal
   resources:
     requests:
       storage: 5Gi
 ---
-# Example Pod that uses the PVC
 apiVersion: v1
 kind: Pod
 metadata:
@@ -79,7 +78,6 @@ spec:
       volumeMounts:
         - name: dataset
           mountPath: /data
-          readOnly: true
   volumes:
     - name: dataset
       persistentVolumeClaim:

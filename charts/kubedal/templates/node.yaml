@@ -1,0 +1,109 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: {{ include "kubedal.fullname" . }}-node
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+    app.kubernetes.io/component: node
+spec:
+  selector:
+    matchLabels:
+      app.kubernetes.io/name: {{ include "kubedal.name" . }}
+      app.kubernetes.io/instance: {{ .Release.Name }}
+      app.kubernetes.io/component: node
+  template:
+    metadata:
+      labels:
+        app.kubernetes.io/name: {{ include "kubedal.name" . }}
+        app.kubernetes.io/instance: {{ .Release.Name }}
+        app.kubernetes.io/component: node
+      {{- with .Values.node.podAnnotations }}
+      annotations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+    spec:
+      serviceAccountName: {{ include "kubedal.nodeServiceAccount" . }}
+      priorityClassName: system-node-critical
+      {{- with .Values.imagePullSecrets }}
+      imagePullSecrets:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      containers:
+        - name: node-driver-registrar
+          image: {{ .Values.sidecars.nodeDriverRegistrar.image }}
+          args:
+            - --csi-address=/csi/csi.sock
+            - --kubelet-registration-path={{ include "kubedal.pluginDir" . }}/csi.sock
+            - --v=2
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            - name: registration-dir
+              mountPath: /registration
+          {{- with .Values.sidecars.nodeDriverRegistrar.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+        - name: kubedal
+          image: {{ include "kubedal.image" . }}
+          imagePullPolicy: {{ .Values.image.pullPolicy }}
+          # Needed for bind mounts and FUSE mounts.
+          securityContext:
+            privileged: true
+          args:
+            - --endpoint=unix:///csi/csi.sock
+            - --driver-name={{ .Values.driverName }}
+            - --node-id=$(NODE_ID)
+            - --data-dir={{ include "kubedal.dataDir" . }}
+            - --content-cache-size={{ .Values.node.contentCacheSize }}
+            - --fuse-spool-size={{ .Values.node.fuseSpoolSize }}
+          env:
+            - name: NODE_ID
+              valueFrom:
+                fieldRef:
+                  fieldPath: spec.nodeName
+            - name: RUST_LOG
+              value: {{ .Values.logLevel | quote }}
+          volumeMounts:
+            - name: plugin-dir
+              mountPath: /csi
+            # Mounts made here must reach the pods, so they propagate both ways.
+            - name: kubelet-dir
+              mountPath: {{ .Values.kubeletDir }}
+              mountPropagation: Bidirectional
+            - name: dev
+              mountPath: /dev
+          {{- with .Values.node.resources }}
+          resources:
+            {{- toYaml . | nindent 12 }}
+          {{- end }}
+      volumes:
+        - name: plugin-dir
+          hostPath:
+            path: {{ include "kubedal.pluginDir" . }}
+            type: DirectoryOrCreate
+        - name: registration-dir
+          hostPath:
+            path: {{ trimSuffix "/" .Values.kubeletDir }}/plugins_registry
+            type: Directory
+        - name: kubelet-dir
+          hostPath:
+            path: {{ .Values.kubeletDir }}
+            type: Directory
+        - name: dev
+          hostPath:
+            path: /dev
+            type: Directory
+      {{- with .Values.node.nodeSelector }}
+      nodeSelector:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.tolerations }}
+      tolerations:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}
+      {{- with .Values.node.affinity }}
+      affinity:
+        {{- toYaml . | nindent 8 }}
+      {{- end }}

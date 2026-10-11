@@ -1,0 +1,41 @@
+# File-list volume example.
+#
+# The manifest is a JSON object in the DataNode, here at "jobs/42/manifest.json".
+# Upload it with any S3 client before the pod starts. Example manifest:
+#
+#   {
+#     "version": 1,
+#     "files": [
+#       {"path": "inputs/reads.fq", "source": "datasets/sample-1/reads.fq",
+#        "sha256": "<64 hex characters>", "size": 1048576},
+#       {"path": "bin/analyze.sh", "source": "tools/analyze.sh", "executable": true}
+#     ],
+#     "directories": ["outputs"],
+#     "upload": {"dataNode": "example-s3-node", "prefix": "results/42", "path": "outputs"}
+#   }
+#
+# Files with a sha256 are checked and shared between pods on the same node through
+# the node content cache. When the pod ends, everything in "outputs" is uploaded to
+# "results/42/" in the DataNode. The JSON schema is in schema/manifest-v1.schema.json.
+apiVersion: v1
+kind: Pod
+metadata:
+  name: file-list-example
+  namespace: default
+spec:
+  restartPolicy: Never
+  containers:
+    - name: task
+      image: alpine
+      workingDir: /work
+      command: ["sh", "-c", "./bin/analyze.sh inputs/reads.fq > outputs/report.txt"]
+      volumeMounts:
+        - name: work
+          mountPath: /work
+  volumes:
+    - name: work
+      csi:
+        driver: kubedal.arunaengine.org
+        volumeAttributes:
+          dataNode: example-s3-node
+          manifest: jobs/42/manifest.json

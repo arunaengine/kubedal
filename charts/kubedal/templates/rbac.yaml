@@ -1,0 +1,116 @@
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kubedal.controllerServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: {{ include "kubedal.nodeServiceAccount" . }}
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubedal.fullname" . }}-controller
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+rules:
+  # csi-provisioner
+  - apiGroups: [""]
+    resources: ["persistentvolumes"]
+    verbs: ["get", "list", "watch", "create", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["persistentvolumeclaims"]
+    # delete: DataReplicaSet moves replicas off read-only DataNodes.
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["storageclasses", "csinodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["storage.k8s.io"]
+    resources: ["volumeattachments"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: [""]
+    resources: ["nodes"]
+    verbs: ["get", "list", "watch"]
+  - apiGroups: ["coordination.k8s.io"]
+    resources: ["leases"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+  # kubedal controllers (DataNode, DataPod, DataReplicaSet)
+  - apiGroups: ["kubedal.arunaengine.org"]
+    resources:
+      - datanodes
+      - datanodes/status
+      - datapods
+      - datapods/status
+      - datareplicasets
+      - datareplicasets/status
+    verbs: ["get", "list", "watch", "create", "update", "patch", "delete"]
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # DataReplicaSet creates sync pods
+  - apiGroups: [""]
+    resources: ["pods"]
+    verbs: ["get", "list", "watch", "create", "delete"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubedal.fullname" . }}-controller
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubedal.controllerServiceAccount" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "kubedal.fullname" . }}-controller
+  apiGroup: rbac.authorization.k8s.io
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: {{ include "kubedal.fullname" . }}-node
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+rules:
+  - apiGroups: ["kubedal.arunaengine.org"]
+    resources: ["datanodes", "datapods"]
+    verbs: ["get"]
+  # Credentials of DataNodes. Only the node plugin reads them; pods never see them.
+  - apiGroups: [""]
+    resources: ["secrets"]
+    verbs: ["get"]
+  # Check if a pod may use a DataNode in another namespace.
+  - apiGroups: ["authorization.k8s.io"]
+    resources: ["subjectaccessreviews"]
+    verbs: ["create"]
+  # Upload results and lost FUSE mounts are reported as events on the pod.
+  - apiGroups: ["", "events.k8s.io"]
+    resources: ["events"]
+    verbs: ["get", "list", "watch", "create", "update", "patch"]
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRoleBinding
+metadata:
+  name: {{ include "kubedal.fullname" . }}-node
+  labels:
+    {{- include "kubedal.labels" . | nindent 4 }}
+subjects:
+  - kind: ServiceAccount
+    name: {{ include "kubedal.nodeServiceAccount" . }}
+    namespace: {{ .Release.Namespace }}
+roleRef:
+  kind: ClusterRole
+  name: {{ include "kubedal.fullname" . }}-node
+  apiGroup: rbac.authorization.k8s.io

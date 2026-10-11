@@ -1,51 +1,108 @@
 use crate::csi::node_server::Node;
+use crate::csi::volume_capability::AccessType;
 use crate::csi::{
     NodeExpandVolumeRequest, NodeExpandVolumeResponse, NodeGetCapabilitiesRequest,
     NodeGetCapabilitiesResponse, NodeGetInfoRequest, NodeGetInfoResponse, NodePublishVolumeRequest,
-    NodePublishVolumeResponse, NodeServiceCapability, NodeUnpublishVolumeRequest,
-    NodeUnpublishVolumeResponse,
+    NodePublishVolumeResponse, NodeUnpublishVolumeRequest, NodeUnpublishVolumeResponse,
 };
-use crate::resource::crd::{DataNode, DataPod, MountAccess};
-use crate::util::mount_helper::{AccessMode, Mount, MountMode};
-use crate::util::opendal::get_operator;
-use k8s_openapi::api::authorization::v1::{
-    ResourceAttributes, SubjectAccessReview, SubjectAccessReviewSpec,
-};
-use k8s_openapi::api::core::v1::Secret;
-use kube::api::PostParams;
+use crate::node::request::{self, ContextSource};
+use crate::node::state::{DataNodeRef, PodRef};
+use crate::node::volume::{PublishRequest, VolumeManager, VolumeSource};
+use crate::resource::crd::DataPod;
+use crate::util::error::kube_status;
 use kube::{Api, Client};
-use opendal::Operator;
-use std::collections::HashMap;
+use std::path::PathBuf;
 use std::sync::Arc;
-use tokio::sync::Mutex;
 use tonic::{Request, Response, Status};
-
-pub struct FullDataSource {
-    pub source: DataNode,
-    pub pod: DataPod,
-    pub secret: Option<Secret>,
-}
-
-pub struct PodInfo {
-    pub name: String,
-    pub namespace: String,
-    pub service_account: String,
-    pub uid: String,
-}
 
 pub struct NodeService {
     client: Client,
     node_id: String,
-    // Track mounted volumes for our dummy driver
-    mounts: Arc<Mutex<HashMap<String, Mount>>>,
+    manager: Arc<VolumeManager>,
 }
 
 impl NodeService {
-    pub fn new(client: Client, node_id: &str) -> Self {
+    pub fn new(client: Client, node_id: &str, manager: Arc<VolumeManager>) -> Self {
         Self {
             client,
             node_id: node_id.to_string(),
-            mounts: Arc::new(Mutex::new(HashMap::new())),
+            manager,
+        }
+    }
+
+    /// Turn the parsed context into a source, looking up the DataPod if needed.
+    async fn resolve_source(
+        &self,
+        source: ContextSource,
+        pod: &PodRef,
+    ) -> Result<(VolumeSource, Option<String>), Status> {
+        let (name, namespace, node, mode, writable) = match source {
+            ContextSource::Direct(source) => return Ok((source, None)),
+            ContextSource::DataPod {
+                name,
+                namespace,
+                node,
+                mode,
+                writable,
+            } => (name, namespace, node, mode, writable),
+        };
+
+        // A PVC may only name a DataPod in the namespace of the pod.
+        if namespace != pod.namespace {
+            return Err(Status::permission_denied(format!(
+                "DataPod {namespace}/{name} is not in the namespace of pod {}/{}",
+                pod.namespace, pod.name
+            )));
+        }
+        let api: Api<DataPod> = Api::namespaced(self.client.clone(), &namespace);
+        let data_pod = api
+            .get(&name)
+            .await
+            .map_err(|e| kube_status(e, &format!("DataPod {namespace}/{name}")))?;
+        let path = data_pod_path(&data_pod)?;
+        let node = match data_pod.spec.data_node_ref {
+            Some(node_ref) => DataNodeRef {
+                namespace: node_ref.namespace.unwrap_or_else(|| namespace.clone()),
+                name: node_ref.name,
+            },
+            None => node.ok_or_else(|| {
+                Status::failed_precondition(format!(
+                    "DataPod {namespace}/{name} has no DataNode yet"
+                ))
+            })?,
+        };
+        let source = VolumeSource::Tree {
+            node,
+            path,
+            mode,
+            writable,
+        };
+        Ok((source, data_pod.metadata.uid))
+    }
+}
+
+/// The folder of a DataPod inside its DataNode.
+///
+/// Without a path, the DataPod controller assigns "/<uid>". The same default is
+/// used here, so a pod that starts before the controller ran never sees the root
+/// of the DataNode.
+fn data_pod_path(data_pod: &DataPod) -> Result<String, Status> {
+    match data_pod.spec.path.as_deref() {
+        // An explicit path is taken exactly as written ("//" must never become
+        // the root, "team//run" never "team/run").
+        Some(path) if !path.is_empty() && path != "/" => {
+            if crate::util::opendal::exact_user_key(path).is_none() {
+                return Err(Status::invalid_argument(format!(
+                    "DataPod path {path:?} would name another storage folder"
+                )));
+            }
+            Ok(path.to_string())
+        }
+        _ => {
+            let uid = data_pod.metadata.uid.as_deref().ok_or_else(|| {
+                Status::unavailable("the DataPod has no path and no uid yet; try again later")
+            })?;
+            Ok(format!("/{uid}"))
         }
     }
 }
@@ -56,385 +113,170 @@ impl Node for NodeService {
         &self,
         _request: Request<NodeGetCapabilitiesRequest>,
     ) -> Result<Response<NodeGetCapabilitiesResponse>, Status> {
-        // Advertise stage_unstage_volume capability
-        let stage_unstage = NodeServiceCapability {
-            r#type: Some(crate::csi::node_service_capability::Type::Rpc(
-                crate::csi::node_service_capability::Rpc {
-                    r#type: crate::csi::node_service_capability::rpc::Type::StageUnstageVolume
-                        .into(),
-                },
-            )),
-        };
-
-        let response = NodeGetCapabilitiesResponse {
-            capabilities: vec![stage_unstage],
-        };
-
-        Ok(Response::new(response))
+        // kubedal does all work in NodePublishVolume, so no optional node RPCs are offered.
+        Ok(Response::new(NodeGetCapabilitiesResponse {
+            capabilities: vec![],
+        }))
     }
 
     async fn node_get_info(
         &self,
         _request: Request<NodeGetInfoRequest>,
     ) -> Result<Response<NodeGetInfoResponse>, Status> {
-        // Return basic node information
-        let response = NodeGetInfoResponse {
+        Ok(Response::new(NodeGetInfoResponse {
             node_id: self.node_id.clone(),
-            max_volumes_per_node: 1000, // Arbitrary limit for the dummy driver
+            max_volumes_per_node: 0, // no limit
             accessible_topology: None,
-        };
-
-        Ok(Response::new(response))
+        }))
     }
 
-    #[tracing::instrument(skip(self, request))]
+    #[tracing::instrument(skip(self, request), fields(volume_id))]
     async fn node_publish_volume(
         &self,
         request: Request<NodePublishVolumeRequest>,
     ) -> Result<Response<NodePublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        let volume_id = request.volume_id; // This is just the volume-handle 
-        let target_path = request.target_path;
-
-        if volume_id.is_empty() {
+        tracing::Span::current().record("volume_id", request.volume_id.as_str());
+        if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
         }
-
-        if target_path.is_empty() {
+        if request.target_path.is_empty() {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
+        let capability = request
+            .volume_capability
+            .as_ref()
+            .ok_or_else(|| Status::invalid_argument("Volume capability is missing"))?;
+        if !matches!(capability.access_type, Some(AccessType::Mount(_))) {
+            return Err(Status::invalid_argument(
+                "kubedal only supports file system volumes, not block volumes",
+            ));
+        }
 
-        let (full_data_source, mount_access) =
-            get_full_data_mount(self.client.clone(), &request.volume_context).await?;
-        let pod_info = get_pod_info(&request.volume_context)?;
+        let pod = request::pod_from_context(&request.volume_context)?;
+        let source = request::source_from_context(&request.volume_context, &pod)?;
+        let (source, data_pod_uid) = self.resolve_source(source, &pod).await?;
 
-        // Checks if the pods service account has access to the data source / secret
-        check_access(self.client.clone(), &full_data_source, &pod_info).await?;
-
-        // Read dataset into target path
         tracing::info!(
-            "Publishing volume '{}' with data source '{}' to '{}'",
-            volume_id,
-            full_data_source
-                .source
-                .metadata
-                .name
-                .clone()
-                .unwrap_or_default(),
-            target_path
+            "publishing volume {} for pod {}/{} at {}",
+            request.volume_id,
+            pod.namespace,
+            pod.name,
+            request.target_path
         );
-
-        let (operator, mount_mode, access_mode) = full_data_source
-            .into_parts(self.client.clone(), mount_access)
+        self.manager
+            .publish_detached(PublishRequest {
+                volume_id: request.volume_id,
+                target_path: PathBuf::from(request.target_path),
+                read_only: request.readonly,
+                pod,
+                source,
+                data_pod_uid,
+            })
             .await?;
-
-        let mut mount = Mount::new(
-            volume_id.clone(),
-            target_path,
-            operator,
-            mount_mode,
-            access_mode,
-        );
-        mount.mount().await?;
-
-        // Track this mount in our in-memory state
-        let mut mounts = self.mounts.lock().await;
-        mounts.insert(volume_id, mount);
-
         Ok(Response::new(NodePublishVolumeResponse {}))
     }
 
+    #[tracing::instrument(skip(self, request), fields(volume_id))]
     async fn node_unpublish_volume(
         &self,
         request: Request<NodeUnpublishVolumeRequest>,
     ) -> Result<Response<NodeUnpublishVolumeResponse>, Status> {
         let request = request.into_inner();
-        let volume_id = request.volume_id;
-        let target_path = request.target_path;
-
-        if volume_id.is_empty() {
+        tracing::Span::current().record("volume_id", request.volume_id.as_str());
+        if request.volume_id.is_empty() {
             return Err(Status::invalid_argument("Volume ID cannot be empty"));
         }
-
-        if target_path.is_empty() {
+        if request.target_path.is_empty() {
             return Err(Status::invalid_argument("Target path cannot be empty"));
         }
-
-        tracing::info!("Unpublishing volume '{}' from '{}'", volume_id, target_path);
-
-        // Remove from our tracking
-        let mut mounts = self.mounts.lock().await;
-        if let Some(mut mount) = mounts.remove(&volume_id) {
-            mount.unmount().await?;
-        }
-
+        tracing::info!(
+            "unpublishing volume {} from {}",
+            request.volume_id,
+            request.target_path
+        );
+        self.manager
+            .unpublish_detached(&request.volume_id, &PathBuf::from(request.target_path))
+            .await?;
         Ok(Response::new(NodeUnpublishVolumeResponse {}))
     }
 
-    // Not implemented methods (optional)
     async fn node_stage_volume(
         &self,
         _request: Request<crate::csi::NodeStageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeStageVolumeResponse>, Status> {
-        // Our simple driver doesn't support this
-        Ok(Response::new(crate::csi::NodeStageVolumeResponse {}))
+        Err(Status::unimplemented("NodeStageVolume is not supported"))
     }
 
     async fn node_unstage_volume(
         &self,
         _request: Request<crate::csi::NodeUnstageVolumeRequest>,
     ) -> Result<Response<crate::csi::NodeUnstageVolumeResponse>, Status> {
-        // Our simple driver doesn't support this
-        Ok(Response::new(crate::csi::NodeUnstageVolumeResponse {}))
+        Err(Status::unimplemented("NodeUnstageVolume is not supported"))
     }
 
     async fn node_expand_volume(
         &self,
         _request: Request<NodeExpandVolumeRequest>,
     ) -> Result<Response<NodeExpandVolumeResponse>, Status> {
-        // Our simple driver doesn't support this
         Err(Status::unimplemented("Volume expansion is not supported"))
     }
 
-    // Additional required methods
     async fn node_get_volume_stats(
         &self,
         _request: Request<crate::csi::NodeGetVolumeStatsRequest>,
     ) -> Result<Response<crate::csi::NodeGetVolumeStatsResponse>, Status> {
-        // Our simple driver doesn't support this
         Err(Status::unimplemented("NodeGetVolumeStats is not supported"))
     }
 }
 
-#[tracing::instrument]
-fn get_pod_info(volume_context: &HashMap<String, String>) -> Result<PodInfo, Status> {
-    // Fetch Pod meta from context and check with SubjectAccessReview
-    let pod_name = volume_context
-        .get("csi.storage.k8s.io/pod.name")
-        .expect("Pod name not provided");
-    let pod_namespace = volume_context
-        .get("csi.storage.k8s.io/pod.namespace")
-        .expect("Pod namespace not provided");
-    let pod_service_account = volume_context
-        .get("csi.storage.k8s.io/serviceAccount.name")
-        .expect("Pod service account not provided");
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::resource::crd::DataPodSpec;
 
-    let pod_uid = volume_context
-        .get("csi.storage.k8s.io/pod.uid")
-        .expect("Pod UID not provided");
-
-    Ok(PodInfo {
-        name: pod_name.clone(),
-        namespace: pod_namespace.clone(),
-        service_account: pod_service_account.clone(),
-        uid: pod_uid.clone(),
-    })
-}
-
-async fn get_full_data_mount(
-    client: Client,
-    volume_context: &HashMap<String, String>,
-) -> Result<(FullDataSource, MountAccess), Status> {
-    // Get DataSource meta from volume context
-    let data_node_name = volume_context
-        .get("kubedal.arunaengine.org/data-node-name")
-        .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode name not provided"))?;
-
-    let data_node_namespace = volume_context
-        .get("kubedal.arunaengine.org/data-node-namespace")
-        .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode namespace not provided"))?;
-
-    let data_pod_name = volume_context
-        .get("kubedal.arunaengine.org/data-pod-name")
-        .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode name not provided"))?;
-
-    let data_pod_namespace = volume_context
-        .get("kubedal.arunaengine.org/data-pod-namespace")
-        .cloned()
-        .ok_or_else(|| Status::invalid_argument("DataNode namespace not provided"))?;
-
-    let mount_mode = match volume_context
-        .get("kubedal.arunaengine.org/mount")
-        .ok_or_else(|| Status::invalid_argument("Resource namespace not provided"))?
-        .as_str()
-    {
-        "cache" => MountAccess::CacheReadOnly,
-        "cache-read-only" => MountAccess::CacheReadOnly,
-        "cache-read-write" => MountAccess::CacheReadWrite,
-        "fuse" => MountAccess::FuseReadOnly,
-        "fuse-read-only" => MountAccess::FuseReadOnly,
-        "fuse-read-write" => MountAccess::FuseReadWrite,
-        _ => return Err(Status::invalid_argument("Unsupported mount type")),
-    };
-
-    // Fetch DataNode, DataPod, [optional] Secret
-    let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &data_node_namespace);
-    let data_node = data_node_api.get(&data_node_name).await.map_err(|e| {
-        tracing::error!("Error getting DataNode: {:?}", e);
-        Status::internal("Error getting DataNode")
-    })?;
-
-    let data_pod_api: Api<DataPod> = Api::namespaced(client.clone(), &data_pod_namespace);
-    let data_pod = data_pod_api.get(&data_pod_name).await.map_err(|e| {
-        tracing::error!("Error getting DataPod: {:?}", e);
-        Status::internal("Error getting DataPod")
-    })?;
-
-    let secret = match data_node.spec.secret_ref.as_ref() {
-        None => None,
-        Some(secret_ref) => {
-            let secret_name = &secret_ref.name;
-            let secret_ns = secret_ref
-                .namespace
-                .as_ref()
-                .or(data_node.metadata.namespace.as_ref())
-                .ok_or_else(|| Status::invalid_argument("Secret namespace not provided"))?;
-            let secret_api: Api<Secret> = Api::namespaced(client.clone(), secret_ns);
-            let secret = secret_api
-                .get(secret_name)
-                .await
-                .map_err(|_| Status::not_found("Secret not found"))?;
-            Some(secret)
-        }
-    };
-
-    Ok((
-        FullDataSource {
-            source: data_node,
-            pod: data_pod,
-            secret,
-        },
-        mount_mode,
-    ))
-}
-
-#[tracing::instrument(skip(client, full_data_source, pod_info))]
-async fn check_access(
-    client: Client,
-    full_data_source: &FullDataSource,
-    pod_info: &PodInfo,
-) -> Result<(), Status> {
-    let auth_api: Api<SubjectAccessReview> = Api::all(client.clone());
-    let response = auth_api
-        .create(
-            &PostParams::default(),
-            &SubjectAccessReview {
-                metadata: Default::default(),
-                spec: SubjectAccessReviewSpec {
-                    resource_attributes: Some(ResourceAttributes {
-                        group: Some("kubedal.arunaengine.org".to_string()),
-                        name: full_data_source.source.metadata.name.clone(),
-                        namespace: full_data_source.source.metadata.namespace.clone(),
-                        resource: Some("datanodes".to_string()),
-                        verb: Some("get".to_string()),
-                        ..Default::default()
-                    }),
-                    user: Some(format!(
-                        "system:serviceaccount:{}:{}",
-                        pod_info.namespace, pod_info.service_account
-                    )),
-                    ..Default::default()
-                },
-                status: None,
+    fn data_pod(path: Option<&str>, uid: Option<&str>) -> DataPod {
+        let mut dp = DataPod::new(
+            "dp",
+            DataPodSpec {
+                path: path.map(str::to_string),
+                ..Default::default()
             },
-        )
-        .await
-        .map_err(|_| Status::internal("SubjectAccessReview failed"))?;
-    tracing::info!("SubjectAccessReview response: {:#?}", &response);
-
-    if let Some(status) = response.status {
-        if !status.allowed {
-            return Err(Status::permission_denied(format!(
-                "system:serviceaccount:{}:{}, has unsufficient permission to GET datanode.kubedal.arunaengine.org {:?} in namespace {:?}",
-                pod_info.namespace,
-                pod_info.service_account,
-                full_data_source
-                    .source
-                    .metadata
-                    .name
-                    .as_ref()
-                    .unwrap_or(&"".to_string()),
-                full_data_source
-                    .source
-                    .metadata
-                    .namespace
-                    .as_ref()
-                    .unwrap_or(&"".to_string())
-            )));
-        }
-    } else {
-        return Err(Status::permission_denied(
-            "SubjectAccessReview did not return status",
-        ));
+        );
+        dp.metadata.uid = uid.map(str::to_string);
+        dp
     }
 
-    if let Some(secret) = full_data_source.secret.as_ref() {
-        let response = auth_api
-            .create(
-                &PostParams::default(),
-                &SubjectAccessReview {
-                    metadata: Default::default(),
-                    spec: SubjectAccessReviewSpec {
-                        resource_attributes: Some(ResourceAttributes {
-                            name: secret.metadata.name.clone(),
-                            namespace: secret.metadata.namespace.clone(),
-                            resource: Some("secrets".to_string()),
-                            verb: Some("get".to_string()),
-                            ..Default::default()
-                        }),
-                        user: Some(format!(
-                            "system:serviceaccount:{}:{}",
-                            pod_info.namespace, pod_info.service_account
-                        )),
-                        ..Default::default()
-                    },
-                    status: None,
-                },
-            )
-            .await
-            .map_err(|_| Status::internal("SubjectAccessReview failed"))?;
-        tracing::info!("SubjectAccessReview response: {:#?}", &response);
-
-        if let Some(status) = response.status {
-            if !status.allowed {
-                return Err(Status::permission_denied(format!(
-                    "system:serviceaccount:{}:{}, has unsufficient permission to GET secret.kubernetes.io/secret {:?} in namespace {:?}",
-                    pod_info.namespace,
-                    pod_info.service_account,
-                    secret.metadata.name.as_ref().unwrap_or(&"".to_string()),
-                    secret
-                        .metadata
-                        .namespace
-                        .as_ref()
-                        .unwrap_or(&"".to_string())
-                )));
-            }
-        } else {
-            return Err(Status::permission_denied(
-                "SubjectAccessReview did not return status",
-            ));
-        }
+    #[test]
+    fn data_pod_without_path_uses_its_uid() {
+        assert_eq!(data_pod_path(&data_pod(None, Some("u1"))).unwrap(), "/u1");
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/"), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some(""), Some("u1"))).unwrap(),
+            "/u1"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(Some("/data"), Some("u1"))).unwrap(),
+            "/data"
+        );
+        assert_eq!(
+            data_pod_path(&data_pod(None, None)).unwrap_err().code(),
+            tonic::Code::Unavailable
+        );
     }
 
-    return Ok(());
-}
-
-impl FullDataSource {
-    pub async fn into_parts(
-        self,
-        client: Client,
-        mount_mode: MountAccess,
-    ) -> Result<(Operator, MountMode, AccessMode), Status> {
-        let (mode, access) = match mount_mode {
-            MountAccess::CacheReadWrite => (MountMode::Cached, AccessMode::ReadWrite),
-            MountAccess::CacheReadOnly => (MountMode::Cached, AccessMode::ReadOnly),
-            MountAccess::FuseReadWrite => (MountMode::Fuse, AccessMode::ReadWrite),
-            MountAccess::FuseReadOnly => (MountMode::Fuse, AccessMode::ReadOnly),
-        };
-
-        Ok((get_operator(&client, &self.source).await?, mode, access))
+    #[test]
+    fn explicit_data_pod_paths_are_taken_exactly_as_written() {
+        for path in ["//", "team//run", "team/./run", "run ", "//team"] {
+            let err = data_pod_path(&data_pod(Some(path), Some("u1"))).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{path:?}");
+        }
+        assert_eq!(
+            data_pod_path(&data_pod(Some("team/run"), Some("u1"))).unwrap(),
+            "team/run"
+        );
     }
 }

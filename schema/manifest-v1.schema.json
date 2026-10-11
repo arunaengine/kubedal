@@ -1,0 +1,118 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "kubedal file-list manifest",
+  "description": "Files to place in a kubedal file-list volume, directories to create, and where to upload the volume content when the pod ends.",
+  "type": "object",
+  "properties": {
+    "directories": {
+      "description": "Directories to create in the volume, for example for outputs.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "type": "string"
+      }
+    },
+    "files": {
+      "description": "Files to place in the volume.",
+      "type": "array",
+      "default": [],
+      "items": {
+        "$ref": "#/$defs/ManifestFile"
+      }
+    },
+    "upload": {
+      "description": "Where to upload the volume content when the pod ends.",
+      "anyOf": [
+        {
+          "$ref": "#/$defs/ManifestUpload"
+        },
+        {
+          "type": "null"
+        }
+      ]
+    },
+    "version": {
+      "description": "Format version. Must be 1.",
+      "type": "integer",
+      "format": "uint32",
+      "minimum": 0
+    }
+  },
+  "additionalProperties": false,
+  "required": [
+    "version"
+  ],
+  "$defs": {
+    "ManifestFile": {
+      "description": "One file to place in the volume.",
+      "type": "object",
+      "properties": {
+        "executable": {
+          "description": "Make the file executable (mode 0755 instead of 0644).",
+          "type": "boolean",
+          "default": false
+        },
+        "path": {
+          "description": "Path of the file inside the volume.",
+          "type": "string"
+        },
+        "sha256": {
+          "description": "Expected SHA-256 of the content, as 64 hex characters. Files with a digest are\nverified and shared through the node content cache.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "size": {
+          "description": "Expected size in bytes. Used to check the DataNode limit before downloading.",
+          "type": [
+            "integer",
+            "null"
+          ],
+          "format": "uint64",
+          "minimum": 0
+        },
+        "source": {
+          "description": "Path of the object inside the DataNode of the volume.",
+          "type": "string"
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "path",
+        "source"
+      ]
+    },
+    "ManifestUpload": {
+      "description": "Where to upload the volume content when the pod ends.",
+      "type": "object",
+      "properties": {
+        "dataNode": {
+          "description": "Name of the DataNode to upload to.",
+          "type": "string"
+        },
+        "dataNodeNamespace": {
+          "description": "Namespace of that DataNode. Defaults to the namespace of the pod.",
+          "type": [
+            "string",
+            "null"
+          ]
+        },
+        "path": {
+          "description": "Folder inside the volume to upload. Empty means the whole volume.",
+          "type": "string",
+          "default": ""
+        },
+        "prefix": {
+          "description": "Prefix inside the DataNode.",
+          "type": "string",
+          "default": ""
+        }
+      },
+      "additionalProperties": false,
+      "required": [
+        "dataNode"
+      ]
+    }
+  }
+}

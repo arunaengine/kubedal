@@ -1,0 +1,701 @@
+// Licensed to the Apache Software Foundation (ASF) under one
+// or more contributor license agreements.  See the NOTICE file
+// distributed with this work for additional information
+// regarding copyright ownership.  The ASF licenses this file
+// to you under the Apache License, Version 2.0 (the
+// "License"); you may not use this file except in compliance
+// with the License.  You may obtain a copy of the License at
+//
+//   http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing,
+// software distributed under the License is distributed on an
+// "AS IS" BASIS, WITHOUT WARRANTIES OR CONDITIONS OF ANY
+// KIND, either express or implied.  See the License for the
+// specific language governing permissions and limitations
+// under the License.
+
+use super::*;
+
+impl PathFilesystem for Filesystem {
+    // Init a fuse filesystem
+    async fn init(&self, _req: Request) -> Result<ReplyInit> {
+        Ok(ReplyInit {
+            max_write: NonZeroU32::new(16 * 1024).unwrap(),
+        })
+    }
+
+    // Callback when fs is being destroyed
+    async fn destroy(&self, _req: Request) {}
+
+    async fn lookup(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<ReplyEntry> {
+        tracing::debug!("lookup(parent={parent:?}, name={name:?})");
+
+        let path = PathBuf::from(parent).join(name);
+        let now = SystemTime::now();
+        // A file that is being written may not be uploaded yet.
+        if let Some(size) = self.spool_size(path.as_os_str()).await? {
+            let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
+            return Ok(ReplyEntry {
+                ttl: TTL,
+                attr: FileAttr { size, ..attr },
+            });
+        }
+        let metadata = self
+            .stat_entry(&key_of(path.as_os_str())?)
+            .await
+            .map_err(opendal_error2errno)?;
+        let attr = metadata2file_attr(&metadata, now, self.uid, self.gid);
+
+        Ok(ReplyEntry { ttl: TTL, attr })
+    }
+
+    async fn getattr(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: Option<u64>,
+        flags: u32,
+    ) -> Result<ReplyAttr> {
+        tracing::debug!("getattr(path={path:?}, fh={fh:?}, flags={flags:?})");
+
+        // A handle with a state answers from that state: it keeps working after
+        // unlink and never shows a newer file that got the same name.
+        let handle_state = fh.and_then(|fh| {
+            self.opened_files
+                .get(FileKey::try_from(fh).ok()?.0)
+                .and_then(|f| f.write.clone().or_else(|| f.read_state.clone()))
+        });
+        // A reader without a state answers from what it saw at open, also after
+        // a rename or unlink of the name.
+        let reader_attr = fh.and_then(|fh| {
+            let f = self.opened_files.get(FileKey::try_from(fh).ok()?.0)?;
+            let removed = f.name_removed.load(std::sync::atomic::Ordering::SeqCst);
+            (f.write.is_none() && f.read_state.is_none())
+                .then_some(f.size.map(|size| (size, f.mtime, removed)))
+                .flatten()
+        });
+        if let Some((size, mtime, removed)) = reader_attr {
+            let now = SystemTime::now();
+            let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
+            let mtime = mtime.unwrap_or(now);
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr {
+                    size,
+                    mtime,
+                    ctime: mtime,
+                    // a handle whose name was removed has no links left
+                    nlink: if removed { 0 } else { attr.nlink },
+                    ..attr
+                },
+            });
+        }
+        if let Some(state) = handle_state {
+            let size = state.lock().await.len;
+            let attr =
+                dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
+            // An open file whose name was removed has no links left.
+            let nlink = if state.is_unlinked() { 0 } else { attr.nlink };
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr {
+                    size,
+                    nlink,
+                    ..attr
+                },
+            });
+        }
+
+        // A file that is being written may not be uploaded yet; its size is local.
+        let fh_path = fh.and_then(|fh| {
+            self.opened_files
+                .get(FileKey::try_from(fh).ok()?.0)
+                .map(|f| f.path.clone())
+        });
+        let spool_path = path.map(OsStr::to_os_string).or(fh_path);
+        let spool_size = match &spool_path {
+            Some(p) => self.spool_size(p).await?,
+            None => None,
+        };
+        if let Some(size) = spool_size {
+            let attr =
+                dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
+            return Ok(ReplyAttr {
+                ttl: TTL,
+                attr: FileAttr { size, ..attr },
+            });
+        }
+
+        let fh_path = fh.and_then(|fh| {
+            self.opened_files
+                .get(FileKey::try_from(fh).ok()?.0)
+                .map(|f| f.path.clone())
+        });
+
+        let file_path = match (path.map(Into::into), fh_path) {
+            // After a rename the path is the current name; it wins.
+            (Some(a), Some(_)) => Some(a),
+            (a, b) => a.or(b),
+        };
+
+        let metadata = self
+            .stat_entry(&key_of(file_path.unwrap_or_default().as_os_str())?)
+            .await
+            .map_err(opendal_error2errno)?;
+
+        let now = SystemTime::now();
+        let attr = metadata2file_attr(&metadata, now, self.uid, self.gid);
+
+        Ok(ReplyAttr { ttl: TTL, attr })
+    }
+
+    async fn setattr(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: Option<u64>,
+        set_attr: SetAttr,
+    ) -> Result<ReplyAttr> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("setattr(path={path:?}, fh={fh:?}, set_attr={set_attr:?})");
+
+        if let Some(size) = set_attr.size {
+            self.truncate(path, fh, size).await?;
+        }
+        self.getattr(_req, path, fh, 0).await
+    }
+
+    async fn mkdir(
+        &self,
+        _req: Request,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        _umask: u32,
+    ) -> Result<ReplyEntry> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("mkdir(parent={parent:?}, name={name:?}, mode=0o{mode:o})");
+
+        let path = PathBuf::from(parent).join(name);
+        self.op
+            .create_dir(&dir_key_of(path.as_os_str())?)
+            .await
+            .map_err(opendal_error2errno)?;
+
+        let now = SystemTime::now();
+        let attr = dummy_file_attr(FileType::Directory, now, self.uid, self.gid);
+
+        Ok(ReplyEntry { ttl: TTL, attr })
+    }
+
+    async fn unlink(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("unlink(parent={parent:?}, name={name:?})");
+
+        let path = PathBuf::from(parent).join(name);
+        // Read-only handles that read the object keep a copy of it.
+        let key = key_of(path.as_os_str())?;
+        self.preserve_readers(&key).await?;
+        // Open handles keep their content, but it must never be uploaded again.
+        self.unlink_state(path.as_os_str()).await?;
+        self.name_gone(&key);
+        Ok(())
+    }
+
+    async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("rmdir(parent={parent:?}, name={name:?})");
+
+        let path = PathBuf::from(parent).join(name);
+        // A folder with files that exist only in the spool (not uploaded yet) is
+        // not empty; removing it would let their upload create it again.
+        let ns = self.states.lock_namespace().await;
+        let key = key_of(path.as_os_str())?;
+        let prefix = format!("{key}/");
+        if self.states.has_live_under(&ns, &prefix).await {
+            return Err(Errno::from(libc::ENOTEMPTY));
+        }
+        // mkdir writes the folder marker "dir/"; that is what goes. A folder
+        // that still lists children in storage is not empty.
+        let dir = dir_key_of(path.as_os_str())?;
+        let mut lister = self.op.lister(&dir).await.map_err(opendal_error2errno)?;
+        while let Some(entry) = lister.next().await {
+            let entry = entry.map_err(opendal_error2errno)?;
+            if entry.path() != dir {
+                return Err(Errno::from(libc::ENOTEMPTY));
+            }
+        }
+        self.op.delete(&dir).await.map_err(opendal_error2errno)?;
+
+        Ok(())
+    }
+
+    async fn rename(
+        &self,
+        _req: Request,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+    ) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!(
+            "rename(p={origin_parent:?}, name={origin_name:?}, newp={parent:?}, newname={name:?})"
+        );
+
+        let origin_path = PathBuf::from(origin_parent).join(origin_name);
+        let path = PathBuf::from(parent).join(name);
+
+        let (from, to) = (key_of(origin_path.as_os_str())?, key_of(path.as_os_str())?);
+        // The namespace lock is held for the whole rename, also during storage
+        // calls, so no other name change can come in between.
+        let ns = self.states.lock_namespace().await;
+        // Read-only handles that read the source or the replaced target object
+        // keep a copy of what they opened.
+        if from != to {
+            self.preserve_readers(&from).await?;
+            self.preserve_readers(&to).await?;
+        }
+        // A file with a spool holds its whole content, so the rename only moves
+        // the spool to the new key and removes the old object.
+        if self
+            .states
+            .rename(&ns, &self.op, &from, &to)
+            .await
+            .map_err(status_errno)?
+        {
+            if from != to {
+                self.name_moved(&from, &to);
+            }
+            return Ok(());
+        }
+
+        // Without a storage rename, the source is checked and opened first, so
+        // its failures stop nothing: the destination is not touched yet.
+        let native = self.op.info().capability().rename;
+        let source = if native {
+            None
+        } else {
+            self.open_copy_source(&from).await?
+        };
+        // A file open under the new name loses it, but only once the storage
+        // rename worked; it must never upload over the renamed file later.
+        self.states
+            .rename_closed(
+                &ns,
+                &self.op,
+                &from,
+                &to,
+                || async {
+                    if native {
+                        self.op
+                            .rename(&from, &to)
+                            .await
+                            .map_err(opendal_error2errno)?;
+                        return Ok(false);
+                    }
+                    self.copy_for_rename(&from, &to, source)
+                        .await
+                        .map(|()| true)
+                },
+                status_errno,
+            )
+            .await?;
+        // Only now the names changed.
+        if from != to {
+            self.name_moved(&from, &to);
+        }
+        Ok(())
+    }
+
+    async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
+        tracing::debug!("opendir(path={path:?}, flags=0x{flags:x})");
+        // Reply flags are FOPEN_* bits, not the O_* flags of the request.
+        Ok(ReplyOpen { fh: 0, flags: 0 })
+    }
+
+    async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
+        let _running = self.enter()?;
+        tracing::debug!("open(path={path:?}, flags=0x{flags:x})");
+
+        let (is_read, is_write, is_append) = self.check_flags(flags)?;
+        let write = if is_write {
+            let truncate = flags & libc::O_TRUNC as u32 != 0;
+            Some(self.open_write(path, !truncate).await?)
+        } else {
+            None
+        };
+
+        // A reader holds the state that is live when it opens, or else remembers
+        // the size and version (etag) of the object. So it never sees content of
+        // another file that later gets the same name.
+        let read_state = match write {
+            None => self.live_state(path).await?,
+            Some(_) => None,
+        };
+        let stateless = write.is_none() && read_state.is_none();
+        let (size, etag, mtime) = if stateless {
+            let meta = self
+                .op
+                .stat(&key_of(path)?)
+                .await
+                .map_err(opendal_error2errno)?;
+            (
+                Some(meta.content_length()),
+                meta.etag().map(str::to_string),
+                meta.last_modified().map(Into::into),
+            )
+        } else {
+            (None, None, None)
+        };
+
+        let key = self
+            .opened_files
+            .insert(OpenedFile {
+                path: path.into(),
+                is_read,
+                write,
+                read_state,
+                append: is_append,
+                size,
+                etag,
+                mtime,
+                snapshot: Default::default(),
+                name_removed: Default::default(),
+            })
+            .ok_or(Errno::from(libc::EBUSY))?;
+        if stateless {
+            self.track_reader(&key_of(path)?, key);
+        }
+
+        // Reply flags are FOPEN_* bits, not the O_* flags of the request (O_EXCL
+        // would read as FOPEN_PASSTHROUGH, which the kernel refuses).
+        Ok(ReplyOpen {
+            fh: FileKey(key).to_fh(),
+            flags: 0,
+        })
+    }
+
+    async fn read(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        offset: u64,
+        size: u32,
+    ) -> Result<ReplyData> {
+        tracing::debug!("read(path={path:?}, fh={fh}, offset={offset}, size={size})");
+
+        let (file_path, file_size, state, etag) = {
+            let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
+            if !file.is_read {
+                Err(Errno::from(libc::EACCES))?;
+            }
+            (
+                key_of(file.path.as_os_str())?,
+                file.size,
+                file.write
+                    .clone()
+                    .or_else(|| file.read_state.clone())
+                    .or_else(|| file.snapshot.get().cloned()),
+                file.etag.clone(),
+            )
+        };
+
+        // A handle with a state reads from its spool file. It stays readable after
+        // unlink or close, because the handle keeps the open spool file.
+        if let Some(state) = state {
+            let data = state.lock().await.read_at(offset, size).map_err(io_errno)?;
+            return Ok(ReplyData { data: data.into() });
+        }
+
+        let mut end = offset.saturating_add(u64::from(size));
+        if let Some(file_size) = file_size {
+            if offset >= file_size {
+                return Ok(ReplyData { data: Bytes::new() });
+            }
+            end = end.min(file_size);
+        }
+        self.states.pause.hit("read_storage").await;
+        let mut read = self.op.read_with(&file_path).range(offset..end);
+        if let Some(etag) = etag {
+            read = read.if_match(&etag);
+        }
+        let result = read.await;
+        // An unlink or rename may have given this handle a copy while the read
+        // waited on storage; the copy has the content it opened.
+        let copy = self
+            .get_opened_file(FileKey::try_from(fh)?, path)?
+            .snapshot
+            .get()
+            .cloned();
+        if let Some(copy) = copy {
+            let data = copy.lock().await.read_at(offset, size).map_err(io_errno)?;
+            return Ok(ReplyData { data: data.into() });
+        }
+        let data = match result {
+            Ok(buffer) => buffer.to_bytes(),
+            // The object changed since this handle opened it.
+            Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {
+                return Err(Errno::from(libc::ESTALE));
+            }
+            // A read at or after the end of the file returns no data.
+            Err(err) if err.kind() == ErrorKind::RangeNotSatisfied => Bytes::new(),
+            Err(err) => return Err(opendal_error2errno(err)),
+        };
+
+        Ok(ReplyData { data })
+    }
+
+    async fn write(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        offset: u64,
+        data: &[u8],
+        _write_flags: u32,
+        flags: u32,
+    ) -> Result<ReplyWrite> {
+        self.states.pause.hit("before_enter").await;
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!(
+            "write(path={:?}, fh={}, offset={}, data_len={}, flags=0x{:x})",
+            path,
+            fh,
+            offset,
+            data.len(),
+            flags
+        );
+
+        let (state, append) = {
+            let file = self.get_opened_file(FileKey::try_from(fh)?, path)?;
+            match file.write.clone() {
+                Some(state) => (state, file.append),
+                None => Err(Errno::from(libc::EACCES))?,
+            }
+        };
+
+        let mut guard = state.lock().await;
+        // Another operation may have stopped the file system meanwhile.
+        self.check_writable()?;
+        if guard.closed {
+            return Err(Errno::from(libc::EBADF));
+        }
+        // With O_APPEND every write goes to the current end, also when other
+        // handles made the file longer since the kernel last asked for its size.
+        let offset = if append { guard.len } else { offset };
+        self.states
+            .write(&state, &mut guard, data, offset)
+            .map_err(io_errno)?;
+
+        Ok(ReplyWrite {
+            written: data.len() as _,
+        })
+    }
+
+    async fn release(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        flags: u32,
+        lock_owner: u64,
+        flush: bool,
+    ) -> Result<()> {
+        let _running = self.enter()?;
+        tracing::debug!(
+            "release(path={path:?}, fh={fh}, flags=0x{flags:x}, lock_owner={lock_owner}, flush={flush})"
+        );
+
+        let file_key = FileKey::try_from(fh)?.0;
+        let file = self
+            .opened_files
+            .take(file_key)
+            .ok_or(Errno::from(libc::EBADF))?;
+        self.untrack_reader(file_key);
+
+        // Release comes once, after the last file descriptor is closed. Its result
+        // does not reach the program, so this upload is only a last attempt.
+        if let Some(state) = file.write {
+            self.release_state(state).await?;
+        }
+        Ok(())
+    }
+
+    /// Flush is called on every close of a file descriptor, also for duplicated
+    /// descriptors. The content is uploaded here, so `close` returns upload errors.
+    /// More writes can follow; they are uploaded by the next flush.
+    async fn flush(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        lock_owner: u64,
+    ) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("flush(path={path:?}, fh={fh}, lock_owner={lock_owner})");
+        self.upload_open_file(path, fh).await
+    }
+
+    async fn fsync(
+        &self,
+        _req: Request,
+        path: Option<&OsStr>,
+        fh: u64,
+        datasync: bool,
+    ) -> Result<()> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!("fsync(path={path:?}, fh={fh}, datasync={datasync})");
+        self.upload_open_file(path, fh).await
+    }
+
+    async fn readdir<'a>(
+        &'a self,
+        _req: Request,
+        path: &'a OsStr,
+        fh: u64,
+        offset: i64,
+    ) -> Result<ReplyDirectory<impl futures::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
+    {
+        self.readdir_impl(_req, path, fh, offset).await
+    }
+
+    async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<()> {
+        tracing::debug!("access(path={path:?}, mask=0x{mask:x})");
+
+        self.stat_entry(&key_of(path)?)
+            .await
+            .map_err(opendal_error2errno)?;
+
+        Ok(())
+    }
+
+    async fn create(
+        &self,
+        _req: Request,
+        parent: &OsStr,
+        name: &OsStr,
+        mode: u32,
+        flags: u32,
+    ) -> Result<ReplyCreated> {
+        let _running = self.enter()?;
+        self.check_writable()?;
+        tracing::debug!(
+            "create(parent={parent:?}, name={name:?}, mode=0o{mode:o}, flags=0x{flags:x})"
+        );
+
+        let (is_read, _, is_append) = self.check_flags(flags | libc::O_CREAT as u32)?;
+
+        let path = PathBuf::from(parent).join(name);
+
+        let (is_read, is_append) = (is_read, is_append);
+        // A new name: start empty (O_EXCL and a missing file both mean that).
+        let write = Some(self.open_write(path.as_os_str(), false).await?);
+
+        let now = SystemTime::now();
+        let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
+
+        let key = self
+            .opened_files
+            .insert(OpenedFile {
+                path: path.into(),
+                is_read,
+                write,
+                read_state: None,
+                append: is_append,
+                size: None,
+                etag: None,
+                mtime: None,
+                snapshot: Default::default(),
+                name_removed: Default::default(),
+            })
+            .ok_or(Errno::from(libc::EBUSY))?;
+
+        Ok(ReplyCreated {
+            ttl: TTL,
+            attr,
+            generation: 0,
+            fh: FileKey(key).to_fh(),
+            // FOPEN_* bits, not the O_* flags of the request.
+            flags: 0,
+        })
+    }
+
+    async fn readdirplus<'a>(
+        &'a self,
+        _req: Request,
+        parent: &'a OsStr,
+        fh: u64,
+        offset: u64,
+        _lock_owner: u64,
+    ) -> Result<
+        ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>,
+    > {
+        self.readdirplus_impl(_req, parent, fh, offset, _lock_owner)
+            .await
+    }
+
+    async fn rename2(
+        &self,
+        req: Request,
+        origin_parent: &OsStr,
+        origin_name: &OsStr,
+        parent: &OsStr,
+        name: &OsStr,
+        flags: u32,
+    ) -> Result<()> {
+        tracing::debug!(
+            "rename2(origin_parent={origin_parent:?}, origin_name={origin_name:?}, parent={parent:?}, name={name:?}, flags={flags})"
+        );
+        match flags {
+            0 => {}
+            libc::RENAME_NOREPLACE => {
+                // Checked before the rename; not atomic against a file created
+                // at the same moment by another program.
+                let path = PathBuf::from(parent).join(name);
+                if self.spool_size(path.as_os_str()).await?.is_some() {
+                    return Err(Errno::from(libc::EEXIST));
+                }
+                // Only "not found" means the name is free; other errors are real.
+                let lookup = if self.states.pause.should_fail("noreplace_lookup") {
+                    Err(opendal::Error::new(ErrorKind::PermissionDenied, "injected"))
+                } else {
+                    self.stat_entry(&key_of(path.as_os_str())?).await
+                };
+                match lookup {
+                    Ok(_) => return Err(Errno::from(libc::EEXIST)),
+                    Err(err) if err.kind() == ErrorKind::NotFound => {}
+                    Err(err) => return Err(opendal_error2errno(err)),
+                }
+            }
+            // RENAME_EXCHANGE, RENAME_WHITEOUT and unknown flags.
+            _ => return Err(Errno::from(libc::EINVAL)),
+        }
+        self.rename(req, origin_parent, origin_name, parent, name)
+            .await
+    }
+
+    async fn statfs(&self, _req: Request, path: &OsStr) -> Result<ReplyStatFs> {
+        tracing::debug!("statfs(path={path:?})");
+        Ok(ReplyStatFs {
+            blocks: 1,
+            bfree: 0,
+            bavail: 0,
+            files: 1,
+            ffree: 0,
+            bsize: 4096,
+            namelen: u32::MAX,
+            frsize: 0,
+        })
+    }
+}

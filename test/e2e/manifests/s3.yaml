@@ -1,0 +1,57 @@
+# An S3 compatible server for the end-to-end test. Any S3 server works;
+# RustFS is used because it is small and its image is freely available.
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: e2e
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: s3
+  namespace: e2e
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      app: s3
+  template:
+    metadata:
+      labels:
+        app: s3
+    spec:
+      containers:
+        - name: s3
+          image: S3_IMAGE
+          env:
+            - name: RUSTFS_ACCESS_KEY
+              value: e2e-access
+            - name: RUSTFS_SECRET_KEY
+              value: e2e-secret-key
+            - name: MINIO_ROOT_USER
+              value: e2e-access
+            - name: MINIO_ROOT_PASSWORD
+              value: e2e-secret-key
+          ports:
+            - containerPort: 9000
+          readinessProbe:
+            tcpSocket:
+              port: 9000
+          volumeMounts:
+            - name: data
+              mountPath: /data
+      volumes:
+        - name: data
+          emptyDir: {}
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: s3
+  namespace: e2e
+spec:
+  selector:
+    app: s3
+  ports:
+    - port: 9000
+      targetPort: 9000

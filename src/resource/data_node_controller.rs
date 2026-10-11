@@ -21,7 +21,9 @@ const DATASOURCE_FINALIZER: &str = "kubedal.arunaengine.org/datanode";
 
 #[instrument(skip(ctx, res), fields(trace_id))]
 pub async fn reconcile_dn(res: Arc<DataNode>, ctx: Arc<Context>) -> Result<Action, Error> {
-    let ns = res.namespace().unwrap(); // res is namespace scoped
+    let ns = res
+        .namespace()
+        .ok_or_else(|| Error::ReconcilerError(format!("{} has no namespace", res.name_any())))?;
     let dn: Api<DataNode> = Api::namespaced(ctx.client.clone(), &ns);
 
     info!("Reconciling Document \"{}\" in {}", res.name_any(), ns);
@@ -57,7 +59,7 @@ impl DataNode {
         let data_node_api: Api<DataNode> = Api::namespaced(client.clone(), &ns);
 
         // Check OpenDAL
-        let operator = get_operator(&client, &self).await?;
+        let operator = get_operator(&client, self).await?;
         operator
             .check()
             .await

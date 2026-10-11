@@ -74,7 +74,7 @@ kind: Secret
 metadata:
   name: s3-credentials
   namespace: default
-type: Kubedal
+type: Opaque
 stringData:
   access_key_id: "minioadmin" # Must be exactly as defined in the opendal config
   secret_access_key: "minioadmin" # Must be exactly as defined in the opendal config
@@ -86,8 +86,6 @@ metadata:
   name: example-dataset-pvc
   namespace: default
   annotations:
-    kubedal.arunaengine.org/data-node-name: example-s3-node #TODO: Remove -> Use dataNodeRef in DataPod spec
-    kubedal.arunaengine.org/data-node-namespace: default    #TODO: Remove -> Use dataNodeRef in DataPod spec
     kubedal.arunaengine.org/data-pod-name: example-data-pod
     kubedal.arunaengine.org/data-pod-namespace: default
     kubedal.arunaengine.org/mount: fuse-read-write

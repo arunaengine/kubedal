@@ -1,35 +1,46 @@
 [package]
 name = "kubedal"
-version = "0.1.0"
+version = "0.2.0"
 edition = "2024"
+rust-version = "1.88"
 
 [dependencies]
-clap = "4.5.34"
+bytes = "1.10"
+clap = "4.6"
 futures = "0.3.31"
-k8s-openapi = { version = "0.24.0", features = ["v1_29", "schemars"] }
-kube = { version = "0.99.0", features = ["derive", "runtime"] }
-opendal = { version = "0.52.0", features = ["services-s3", "services-http"] }
-fuse3 = { version = "0.8.1", features = ["unprivileged", "tokio-runtime"] }
-fuse3_opendal = "0.0.13"
-prost = "0.13.5"
-prost-types = "0.13.5"
+k8s-openapi = { version = "0.28.0", features = ["v1_32", "schemars"] }
+kube = { version = "4.2.0", default-features = false, features = ["client", "rustls-tls", "aws-lc-rs", "derive", "runtime"] }
+opendal = { version = "0.59.4", features = [
+    "services-s3",
+    "services-http",
+    "services-gcs",
+    "services-azblob",
+    "services-fs",
+    "services-memory",
+] }
+fuse3 = { version = "0.9.0", features = ["unprivileged", "tokio-runtime"] }
+libc = "0.2"
+prost = "0.14.4"
+prost-types = "0.14.4"
 serde = "1.0.219"
 serde_json = "1.0.140"
-tokio = { version = "1.44.1", features = ["full"] }
+sharded-slab = "0.1.7"
+tokio = { version = "1.53", features = ["full"] }
 tokio-stream = { version = "0.1.17", features = ["net"] }
-tonic = { version = "0.12.3", features = ["server"] }
-uuid = "1.16.0"
+tonic = { version = "0.14.6", features = ["server"] }
+tonic-prost = "0.14.6"
+uuid = { version = "1.16.0", features = ["v4"] }
 tracing = "0.1.41"
 tracing-subscriber = { version = "0.3.19", features = ["env-filter", "fmt"] }
-schemars = "0.8.22"
+schemars = "1.2"
 serde_yaml = "0.9.34"
+tempfile = "3.27.0"
 thiserror = "2.0.12"
-sys-mount = "3.0.1"
-rand = "0.9.0"
+sha2 = "0.10"
+rustix = { version = "1", features = ["fs"] }
 
 [build-dependencies]
-tonic-build = "0.12.3"
-
+tonic-prost-build = "0.14.6"
 
 [[bin]]
 name = "kubedal"
@@ -38,3 +49,8 @@ path = "src/main.rs"
 [[bin]]
 name = "crdgen"
 path = "src/crdgen.rs"
+
+# fuse3 0.9.0 reuses an inode number while an unlinked file is still open. The
+# fork keeps a number until the kernel forgets the inode. See the README.
+[patch.crates-io]
+fuse3 = { git = "https://github.com/arunaengine/fuse3", rev = "fd12cfce29a108323b82905c1a129b7b1f87151d" }

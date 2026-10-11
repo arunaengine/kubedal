@@ -16,6 +16,11 @@ use crate::csi::{
     ListVolumesRequest, ListVolumesResponse, ValidateVolumeCapabilitiesRequest,
     ValidateVolumeCapabilitiesResponse, Volume,
 };
+use crate::node::request::{
+    ANN_DATA_NODE_NAME, ANN_DATA_NODE_NAMESPACE, ANN_DATA_POD_NAME, ANN_DATA_POD_NAMESPACE,
+    ANN_MOUNT, parse_mount,
+};
+use crate::util::error::kube_status;
 
 pub struct ControllerService {
     // In-memory storage for volumes (for a dummy driver)
@@ -24,14 +29,24 @@ pub struct ControllerService {
 }
 
 impl ControllerService {
-    pub async fn new(client: Client) -> Self {
+    pub async fn new(client: Client, storage_class: String) -> Self {
         // Spawn the controller / resource reconciler
-        tokio::spawn(crate::resource::controller::run(client.clone()));
+        tokio::spawn(crate::resource::controller::run(
+            client.clone(),
+            storage_class,
+        ));
 
         Self {
             client,
             volumes: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Lock the volume map. A poisoned lock still holds valid data, so it is used as is.
+    fn lock_volumes(&self) -> std::sync::MutexGuard<'_, HashMap<String, Volume>> {
+        self.volumes
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -53,18 +68,8 @@ impl Controller for ControllerService {
             )),
         };
 
-        let snapshot = ControllerServiceCapability {
-            r#type: Some(crate::csi::controller_service_capability::Type::Rpc(
-                crate::csi::controller_service_capability::Rpc {
-                    r#type:
-                        crate::csi::controller_service_capability::rpc::Type::CreateDeleteSnapshot
-                            .into(),
-                },
-            )),
-        };
-
         let response = ControllerGetCapabilitiesResponse {
-            capabilities: vec![create_delete, snapshot],
+            capabilities: vec![create_delete],
         };
 
         Ok(Response::new(response))
@@ -82,25 +87,15 @@ impl Controller for ControllerService {
             return Err(Status::invalid_argument("Volume name cannot be empty"));
         }
 
-        {
-            let volumes = self.volumes.lock().unwrap();
-            // Check if volume already exists
-            if volumes.contains_key(&request.name) {
-                let existing_volume = volumes.get(&request.name).unwrap().clone();
-                return Ok(Response::new(CreateVolumeResponse {
-                    volume: Some(existing_volume),
-                }));
-            }
+        // CreateVolume must be idempotent: return the volume created before.
+        if let Some(existing_volume) = self.lock_volumes().get(&request.name).cloned() {
+            return Ok(Response::new(CreateVolumeResponse {
+                volume: Some(existing_volume),
+            }));
         }
 
-        let namespace = request.parameters.get("resourceNamespace").ok_or_else(|| {
-            tracing::error!("Resource namespace not provided in parameters");
-            Status::invalid_argument("Resource namespace not provided in parameters")
-        })?;
-
-        let client = self.client.clone();
-        let pvc_meta = get_pvc(client.clone(), namespace, &request.name).await?;
-        let context = get_config_from_pvc_meta(pvc_meta.clone()).await?;
+        let pvc_meta = find_pvc(self.client.clone(), &request.parameters, &request.name).await?;
+        let context = context_from_pvc_meta(&pvc_meta)?;
 
         tracing::trace!("PVC meta: {:?}", pvc_meta);
         tracing::trace!("Volume context: {:?}", context);
@@ -112,7 +107,7 @@ impl Controller for ControllerService {
         );
 
         // Create a new volume entry
-        let volume_id = format!("kubedal-{}", uuid::Uuid::new_v4());
+        let volume_id = volume_id_for(&request.name, &request.parameters);
         let capacity_bytes = request
             .capacity_range
             .map_or(5 * 1024 * 1024 * 1024, |range| range.required_bytes);
@@ -125,8 +120,7 @@ impl Controller for ControllerService {
             volume_context: context,
         };
 
-        let mut volumes = self.volumes.lock().unwrap();
-        volumes.insert(request.name, volume.clone());
+        self.lock_volumes().insert(request.name, volume.clone());
 
         Ok(Response::new(CreateVolumeResponse {
             volume: Some(volume),
@@ -150,7 +144,7 @@ impl Controller for ControllerService {
         // In a real driver, we would clean up any resources associated with this volume
         // For our dummy driver, we'll just remove it from our in-memory map
 
-        let mut volumes = self.volumes.lock().unwrap();
+        let mut volumes = self.lock_volumes();
 
         // Find and remove the volume by ID
         let volume_key = volumes
@@ -205,7 +199,7 @@ impl Controller for ControllerService {
         _request: Request<ListVolumesRequest>,
     ) -> Result<Response<ListVolumesResponse>, Status> {
         // List all volumes in our in-memory storage
-        let volumes = self.volumes.lock().unwrap();
+        let volumes = self.lock_volumes();
         let entries = volumes
             .values()
             .map(|v| crate::csi::list_volumes_response::Entry {
@@ -288,122 +282,153 @@ impl Controller for ControllerService {
     }
 }
 
-async fn get_pvc(client: Client, namespace: &str, uid: &str) -> Result<ObjectMeta, Status> {
-    let uid = uid.strip_prefix("pvc-").ok_or_else(|| {
-        tracing::error!("PVC name not provided in request");
-        Status::invalid_argument("PVC name not provided in request")
+/// The volume ID for a CreateVolume request. It only depends on the request
+/// name and parameters, so retries, overlapping calls and calls after a restart
+/// all get the same ID.
+fn volume_id_for(name: &str, parameters: &HashMap<String, String>) -> String {
+    use sha2::{Digest, Sha256};
+    let mut entries: Vec<_> = parameters.iter().collect();
+    entries.sort();
+    let mut hasher = Sha256::new();
+    hasher.update(name.as_bytes());
+    for (key, value) in entries {
+        hasher.update([0u8]);
+        hasher.update(key.as_bytes());
+        hasher.update([0u8]);
+        hasher.update(value.as_bytes());
+    }
+    format!(
+        "kubedal-{}",
+        &crate::node::paths::to_hex(&hasher.finalize())[..32]
+    )
+}
+
+/// Find the PVC that a CreateVolume call is for.
+///
+/// With the csi-provisioner flag `--extra-create-metadata`, the parameters hold the
+/// PVC name and namespace. Without it, the PVC is found by its UID (the volume name
+/// is `pvc-<uid>`) in the namespace given by the `resourceNamespace` parameter.
+async fn find_pvc(
+    client: Client,
+    parameters: &HashMap<String, String>,
+    volume_name: &str,
+) -> Result<ObjectMeta, Status> {
+    if let (Some(name), Some(namespace)) = (
+        parameters.get("csi.storage.k8s.io/pvc/name"),
+        parameters.get("csi.storage.k8s.io/pvc/namespace"),
+    ) {
+        let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
+        let pvc = pvcs
+            .get_metadata(name)
+            .await
+            .map_err(|e| kube_status(e, &format!("PVC {namespace}/{name}")))?;
+        return Ok(pvc.metadata);
+    }
+
+    let namespace = parameters.get("resourceNamespace").ok_or_else(|| {
+        Status::invalid_argument(
+            "cannot find the PVC: enable --extra-create-metadata in csi-provisioner \
+             or set the resourceNamespace parameter in the StorageClass",
+        )
     })?;
-
+    let uid = volume_name.strip_prefix("pvc-").ok_or_else(|| {
+        Status::invalid_argument(format!(
+            "volume name {volume_name} does not start with pvc-"
+        ))
+    })?;
     let pvcs: Api<PersistentVolumeClaim> = Api::namespaced(client, namespace);
-
     let all_pvc = pvcs
         .list_metadata(&ListParams::default())
         .await
-        .map_err(|e| {
-            tracing::error!("Error listing PVCs: {:?}", e);
-            Status::internal("Error listing PVCs")
-        })?;
-
-    let pvc = all_pvc
+        .map_err(|e| kube_status(e, &format!("PVCs in {namespace}")))?;
+    all_pvc
         .items
         .into_iter()
-        .find(|pvc| {
-            pvc.metadata
-                .uid
-                .as_ref()
-                .is_some_and(|has_uid| has_uid == uid)
-        })
-        .ok_or_else(|| {
-            tracing::error!("PVC not found");
-            Status::not_found("PVC not found")
-        })?;
-
-    let pvc_meta = pvc.metadata;
-
-    Ok(pvc_meta)
+        .find(|pvc| pvc.metadata.uid.as_deref() == Some(uid))
+        .map(|pvc| pvc.metadata)
+        .ok_or_else(|| Status::not_found(format!("PVC with uid {uid} not found in {namespace}")))
 }
 
-async fn get_config_from_pvc_meta(pvc_meta: ObjectMeta) -> Result<HashMap<String, String>, Status> {
-    let annotations = pvc_meta.annotations.unwrap_or_default();
+/// Build the volume context from the kubedal annotations of a PVC.
+///
+/// A PVC names a DataPod, a DataNode, or both. Namespaces default to the PVC namespace.
+fn context_from_pvc_meta(pvc_meta: &ObjectMeta) -> Result<HashMap<String, String>, Status> {
+    let annotations = pvc_meta.annotations.clone().unwrap_or_default();
+    let pvc_namespace = pvc_meta.namespace.clone().unwrap_or_default();
+    let mut context = HashMap::new();
 
-    let data_node_name = annotations
-        .get("kubedal.arunaengine.org/data-node-name")
-        .ok_or_else(|| {
-            tracing::error!("DataNode name annotation not found");
-            Status::invalid_argument("DataNode name annotation not found")
-        })?;
+    for (name_key, namespace_key) in [
+        (ANN_DATA_NODE_NAME, ANN_DATA_NODE_NAMESPACE),
+        (ANN_DATA_POD_NAME, ANN_DATA_POD_NAMESPACE),
+    ] {
+        if let Some(name) = annotations.get(name_key).filter(|v| !v.is_empty()) {
+            context.insert(name_key.to_string(), name.clone());
+            let namespace = annotations
+                .get(namespace_key)
+                .cloned()
+                .unwrap_or_else(|| pvc_namespace.clone());
+            context.insert(namespace_key.to_string(), namespace);
+        }
+    }
+    if context.is_empty() {
+        return Err(Status::invalid_argument(format!(
+            "PVC needs the annotation {ANN_DATA_POD_NAME} or {ANN_DATA_NODE_NAME}"
+        )));
+    }
 
-    let data_node_namespace = annotations
-        .get("kubedal.arunaengine.org/data-node-namespace")
+    let mount = annotations
+        .get(ANN_MOUNT)
         .cloned()
-        .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
+        .unwrap_or_else(|| "cache-read-only".to_string());
+    // Reject unknown modes now instead of when a pod starts.
+    parse_mount(&mount)?;
+    context.insert(ANN_MOUNT.to_string(), mount);
+    Ok(context)
+}
 
-    let data_pod_name = annotations
-        .get("kubedal.arunaengine.org/data-pod-name")
-        .ok_or_else(|| {
-            tracing::error!("DataPod name annotation not found");
-            Status::invalid_argument("DataPod name annotation not found")
-        })?;
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::collections::BTreeMap;
 
-    let data_pod_namespace = annotations
-        .get("kubedal.arunaengine.org/data-pod-namespace")
-        .cloned()
-        .unwrap_or(pvc_meta.namespace.clone().unwrap_or_default());
+    fn meta(annotations: &[(&str, &str)]) -> ObjectMeta {
+        ObjectMeta {
+            namespace: Some("team".into()),
+            annotations: Some(
+                annotations
+                    .iter()
+                    .map(|(k, v)| (k.to_string(), v.to_string()))
+                    .collect::<BTreeMap<_, _>>(),
+            ),
+            ..Default::default()
+        }
+    }
 
-    let data_mount = annotations
-        .get("kubedal.arunaengine.org/mount")
-        .ok_or_else(|| {
-            tracing::error!("Mount mode annotation not found");
-            Status::invalid_argument("Mount mode annotation not found")
-        })?;
+    #[test]
+    fn volume_id_is_stable_per_request() {
+        let params = HashMap::from([("a".to_string(), "1".to_string())]);
+        let id = volume_id_for("pvc-1", &params);
+        assert_eq!(id, volume_id_for("pvc-1", &params.clone()));
+        assert_ne!(id, volume_id_for("pvc-2", &params));
+        assert_ne!(id, volume_id_for("pvc-1", &HashMap::new()));
+        assert!(id.starts_with("kubedal-"));
+    }
 
-    let mut config = HashMap::new();
-    config.extend([
-        (
-            "kubedal.arunaengine.org/data-node-name".to_string(),
-            data_node_name.to_string(),
-        ),
-        (
-            "kubedal.arunaengine.org/data-node-namespace".to_string(),
-            data_node_namespace.to_string(),
-        ),
-        (
-            "kubedal.arunaengine.org/data-pod-name".to_string(),
-            data_pod_name.to_string(),
-        ),
-        (
-            "kubedal.arunaengine.org/data-pod-namespace".to_string(),
-            data_pod_namespace.to_string(),
-        ),
-        (
-            "kubedal.arunaengine.org/mount".to_string(),
-            data_mount.to_string(),
-        ),
-    ]);
+    #[test]
+    fn data_pod_annotation_is_enough() {
+        let ctx = context_from_pvc_meta(&meta(&[(ANN_DATA_POD_NAME, "dp")])).unwrap();
+        assert_eq!(ctx[ANN_DATA_POD_NAME], "dp");
+        assert_eq!(ctx[ANN_DATA_POD_NAMESPACE], "team");
+        assert_eq!(ctx[ANN_MOUNT], "cache-read-only");
+        assert!(!ctx.contains_key(ANN_DATA_NODE_NAME));
+    }
 
-    // Override the mount mode if specified in the PVC annotations
-    /*
-    let res_api: Api<DataNode> = Api::namespaced(client, &data_node_namespace);
-    let res = res_api.get(data_node_name).await.map_err(|e| {
-        tracing::error!("Error getting resource: {:?}", e);
-        Status::internal("Error getting resource")
-    })?;
-
-    config.insert(
-        "kubedal.arunaengine.org/mount".to_string(),
-        annotations
-            .get("kubedal.arunaengine.org/mount")
-            .and_then(|mode| match mode.as_str() {
-                m @ ("cached" | "fuse") => Some(m),
-                _ => None,
-            })
-            .unwrap_or(match res.spec.mount {
-                crate::resource::crd::MountMode::Cached => "cached",
-                crate::resource::crd::MountMode::Fuse => "fuse",
-            })
-            .to_string(),
-    );
-    */
-
-    Ok(config)
+    #[test]
+    fn missing_or_bad_annotations_fail() {
+        assert!(context_from_pvc_meta(&meta(&[])).is_err());
+        assert!(
+            context_from_pvc_meta(&meta(&[(ANN_DATA_NODE_NAME, "dn"), (ANN_MOUNT, "nfs")]))
+                .is_err()
+        );
+    }
 }

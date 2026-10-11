@@ -313,18 +313,8 @@ impl Filesystem {
     /// Remove the name `path` from storage and from a live state. Returns true if
     /// a live state existed. The state only loses its name if the delete worked.
     async fn unlink_state(&self, path: &OsStr) -> Result<bool> {
-        let op = self.op.clone();
         self.states
-            .unlink(&key_of(path), |keys| async move {
-                for key in keys {
-                    match op.delete(&key).await {
-                        Ok(()) => {}
-                        Err(err) if err.kind() == ErrorKind::NotFound => {}
-                        Err(err) => return Err(crate::util::error::opendal_status(err, "delete")),
-                    }
-                }
-                Ok(())
-            })
+            .unlink(&self.op, &key_of(path))
             .await
             .map_err(status_errno)
     }

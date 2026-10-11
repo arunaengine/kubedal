@@ -769,17 +769,15 @@ async fn failed_closed_file_rename_keeps_the_open_destination() {
 
 #[tokio::test]
 async fn failed_retirement_in_unlink_stops_changes_without_hanging() {
-    use std::os::unix::fs::PermissionsExt;
     let dir = tempfile::tempdir().unwrap();
     let (fs, op) = fs_in(dir.path()).await;
     let p = Some(OsStr::new("/f"));
     let w = create(&fs, "f").await;
     fs.write(req(), p, w, 0, b"data", 0, 0).await.unwrap();
-    // The journal cannot be removed after the object was deleted in storage.
-    let spool = dir.path().join("spool");
-    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o555)).unwrap();
+    // The journal removal cannot be made durable after the object was deleted
+    // in storage.
+    fs.states.pause.fail_once("dir_fsync");
     let result = fs.unlink(req(), OsStr::new("/"), OsStr::new("f")).await;
-    std::fs::set_permissions(&spool, std::fs::Permissions::from_mode(0o755)).unwrap();
     assert_eq!(result.unwrap_err(), Errno::from(libc::EIO));
     // Later opens fail at once instead of waiting on a dead state.
     let open = tokio::time::timeout(

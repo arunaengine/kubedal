@@ -915,20 +915,29 @@ impl States {
     /// Remove the name `key`. `delete` removes the objects with the given keys
     /// from storage; only if it succeeds, the state loses its name. Open handles
     /// keep their content, but it is never uploaded again.
-    pub async fn unlink<F, Fut>(&self, key: &str, delete: F) -> Result<bool, Status>
-    where
-        F: FnOnce(Vec<String>) -> Fut,
-        Fut: std::future::Future<Output = Result<(), Status>>,
-    {
+    pub async fn unlink(&self, op: &Operator, key: &str) -> Result<bool, Status> {
         let ns = self.lock_namespace().await;
         self.check_broken()?;
         let Some(state) = self.live(&ns, key).await else {
             return Ok(false);
         };
         let mut data = state.lock().await;
-        delete(vec![data.key.clone()]).await?;
+        let key = data.key.clone();
+        // Write ahead: after a crash from here on, replay drops the journal of
+        // this name instead of bringing the file back.
+        let tomb = self.write_tombstone(&key)?;
+        self.pause.hit("unlink_tombstoned").await;
+        if let Err(err) = self.delete_object(op, &key).await {
+            // The delete may have applied anyway. Only a name that is still
+            // there is a clean failure.
+            if !self.object_gone(op, &key).await? {
+                self.undo_tombstone(&mut data, &tomb)?;
+                return Err(err);
+            }
+        }
+        self.pause.hit("unlink_deleted").await;
         // The object is gone in storage. If the journal cannot be removed, the
-        // name could come back from memory: fail closed.
+        // name could come back from memory: fail closed. The tombstone stays.
         if let Err(err) = retire(&state, &mut data) {
             mark_broken(
                 &self.broken,
@@ -936,8 +945,62 @@ impl States {
             );
             return Err(broken_status());
         }
-        self.unmap(key, &state);
+        self.unmap(&key, &state);
+        self.pause.hit("unlink_retired").await;
+        self.remove_tombstone(&tomb);
         Ok(true)
+    }
+
+    /// Delete the object of `key`; a missing object counts as deleted. Test
+    /// failure points: "delete_fails" fails without deleting,
+    /// "delete_fails_after_apply" deletes and then reports a failure.
+    async fn delete_object(&self, op: &Operator, key: &str) -> Result<(), Status> {
+        if self.pause.should_fail("delete_fails") {
+            return Err(Status::unavailable("injected delete failure"));
+        }
+        match op.delete(key).await {
+            Ok(()) => {}
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => {}
+            Err(err) => return Err(opendal_status(err, "delete")),
+        }
+        if self.pause.should_fail("delete_fails_after_apply") {
+            return Err(Status::unavailable("injected delete failure after apply"));
+        }
+        Ok(())
+    }
+
+    /// After a storage step that removes `key` reported an error, check whether
+    /// the object is gone anyway. If the check fails too, nobody can tell what
+    /// happened: the file system stops.
+    async fn object_gone(&self, op: &Operator, key: &str) -> Result<bool, Status> {
+        match op.stat(key).await {
+            Ok(_) => Ok(false),
+            Err(err) if err.kind() == opendal::ErrorKind::NotFound => Ok(true),
+            Err(err) => {
+                mark_broken(
+                    &self.broken,
+                    &format!("cannot check {key} after a failed storage step: {err}"),
+                );
+                Err(broken_status())
+            }
+        }
+    }
+
+    /// Take back a tombstone after its storage step did not happen. The journal
+    /// of the state (if any) first gets a newer generation, so it wins against
+    /// the tombstone even if the tombstone cannot be removed.
+    fn undo_tombstone(&self, data: &mut StateData, tomb: &Path) -> Result<(), Status> {
+        if data.complete
+            && let Err(err) = data.write_meta()
+        {
+            mark_broken(
+                &self.broken,
+                &format!("renewing the journal of {} failed: {err}", data.key),
+            );
+            return Err(broken_status());
+        }
+        self.remove_tombstone(tomb);
+        Ok(())
     }
 
     /// Rename the live state of `from` to `to`. Returns false if there is none.
@@ -1418,14 +1481,109 @@ mod tests {
         let states = states(dir.path());
         let joined = states.open_write(&op, "f", false).await.unwrap();
         joined.lock().await.write_at(b"keep me", 0).unwrap();
-        let err = states
-            .unlink("f", |_| async { Err(Status::unavailable("backend down")) })
-            .await
-            .unwrap_err();
+        op.write("f", "old").await.unwrap();
+        states.pause.fail_once("delete_fails");
+        let err = states.unlink(&op, "f").await.unwrap_err();
         assert_eq!(err.code(), tonic::Code::Unavailable);
         let (result, pending) = states.release(&op, &joined).await;
         assert!(result.is_ok() && !pending);
         assert_eq!(op.read("f").await.unwrap().to_vec(), b"keep me");
+        assert_eq!(spool_files(dir.path()), 0);
+    }
+
+    #[tokio::test]
+    async fn an_unlink_whose_delete_applied_despite_an_error_finishes() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("f", "old").await.unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "f", false).await.unwrap();
+        joined.lock().await.write_at(b"pending", 0).unwrap();
+        states.pause.fail_once("delete_fails_after_apply");
+        assert!(states.unlink(&op, "f").await.unwrap());
+        let (result, pending) = states.release(&op, &joined).await;
+        assert!(result.is_ok() && !pending);
+        assert_eq!(
+            op.stat("f").await.unwrap_err().kind(),
+            opendal::ErrorKind::NotFound
+        );
+        assert_eq!(spool_files(dir.path()), 0);
+    }
+
+    fn fs_op(dir: &Path) -> Operator {
+        let root = dir.join("root");
+        std::fs::create_dir_all(&root).unwrap();
+        Operator::new(opendal::services::Fs::default().root(&root.to_string_lossy())).unwrap()
+    }
+
+    /// The child side of the crash tests. It does nothing unless a parent test
+    /// started it with the crash variables set.
+    #[tokio::test]
+    async fn crash_child() {
+        let (Ok(scenario), Ok(point), Ok(dir)) = (
+            std::env::var("KUBEDAL_CRASH_SCENARIO"),
+            std::env::var("KUBEDAL_CRASH_AT"),
+            std::env::var("KUBEDAL_CRASH_DIR"),
+        ) else {
+            return;
+        };
+        let dir = PathBuf::from(dir);
+        let op = fs_op(&dir);
+        let states = states(&dir.join("spool"));
+        states
+            .pause
+            .crash_at(Box::leak(point.clone().into_boxed_str()));
+        match scenario.as_str() {
+            "unlink" => {
+                let f = states.open_write(&op, "f", false).await.unwrap();
+                f.lock().await.write_at(b"new", 0).unwrap();
+                states.unlink(&op, "f").await.unwrap();
+            }
+            other => panic!("unknown crash scenario {other}"),
+        }
+        panic!("the child did not reach the crash point {point}");
+    }
+
+    /// Run `scenario` in a child process that exits at `point`.
+    fn crash_in_child(scenario: &str, point: &str, dir: &Path) {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "util::fuse_fs::states::tests::crash_child",
+                "--test-threads=1",
+            ])
+            .env("KUBEDAL_CRASH_SCENARIO", scenario)
+            .env("KUBEDAL_CRASH_AT", point)
+            .env("KUBEDAL_CRASH_DIR", dir)
+            .status()
+            .unwrap();
+        assert_eq!(
+            status.code(),
+            Some(super::super::pause::CRASH_EXIT_CODE),
+            "{scenario} did not crash at {point}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_unlink_never_brings_back_the_pending_content() {
+        for point in ["unlink_tombstoned", "unlink_deleted", "unlink_retired"] {
+            let dir = tempfile::tempdir().unwrap();
+            let op = fs_op(dir.path());
+            op.write("f", "old").await.unwrap();
+            crash_in_child("unlink", point, dir.path());
+            let spool = dir.path().join("spool");
+            upload_pending(&op, &spool, &SpoolBudget::new(u64::MAX))
+                .await
+                .unwrap();
+            if point == "unlink_tombstoned" {
+                // The delete did not run: the old object is still there.
+                assert_eq!(op.read("f").await.unwrap().to_vec(), b"old");
+            } else {
+                let err = op.stat("f").await.unwrap_err();
+                assert_eq!(err.kind(), opendal::ErrorKind::NotFound, "{point}");
+            }
+            assert_eq!(spool_files(&spool), 0, "{point}");
+        }
     }
 
     #[tokio::test]

@@ -35,7 +35,11 @@ impl Pause {
 pub struct PausePoints {
     points: Mutex<HashMap<&'static str, Arc<Pause>>>,
     failures: Mutex<Vec<&'static str>>,
+    crash_at: Mutex<Option<&'static str>>,
 }
+
+/// Exit code of a process that stopped at a crash point.
+pub const CRASH_EXIT_CODE: i32 = 86;
 
 impl PausePoints {
     /// Arm the point `name`. The next task that hits it stops there.
@@ -71,8 +75,18 @@ impl PausePoints {
         }
     }
 
+    /// Make the process exit at once when it reaches the point `name`. Crash
+    /// tests run this in a child process and check the spool folder afterwards.
+    pub fn crash_at(&self, name: &'static str) {
+        *self.crash_at.lock().unwrap_or_else(|p| p.into_inner()) = Some(name);
+    }
+
     /// Stop here if the point `name` is armed, until the test resumes it.
+    /// Exit the process if `name` is the crash point.
     pub async fn hit(&self, name: &'static str) {
+        if *self.crash_at.lock().unwrap_or_else(|p| p.into_inner()) == Some(name) {
+            std::process::exit(CRASH_EXIT_CODE);
+        }
         let pause = self
             .points
             .lock()

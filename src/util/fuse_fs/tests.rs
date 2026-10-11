@@ -1226,3 +1226,33 @@ async fn forced_truncating_open_after_a_release_broke_changes_nothing() {
     assert_eq!(read_all(&fs, "/f", second).await, b"content");
     assert_eq!(op.read("f").await.unwrap().to_vec(), b"content");
 }
+
+#[tokio::test]
+async fn forced_open_during_the_unlink_of_a_closed_file_waits() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let fs = Arc::new(fs);
+    op.write("f", "OLD").await.unwrap();
+    let pause = fs.pause_points().arm("unlink_closed");
+    let unlink = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.unlink(req(), OsStr::new("/"), OsStr::new("f")).await })
+    };
+    tokio::time::timeout(std::time::Duration::from_secs(5), pause.reached())
+        .await
+        .expect("the unlink of a closed file must hold the namespace lock");
+    let opened = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.open(req(), OsStr::new("/f"), libc::O_RDWR as u32).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The open must not load the old content before the delete.
+    assert!(!opened.is_finished());
+    pause.resume();
+    unlink.await.unwrap().unwrap();
+    let _ = opened.await.unwrap();
+    assert_ne!(
+        op.read("f").await.map(|b| b.to_vec()).ok(),
+        Some(b"OLD".to_vec())
+    );
+}

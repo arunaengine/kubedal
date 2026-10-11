@@ -1003,13 +1003,18 @@ impl States {
         Ok(true)
     }
 
-    /// Remove the name `key`. `delete` removes the objects with the given keys
-    /// from storage; only if it succeeds, the state loses its name. Open handles
-    /// keep their content, but it is never uploaded again.
+    /// Remove the name `key` in storage; only if that succeeds, a live state
+    /// loses its name. Open handles keep their content, but it is never uploaded
+    /// again. Returns true if a live state was retired.
+    ///
+    /// The namespace lock is held also for a file without a live state, so no
+    /// writable open can load the old content before the delete.
     pub async fn unlink(&self, op: &Operator, key: &str) -> Result<bool, Status> {
         let ns = self.lock_namespace().await;
         self.check_broken()?;
         let Some(state) = self.live(&ns, key).await else {
+            self.pause.hit("unlink_closed").await;
+            self.delete_object(op, key).await?;
             return Ok(false);
         };
         let mut data = state.lock().await;

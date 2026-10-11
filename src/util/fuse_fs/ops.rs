@@ -190,13 +190,8 @@ impl PathFilesystem for Filesystem {
 
         let path = PathBuf::from(parent).join(name);
         // Open handles keep their content, but it must never be uploaded again.
-        if self.unlink_state(path.as_os_str()).await? {
-            return Ok(());
-        }
-        self.op
-            .delete(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)
+        self.unlink_state(path.as_os_str()).await?;
+        Ok(())
     }
 
     async fn rmdir(&self, _req: Request, parent: &OsStr, name: &OsStr) -> Result<()> {

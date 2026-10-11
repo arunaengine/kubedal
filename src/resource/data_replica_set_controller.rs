@@ -57,20 +57,10 @@ impl DataReplicaSet {
             Error::ReconcilerError(format!("DataReplicaSet {} is missing namespace", drs_name))
         })?; // .unwrap_or_default? Or match and patch with 'default'?
         let drs_replicas = self.spec.replicas as usize;
-        let selector = self
-            .spec
-            .selector
-            .labels
-            .iter()
-            .map(|(k, v)| format!("{}={}", k, v))
-            .collect::<Vec<_>>()
-            .join(",");
-
-        // Eval number of existing DataPod replicas
+        // Replicas are found by owner, not by the selector: after a selector
+        // change the existing replicas must still be found.
         let dp_api: Api<DataPod> = Api::namespaced(client.clone(), &drs_ns);
-        let drs_data_pods = dp_api
-            .list(&ListParams::default().labels(&selector))
-            .await?;
+        let drs_data_pods = dp_api.list(&ListParams::default()).await?;
 
         let dn_api: Api<DataNode> = Api::namespaced(client.clone(), &drs_ns);
         let pvc_api = Api::<PersistentVolumeClaim>::namespaced(client.clone(), &drs_ns);
@@ -81,10 +71,9 @@ impl DataReplicaSet {
         // so also those that no longer match a changed selector go.
         if drs_replicas == 0 {
             let uid = self.metadata.uid.clone().unwrap_or_default();
-            let all_data_pods = dp_api.list(&ListParams::default()).await?;
             let all_pvcs = pvc_api.list(&ListParams::default()).await?;
             let (pvcs, data_pods) =
-                zero_replica_cleanup(self, &uid, &all_data_pods.items, &all_pvcs.items);
+                zero_replica_cleanup(self, &uid, &drs_data_pods.items, &all_pvcs.items);
             for name in pvcs {
                 delete_if_present(&pvc_api, &name).await?;
             }
@@ -140,12 +129,7 @@ impl DataReplicaSet {
         let drs_uid = self.metadata.uid.clone().ok_or_else(|| {
             Error::ReconcilerError(format!("DataReplicaSet {drs_name} has no uid"))
         })?;
-        let prefix = format!("{drs_uid}-replica-");
-        let ours: Vec<DataPod> = drs_data_pods
-            .items
-            .into_iter()
-            .filter(|dp| dp.name_any().starts_with(&prefix))
-            .collect();
+        let ours = owned_replicas(&drs_uid, drs_data_pods.items);
         let taken: Vec<String> = ours.iter().map(|dp| dp.name_any()).collect();
         let all_nodes = dn_api.list(&ListParams::default()).await?.items;
 
@@ -641,12 +625,25 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
 /// missing RBAC permission) is returned, not ignored.
 /// The objects in `items` that have an owner reference with `uid`.
 fn owned_by<'a, K: Resource>(items: &'a [K], uid: &str) -> Vec<&'a K> {
-    if uid.is_empty() {
-        return vec![];
-    }
     items
         .iter()
-        .filter(|item| item.owner_references().iter().any(|o| o.uid == uid))
+        .filter(|item| is_owned_by(*item, uid))
+        .collect()
+}
+
+/// True if `item` has an owner reference with `uid` (never for an empty uid).
+fn is_owned_by<K: Resource>(item: &K, uid: &str) -> bool {
+    !uid.is_empty() && item.owner_references().iter().any(|o| o.uid == uid)
+}
+
+/// The replica DataPods of the set with `drs_uid`: owned by it and named as its
+/// replicas.
+fn owned_replicas(drs_uid: &str, data_pods: Vec<DataPod>) -> Vec<DataPod> {
+    let prefix = format!("{drs_uid}-replica-");
+    data_pods
+        .into_iter()
+        .filter(|dp| is_owned_by(dp, drs_uid))
+        .filter(|dp| dp.name_any().starts_with(&prefix))
         .collect()
 }
 
@@ -819,6 +816,33 @@ mod tests {
         let names: Vec<_> = owned_by(&items, "u").iter().map(|d| d.name_any()).collect();
         assert_eq!(names, vec!["old-labels"]);
         assert!(owned_by(&items, "").is_empty());
+    }
+
+    #[test]
+    fn replicas_are_found_by_owner_after_a_selector_change() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let dp = |name: &str, owner: &str, label: &str| {
+            let mut dp = DataPod::new(name, DataPodSpec::default());
+            dp.metadata.labels = Some([("app".to_string(), label.to_string())].into());
+            dp.metadata.owner_references = Some(vec![OwnerReference {
+                uid: owner.into(),
+                ..Default::default()
+            }]);
+            dp
+        };
+        let items = vec![
+            dp("u-replica-0", "u", "old"),
+            dp("u-replica-1", "u", "new"),
+            // Not owned by the set, even with a replica name.
+            dp("u-replica-2", "v", "new"),
+            // Owned, but not a replica name.
+            dp("helper", "u", "new"),
+        ];
+        let names: Vec<_> = owned_replicas("u", items)
+            .iter()
+            .map(|d| d.name_any())
+            .collect();
+        assert_eq!(names, vec!["u-replica-0", "u-replica-1"]);
     }
 
     #[test]

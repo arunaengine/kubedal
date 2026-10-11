@@ -8,7 +8,7 @@ use k8s_openapi::api::core::v1::{
 };
 use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
 use k8s_openapi::apimachinery::pkg::apis::meta::v1::ObjectMeta;
-use kube::api::{ListParams, Patch, PatchParams, PostParams};
+use kube::api::{DeleteParams, ListParams, Patch, PatchParams, PostParams, Preconditions};
 use kube::{
     Resource,
     api::{Api, ResourceExt},
@@ -75,12 +75,12 @@ impl DataReplicaSet {
             let (pvcs, data_pods) =
                 zero_replica_cleanup(self, &uid, &drs_data_pods.items, &all_pvcs.items);
             for name in pvcs {
-                delete_if_present(&pvc_api, &name).await?;
+                delete_owned(&pvc_api, &name, self).await?;
             }
             for name in data_pods {
-                delete_if_present(&dp_api, &name).await?;
+                delete_owned(&dp_api, &name, self).await?;
             }
-            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
+            delete_owned(&pod_api, &sync_pod_name(self), self).await?;
             self.patch_status(&ctx, true).await?;
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
         }
@@ -91,7 +91,7 @@ impl DataReplicaSet {
         if let Some(message) = source_namespace_error(&drs_ns, &self.spec.source_pod) {
             warn!("DataReplicaSet {drs_name}: {message}");
             // An old sync pod must not keep running for an invalid source.
-            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
+            delete_owned(&pod_api, &sync_pod_name(self), self).await?;
             // The status comes first; the Event is only a hint and may fail.
             self.patch_status(&ctx, false).await?;
             if let Err(err) = ctx
@@ -142,8 +142,8 @@ impl DataReplicaSet {
         let (mut replicas, excess) = split_excess(&drs_uid, healthy, drs_replicas);
         for dp in &excess {
             info!("Removing replica {} above the desired count", dp.name_any());
-            delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
-            delete_if_present(&dp_api, &dp.name_any()).await?;
+            delete_owned(&pvc_api, &pvc_name(self, dp), self).await?;
+            delete_owned(&dp_api, &dp.name_any(), self).await?;
         }
         let need = drs_replicas.saturating_sub(replicas.len());
         if need > 0 {
@@ -182,8 +182,8 @@ impl DataReplicaSet {
                     "Removing replica {} from a read-only DataNode",
                     dp.name_any()
                 );
-                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
-                delete_if_present(&dp_api, &dp.name_any()).await?;
+                delete_owned(&pvc_api, &pvc_name(self, dp), self).await?;
+                delete_owned(&dp_api, &dp.name_any(), self).await?;
             }
         } else if !on_read_only.is_empty() {
             warn!(
@@ -194,7 +194,7 @@ impl DataReplicaSet {
         if replicas.is_empty() {
             // No replica: no sync pod either, also not an old one. With zero
             // replicas wanted, that is the desired state.
-            delete_if_present(&pod_api, &sync_pod_name(self)).await?;
+            delete_owned(&pod_api, &sync_pod_name(self), self).await?;
             self.patch_status(&ctx, drs_replicas == 0).await?;
             return Ok(Action::requeue(Duration::from_secs(5 * 60)));
         }
@@ -245,7 +245,7 @@ impl DataReplicaSet {
                 // ended (evicted, crashed). Delete it; a later reconcile creates it
                 // again.
                 info!("Replacing the sync pod of replica set {drs_name}");
-                delete_if_present(&pod_api, &pod.name_any()).await?;
+                delete_owned(&pod_api, &pod.name_any(), self).await?;
                 self.patch_status(&ctx, false).await?;
                 return Ok(Action::requeue(Duration::from_secs(10)));
             }
@@ -711,15 +711,45 @@ fn zero_replica_cleanup(
     (pvc_names, data_pod_names)
 }
 
-async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<(), Error>
+/// Delete the object `name` only if `owner` owns it. The delete carries the
+/// object's UID as a precondition, so an object that was replaced meanwhile
+/// (same name, new UID) is never deleted. A missing or foreign object is left.
+async fn delete_owned<K>(api: &Api<K>, name: &str, owner: &DataReplicaSet) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
 {
-    match api.delete(name, &Default::default()).await {
+    let Some(object) = api.get_opt(name).await? else {
+        return Ok(());
+    };
+    let owner_uid = owner.metadata.uid.as_deref().unwrap_or_default();
+    let Some(params) = owned_delete_params(&object, owner_uid) else {
+        warn!(
+            "DataReplicaSet {}: not deleting {name}, it is not owned by the set",
+            owner.name_any()
+        );
+        return Ok(());
+    };
+    match api.delete(name, &params).await {
         Ok(_) => Ok(()),
-        Err(kube::Error::Api(status)) if status.code == 404 => Ok(()),
+        // Gone, or replaced by another object with the same name.
+        Err(kube::Error::Api(status)) if status.code == 404 || status.code == 409 => Ok(()),
         Err(err) => Err(Error::KubeError(err)),
     }
+}
+
+/// Delete parameters that only match `object` itself, or None if the owner
+/// with `owner_uid` does not own it.
+fn owned_delete_params<K: Resource>(object: &K, owner_uid: &str) -> Option<DeleteParams> {
+    if !is_owned_by(object, owner_uid) {
+        return None;
+    }
+    Some(DeleteParams {
+        preconditions: Some(Preconditions {
+            uid: object.meta().uid.clone(),
+            resource_version: None,
+        }),
+        ..Default::default()
+    })
 }
 
 /// True if the replica lives on a DataNode (in namespace `ns`) that is read-only.
@@ -907,6 +937,39 @@ mod tests {
             let problem = check(pvc).unwrap();
             assert!(problem.contains(why), "{problem}");
         }
+    }
+
+    #[test]
+    fn only_owned_objects_are_deleted_and_only_themselves() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let meta = |uid: &str, owner: Option<&str>| ObjectMeta {
+            name: Some("set-source".into()),
+            uid: Some(uid.into()),
+            owner_references: owner.map(|o| {
+                vec![OwnerReference {
+                    uid: o.into(),
+                    ..Default::default()
+                }]
+            }),
+            ..Default::default()
+        };
+        let pvc = |uid, owner| PersistentVolumeClaim {
+            metadata: meta(uid, owner),
+            ..Default::default()
+        };
+        let pod = |uid, owner| Pod {
+            metadata: meta(uid, owner),
+            ..Default::default()
+        };
+        // Foreign objects with the expected names are never deleted.
+        assert!(owned_delete_params(&pvc("p1", None), "u").is_none());
+        assert!(owned_delete_params(&pvc("p2", Some("other")), "u").is_none());
+        assert!(owned_delete_params(&pod("s1", Some("other")), "u").is_none());
+        // Owned ones are deleted only if their UID still matches.
+        let params = owned_delete_params(&pod("s2", Some("u")), "u").unwrap();
+        assert_eq!(params.preconditions.unwrap().uid.as_deref(), Some("s2"));
+        let params = owned_delete_params(&pvc("p3", Some("u")), "u").unwrap();
+        assert_eq!(params.preconditions.unwrap().uid.as_deref(), Some("p3"));
     }
 
     #[test]

@@ -187,7 +187,16 @@ fn copy_file_via(from: &Path, to: &Path, temp: &Path) -> std::io::Result<()> {
         // errors must count.
         output.sync_all()?;
         close_file(output)?;
-        std::fs::rename(temp, to)
+        std::fs::rename(temp, to)?;
+        // On a kubedal FUSE volume, the kernel may send the release of the
+        // temporary file after the rename, so the renamed content may not be
+        // stored under its new name yet. An fsync of the new name uploads it.
+        let file = std::fs::File::options()
+            .write(true)
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(to)?;
+        file.sync_all()?;
+        close_file(file)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temp);

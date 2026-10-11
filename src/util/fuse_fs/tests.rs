@@ -1637,3 +1637,27 @@ async fn a_listing_goes_on_correctly_after_a_writer_is_closed() {
     let rest: Vec<_> = plus.entries.map(|e| e.unwrap().name).collect().await;
     assert_eq!(names(rest), ["b", "c"]);
 }
+
+/// `kubedal replicate` relies on this: the release of a renamed file may come
+/// after the rename, and an fsync of the new name stores the content there.
+#[tokio::test]
+async fn fsync_of_the_new_name_stores_a_file_renamed_before_its_release() {
+    let fs = fs_with("f", "old").await;
+    let root = OsStr::new("/");
+    let fh = create(&fs, "tmp").await;
+    let tmp = Some(OsStr::new("/tmp"));
+    fs.write(req(), tmp, fh, 0, b"new", 0, 0).await.unwrap();
+    fs.fsync(req(), tmp, fh, false).await.unwrap();
+    fs.rename(req(), root, OsStr::new("tmp"), root, OsStr::new("f"))
+        .await
+        .unwrap();
+    // The release of "tmp" has not come yet.
+    let f = Some(OsStr::new("/f"));
+    let fh2 = open(&fs, "/f", libc::O_WRONLY).await;
+    fs.fsync(req(), f, fh2, false).await.unwrap();
+    assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"new");
+    assert!(!fs.op.exists("tmp").await.unwrap());
+    fs.release(req(), f, fh2, 0, 0, false).await.unwrap();
+    fs.release(req(), None, fh, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"new");
+}

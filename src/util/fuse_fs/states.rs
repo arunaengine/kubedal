@@ -1414,7 +1414,11 @@ pub async fn upload_pending(
         Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(0),
         Err(err) => return Err(io_status(err, "list spool folder")),
     };
-    let paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
+    // A failed entry could hide a newer journal or tombstone: stop, keep all.
+    let paths: Vec<PathBuf> = entries
+        .map(|e| e.map(|e| e.path()))
+        .collect::<Result<_, _>>()
+        .map_err(|e| io_status(e, "list spool folder"))?;
     // Group all records (journals and tombstones) by key. Only the newest
     // generation of a key counts; the order never depends on file names.
     let mut newest: HashMap<String, (u64, PathBuf, bool)> = HashMap::new();

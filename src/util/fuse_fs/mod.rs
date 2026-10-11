@@ -327,24 +327,17 @@ impl Filesystem {
     }
 
     /// Copy a closed file for a rename on a backend without native rename (S3,
-    /// GCS, Azure Blob); the caller then removes the old object. Folders fail
-    /// with EXDEV, which tells programs like `mv` to copy the files themselves.
-    async fn copy_for_rename(&self, from: &str, to: &str) -> Result<()> {
-        let meta = self.stat_entry(from).await.map_err(opendal_error2errno)?;
-        if meta.is_dir() {
-            return Err(Errno::from(libc::EXDEV));
-        }
-        if self.op.info().capability().copy {
-            self.op.copy(from, to).await.map_err(opendal_error2errno)?;
-        } else {
-            let mut reader = self
-                .op
-                .reader(from)
-                .await
-                .map_err(opendal_error2errno)?
-                .into_bytes_stream(..)
-                .await
-                .map_err(opendal_error2errno)?;
+    /// GCS, Azure Blob); the caller then removes the old object.
+    ///
+    /// `source` comes from [`Filesystem::open_copy_source`]: a stream of the
+    /// content, or None for a copy inside the storage.
+    async fn copy_for_rename(
+        &self,
+        from: &str,
+        to: &str,
+        source: Option<opendal::FuturesBytesStream>,
+    ) -> Result<()> {
+        if let Some(mut reader) = source {
             let mut writer = self
                 .op
                 .writer_with(to)
@@ -360,8 +353,37 @@ impl Filesystem {
                 }
             }
             writer.close().await.map_err(opendal_error2errno)?;
+        } else {
+            self.op.copy(from, to).await.map_err(opendal_error2errno)?;
         }
         Ok(())
+    }
+
+    /// Check the source of a rename by copy and open it, before anything is
+    /// written: a missing, unreadable or folder source fails here, while the
+    /// destination is untouched. Folders fail with EXDEV, which tells programs
+    /// like `mv` to copy the files themselves. Returns a stream of the content, or None if
+    /// the storage copies by itself. Test failure point: "copy_source_fails".
+    async fn open_copy_source(&self, from: &str) -> Result<Option<opendal::FuturesBytesStream>> {
+        if self.states.pause.should_fail("copy_source_fails") {
+            return Err(Errno::from(libc::EIO));
+        }
+        let meta = self.stat_entry(from).await.map_err(opendal_error2errno)?;
+        if meta.is_dir() {
+            return Err(Errno::from(libc::EXDEV));
+        }
+        if self.op.info().capability().copy {
+            return Ok(None);
+        }
+        let reader = self
+            .op
+            .reader(from)
+            .await
+            .map_err(opendal_error2errno)?
+            .into_bytes_stream(..)
+            .await
+            .map_err(opendal_error2errno)?;
+        Ok(Some(reader))
     }
 
     /// Returns (read, write, append) for open flags.

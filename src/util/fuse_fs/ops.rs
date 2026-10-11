@@ -247,6 +247,14 @@ impl PathFilesystem for Filesystem {
             return Ok(());
         }
 
+        // Without a storage rename, the source is checked and opened first, so
+        // its failures stop nothing: the destination is not touched yet.
+        let native = self.op.info().capability().rename;
+        let source = if native {
+            None
+        } else {
+            self.open_copy_source(&from).await?
+        };
         // A file open under the new name loses it, but only once the storage
         // rename worked; it must never upload over the renamed file later.
         self.states
@@ -256,14 +264,16 @@ impl PathFilesystem for Filesystem {
                 &from,
                 &to,
                 || async {
-                    if self.op.info().capability().rename {
+                    if native {
                         self.op
                             .rename(&from, &to)
                             .await
                             .map_err(opendal_error2errno)?;
                         return Ok(false);
                     }
-                    self.copy_for_rename(&from, &to).await.map(|()| true)
+                    self.copy_for_rename(&from, &to, source)
+                        .await
+                        .map(|()| true)
                 },
                 status_errno,
             )

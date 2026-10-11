@@ -1256,3 +1256,29 @@ async fn forced_open_during_the_unlink_of_a_closed_file_waits() {
         Some(b"OLD".to_vec())
     );
 }
+
+#[tokio::test]
+async fn a_rename_copy_whose_source_fails_early_stops_nothing() {
+    let fs = fs_with("a", "source").await;
+    assert!(!fs.op.info().capability().rename);
+    fs.op.create_dir("d/").await.unwrap();
+    let pb = Some(OsStr::new("/b"));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"old b", 0, 0).await.unwrap();
+    let root = OsStr::new("/");
+    // A folder source and an unreadable source fail before any tombstone.
+    let folder = fs
+        .rename(req(), root, OsStr::new("d"), root, OsStr::new("b"))
+        .await;
+    assert_eq!(folder.unwrap_err(), Errno::from(libc::EXDEV));
+    fs.states.pause.fail_once("copy_source_fails");
+    let unreadable = fs
+        .rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await;
+    assert_eq!(unreadable.unwrap_err(), Errno::from(libc::EIO));
+    assert!(!fs.states.is_broken());
+    // The open b still uploads its own content.
+    fs.release(req(), pb, wb, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"old b");
+    assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"source");
+}

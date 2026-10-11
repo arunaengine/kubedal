@@ -53,6 +53,10 @@ struct SpoolMeta {
     /// key; older ones are obsolete.
     #[serde(default)]
     generation: u64,
+    /// A tombstone has no spool data. It says: the name was removed or replaced
+    /// in storage, so older journals of this key must never be uploaded.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    tombstone: bool,
 }
 
 /// Highest journal generation found in `dir`, or 0.
@@ -265,6 +269,7 @@ impl StateData {
         let data = serde_json::to_vec(&SpoolMeta {
             key: key.to_string(),
             generation,
+            tombstone: false,
         })
         .map_err(std::io::Error::other)?;
         let tmp = self.meta_path.with_extension("json.tmp");
@@ -577,6 +582,48 @@ impl States {
         let mut map = self.map();
         if map.get(key).is_some_and(|s| Arc::ptr_eq(s, state)) {
             map.remove(key);
+        }
+    }
+
+    /// Durably write a tombstone for `key` with a new generation, before a
+    /// storage step that removes or replaces the object of `key`. Returns its
+    /// path. A failure before the tombstone is in place changes nothing; a
+    /// failed folder sync afterwards stops the file system.
+    pub fn write_tombstone(&self, key: &str) -> Result<PathBuf, Status> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| io_status(e, "create spool folder"))?;
+        let name = format!("tomb-{}", uuid::Uuid::new_v4().simple());
+        let path = self.dir.join(format!("{name}.json"));
+        let tmp = self.dir.join(format!("{name}.json.tmp"));
+        let data = serde_json::to_vec(&SpoolMeta {
+            key: key.to_string(),
+            generation: self.generations.fetch_add(1, Ordering::SeqCst),
+            tombstone: true,
+        })
+        .map_err(|e| Status::internal(format!("encode tombstone: {e}")))?;
+        let written = (|| {
+            let mut file = File::create(&tmp)?;
+            file.write_all(&data)?;
+            file.sync_all()?;
+            std::fs::rename(&tmp, &path)
+        })();
+        written.map_err(|e| io_status(e, "write tombstone"))?;
+        let synced = if self.pause.should_fail("tombstone_sync") {
+            Err(std::io::Error::from_raw_os_error(libc::EIO))
+        } else {
+            sync_folder(&self.dir)
+        };
+        if let Err(err) = synced {
+            mark_broken(&self.broken, &format!("syncing a tombstone failed: {err}"));
+            return Err(broken_status());
+        }
+        Ok(path)
+    }
+
+    /// Remove a tombstone once every older journal of its key is durably gone.
+    /// A tombstone left behind is harmless: newer journals win against it.
+    pub fn remove_tombstone(&self, path: &Path) {
+        if let Err(err) = remove_if_present(path).and_then(|()| sync_folder(&self.dir)) {
+            tracing::warn!("cannot remove tombstone {path:?}: {err}");
         }
     }
 
@@ -1020,38 +1067,58 @@ pub async fn upload_pending(
         Err(err) => return Err(io_status(err, "list spool folder")),
     };
     let paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    // Group complete spools by key. Only the newest generation of a key is
-    // uploaded; the order never depends on file names.
-    let mut newest: HashMap<String, (u64, PathBuf)> = HashMap::new();
-    let mut obsolete: Vec<PathBuf> = Vec::new();
+    let cleanup = |e: std::io::Error| io_status(e, "clean up spool folder");
+    // Spool data without a journal is unfinished or removed: drop it.
     for data_path in paths
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "data"))
     {
-        let meta_path = data_path.with_extension("json");
-        let meta: SpoolMeta = match std::fs::read(&meta_path) {
+        if !data_path.with_extension("json").exists() {
+            remove_and_refund(data_path, budget).map_err(cleanup)?;
+        }
+    }
+    // Group all records (journals and tombstones) by key. Only the newest
+    // generation of a key counts; the order never depends on file names.
+    let mut newest: HashMap<String, (u64, PathBuf, bool)> = HashMap::new();
+    let mut obsolete: Vec<PathBuf> = Vec::new();
+    for meta_path in paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "json"))
+    {
+        let meta: SpoolMeta = match std::fs::read(meta_path) {
             Ok(data) => serde_json::from_slice(&data)
                 .map_err(|e| Status::internal(format!("bad spool metadata {meta_path:?}: {e}")))?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-                remove_and_refund(data_path, budget)
-                    .map_err(|e| io_status(e, "remove spool file"))?;
-                continue;
-            }
             Err(err) => return Err(io_status(err, "read spool metadata")),
         };
+        let record = (meta.generation, meta_path.clone(), meta.tombstone);
         match newest.get(&meta.key) {
-            Some((generation, _)) if *generation > meta.generation => {
-                obsolete.push(data_path.clone());
+            Some((generation, _, _)) if *generation > meta.generation => {
+                obsolete.push(meta_path.clone());
             }
             _ => {
-                if let Some((_, older)) =
-                    newest.insert(meta.key.clone(), (meta.generation, data_path.clone()))
-                {
+                if let Some((_, older, _)) = newest.insert(meta.key.clone(), record) {
                     obsolete.push(older);
                 }
             }
         }
     }
+    let mut tombstones = Vec::new();
+    let newest: Vec<(String, PathBuf)> = newest
+        .into_iter()
+        .filter_map(|(key, (_, meta_path, tombstone))| {
+            if tombstone {
+                // Older journals of this key are dropped; the tombstone goes last.
+                tombstones.push(meta_path);
+                None
+            } else {
+                Some((key, meta_path.with_extension("data")))
+            }
+        })
+        .collect();
+    let obsolete: Vec<PathBuf> = obsolete
+        .into_iter()
+        .map(|meta_path| meta_path.with_extension("data"))
+        .collect();
     // Every cleanup step is checked: a journal left behind could later restore
     // old bytes over newer content. Journals go first, then the folder is synced.
     let cleanup = |e: std::io::Error| io_status(e, "clean up spool folder");
@@ -1063,12 +1130,17 @@ pub async fn upload_pending(
         remove_and_refund(data_path, budget).map_err(cleanup)?;
     }
     let mut uploaded = 0;
-    for (key, (_, data_path)) in newest {
+    for (key, data_path) in newest {
         upload_data_file(op, &data_path, &key).await?;
         remove_if_present(&data_path.with_extension("json")).map_err(cleanup)?;
         sync_folder(dir).map_err(cleanup)?;
         remove_and_refund(&data_path, budget).map_err(cleanup)?;
         uploaded += 1;
+    }
+    // A tombstone goes only after every older journal of its key is durably gone.
+    sync_folder(dir).map_err(cleanup)?;
+    for tombstone in &tombstones {
+        remove_if_present(tombstone).map_err(cleanup)?;
     }
     for tmp in paths
         .iter()
@@ -1428,6 +1500,42 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.data")), content).unwrap();
         let meta = serde_json::json!({"key": key, "generation": generation});
         std::fs::write(dir.join(format!("{name}.json")), meta.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn a_newer_tombstone_drops_older_journals_of_its_key() {
+        let dir = tempfile::tempdir().unwrap();
+        journal(dir.path(), "old", "b", 3, "old destination");
+        journal(dir.path(), "other", "c", 4, "other file");
+        let states = states(dir.path());
+        // The tombstone gets a generation above everything on disk.
+        let tomb = states.write_tombstone("b").unwrap();
+        assert!(tomb.exists());
+        drop(states);
+        let op = Operator::new(Memory::default()).unwrap();
+        let budget = SpoolBudget::new(u64::MAX);
+        budget.reserve(25).unwrap();
+        assert_eq!(upload_pending(&op, dir.path(), &budget).await.unwrap(), 1);
+        assert!(!op.exists("b").await.unwrap());
+        assert_eq!(op.read("c").await.unwrap().to_vec(), b"other file");
+        assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+        assert_eq!(budget.used(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_newer_journal_wins_against_an_old_tombstone() {
+        let dir = tempfile::tempdir().unwrap();
+        let states = states(dir.path());
+        states.write_tombstone("b").unwrap();
+        drop(states);
+        // A file created later under the same name has a newer journal.
+        let max = max_generation(dir.path());
+        journal(dir.path(), "new", "b", max + 1, "new file");
+        let op = Operator::new(Memory::default()).unwrap();
+        upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"new file");
     }
 
     #[tokio::test]

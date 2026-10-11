@@ -317,9 +317,23 @@ impl StateData {
     /// Write a change. The first change after the content was published gets a
     /// journal before the write reports success, so a replay keeps it.
     pub fn write_at(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
-        self.journal_first()?;
+        // A request that cannot work fails before the journal is written.
+        let end = checked_end(offset, data.len())?;
+        self.reserved_journal_first(self.len.max(end))?;
         let written = self.write_spool(data, offset);
         self.after_change(written)
+    }
+
+    /// Reserve space for `bytes`, then write the first journal. If the journal
+    /// fails, the reservation is given back.
+    fn reserved_journal_first(&mut self, bytes: u64) -> std::io::Result<()> {
+        let before = self.charged;
+        self.charge_to(bytes)?;
+        if let Err(err) = self.journal_first() {
+            let _ = self.charge_to(before);
+            return Err(err);
+        }
+        Ok(())
     }
 
     /// Before the first change after the content was published (loaded from
@@ -355,9 +369,7 @@ impl StateData {
     /// Write into the spool file without marking the content as changed. An
     /// error says whether the file may have changed.
     fn write_spool(&mut self, data: &[u8], offset: u64) -> Result<(), (std::io::Error, bool)> {
-        let end = offset
-            .checked_add(data.len() as u64)
-            .ok_or_else(|| (std::io::Error::from_raw_os_error(libc::EFBIG), false))?;
+        let end = checked_end(offset, data.len()).map_err(|e| (e, false))?;
         let before = self.charged;
         self.charge_to(self.len.max(end)).map_err(|e| (e, false))?;
         if let Err(err) = self.write_file(data, offset) {
@@ -393,7 +405,8 @@ impl StateData {
     }
 
     pub fn set_len(&mut self, len: u64) -> std::io::Result<()> {
-        self.journal_first()?;
+        checked_end(len, 0)?;
+        self.reserved_journal_first(len)?;
         let resized = self.resize(len);
         self.after_change(resized)
     }
@@ -401,6 +414,7 @@ impl StateData {
     /// Change the length of the spool file without marking the content as
     /// changed. An error says whether the file may have changed.
     fn resize(&mut self, len: u64) -> Result<(), (std::io::Error, bool)> {
+        checked_end(len, 0).map_err(|e| (e, false))?;
         let before = self.charged;
         self.charge_to(len).map_err(|e| (e, false))?;
         if let Err(err) = self.file.set_len(len) {
@@ -529,6 +543,14 @@ fn mark_broken(broken: &AtomicBool, why: &str) {
             "FUSE file system stops accepting changes: {why}; its spool is replayed at unpublish"
         );
     }
+}
+
+/// The end of `len` bytes at `offset`, or EFBIG if no file can be that large.
+fn checked_end(offset: u64, len: usize) -> std::io::Result<u64> {
+    offset
+        .checked_add(len as u64)
+        .filter(|end| *end <= i64::MAX as u64)
+        .ok_or_else(|| std::io::Error::from_raw_os_error(libc::EFBIG))
 }
 
 /// A refused [`States::may_persist`] as an I/O error.
@@ -2086,6 +2108,50 @@ mod tests {
         assert_eq!(data.len, 2);
         // The journal now covers content that changed in part: stop.
         assert!(states.is_broken());
+    }
+
+    #[tokio::test]
+    async fn a_refused_change_writes_no_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("f", "OLD").await.unwrap();
+        let budget = Arc::new(SpoolBudget::new(10));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let f = states.open_write(&op, "f", true).await.unwrap();
+        let journals = || {
+            std::fs::read_dir(dir.path())
+                .unwrap()
+                .filter(|e| {
+                    e.as_ref()
+                        .unwrap()
+                        .path()
+                        .extension()
+                        .is_some_and(|x| x == "json")
+                })
+                .count()
+        };
+        let mut data = f.lock().await;
+        // Over the budget: refused before the journal.
+        let err = data.write_at(&[1u8; 100], 0).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+        let err = data.set_len(100).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::ENOSPC));
+        // Not representable: refused before the journal.
+        let err = data.write_at(b"x", u64::MAX).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+        assert_eq!(journals(), 0);
+        assert!(!data.dirty);
+        // A failed journal gives the reserved space back.
+        block_journal_tmp(&data.meta_path);
+        assert!(data.write_at(b"0123456", 0).is_err());
+        assert_eq!(budget.used(), 3);
+        assert_eq!(journals(), 0);
+        assert!(!states.is_broken());
+    }
+
+    /// Block the temp file of a journal with a folder of the same name.
+    fn block_journal_tmp(meta: &Path) {
+        std::fs::create_dir(meta.with_extension("json.tmp")).unwrap();
     }
 
     #[tokio::test]

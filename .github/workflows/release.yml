@@ -41,9 +41,55 @@ jobs:
             echo "release=true" >> "$GITHUB_OUTPUT"
           fi
 
-  release:
+  # Each architecture builds on its own native runner (QEMU emulation of arm64
+  # takes more than an hour) and is pushed by digest only.
+  image:
     needs: version
     if: needs.version.outputs.release == 'true'
+    strategy:
+      matrix:
+        include:
+          - arch: amd64
+            runner: ubuntu-latest
+          - arch: arm64
+            runner: ubuntu-24.04-arm
+    runs-on: ${{ matrix.runner }}
+    permissions:
+      contents: read
+      packages: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: docker/setup-buildx-action@v3
+      - uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      - id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: linux/${{ matrix.arch }}
+          labels: |
+            org.opencontainers.image.source=https://github.com/arunaengine/kubedal
+            org.opencontainers.image.version=${{ needs.version.outputs.version }}
+            org.opencontainers.image.licenses=MIT OR Apache-2.0
+          outputs: type=image,name=ghcr.io/arunaengine/kubedal,push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=${{ matrix.arch }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.arch }}
+      - run: |
+          mkdir -p digests
+          touch "digests/${DIGEST#sha256:}"
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+      - uses: actions/upload-artifact@v4
+        with:
+          name: digest-${{ matrix.arch }}
+          path: digests/*
+          retention-days: 1
+
+  release:
+    needs: [version, image]
     runs-on: ubuntu-latest
     permissions:
       contents: write
@@ -52,27 +98,24 @@ jobs:
       VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@v4
-      - uses: docker/setup-qemu-action@v3
+      - uses: actions/download-artifact@v4
+        with:
+          path: digests
+          pattern: digest-*
+          merge-multiple: true
       - uses: docker/setup-buildx-action@v3
       - uses: docker/login-action@v3
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - uses: docker/build-push-action@v6
-        with:
-          context: .
-          platforms: linux/amd64,linux/arm64
-          push: true
-          tags: |
-            ghcr.io/arunaengine/kubedal:${{ env.VERSION }}
-            ghcr.io/arunaengine/kubedal:latest
-          labels: |
-            org.opencontainers.image.source=https://github.com/arunaengine/kubedal
-            org.opencontainers.image.version=${{ env.VERSION }}
-            org.opencontainers.image.licenses=MIT OR Apache-2.0
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+      - name: Tag the multi-architecture image
+        working-directory: digests
+        run: |
+          docker buildx imagetools create \
+            -t "ghcr.io/arunaengine/kubedal:$VERSION" \
+            -t ghcr.io/arunaengine/kubedal:latest \
+            $(printf 'ghcr.io/arunaengine/kubedal@sha256:%s ' *)
       - uses: azure/setup-helm@v4
       - name: Push the Helm chart
         run: |

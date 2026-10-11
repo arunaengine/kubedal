@@ -1053,8 +1053,8 @@ async fn a_failed_delete_after_a_rename_copy_stops_changes() {
     assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"source");
 }
 
-/// Break the file system with a failed folder sync while `other` flushes, shut
-/// it down, and replay its spool.
+/// Break the file system with a failed folder sync while `other` flushes, stop
+/// it like a crash, and replay its spool.
 async fn break_and_replay(fs: Filesystem, op: &Operator, dir: &std::path::Path) {
     let other = create(&fs, "other").await;
     fs.write(req(), Some(OsStr::new("/other")), other, 0, b"OTHER", 0, 0)
@@ -1064,7 +1064,8 @@ async fn break_and_replay(fs: Filesystem, op: &Operator, dir: &std::path::Path) 
     assert!(fs.flush(req(), None, other, 0).await.is_err());
     assert!(fs.states.is_broken());
     fs.workers().shutdown().await;
-    drop(fs);
+    // Like a crash: no state gets dropped, so no spool file is cleaned up.
+    std::mem::forget(fs);
     let budget = states::SpoolBudget::new(u64::MAX);
     states::upload_pending(op, &dir.join("spool"), &budget)
         .await
@@ -1155,4 +1156,73 @@ async fn a_failed_first_journal_leaves_the_file_unchanged() {
     assert_eq!(op.read("victim").await.unwrap().to_vec(), b"OLD");
     assert_eq!(read_all(&fs, "/victim", fh).await, b"OLD");
     assert!(!fs.states.is_broken());
+}
+
+#[tokio::test]
+async fn writes_after_unlink_never_bring_the_file_back() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let p = Some(OsStr::new("/f"));
+    let fh = create(&fs, "f").await;
+    fs.write(req(), p, fh, 0, b"first", 0, 0).await.unwrap();
+    fs.flush(req(), p, fh, 0).await.unwrap();
+    fs.unlink(req(), OsStr::new("/"), OsStr::new("f"))
+        .await
+        .unwrap();
+    // The open handle still writes its local copy.
+    fs.write(req(), p, fh, 0, b"later", 0, 0).await.unwrap();
+    assert_eq!(read_all(&fs, "/f", fh).await, b"later");
+    break_and_replay(fs, &op, dir.path()).await;
+    assert!(!op.exists("f").await.unwrap());
+}
+
+#[tokio::test]
+async fn writes_after_a_rename_replaced_the_file_never_overwrite_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    op.write("a", "SRC").await.unwrap();
+    let p = Some(OsStr::new("/b"));
+    let fh = create(&fs, "b").await;
+    fs.write(req(), p, fh, 0, b"old b", 0, 0).await.unwrap();
+    fs.flush(req(), p, fh, 0).await.unwrap();
+    let root = OsStr::new("/");
+    fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await
+        .unwrap();
+    fs.write(req(), p, fh, 0, b"stale", 0, 0).await.unwrap();
+    break_and_replay(fs, &op, dir.path()).await;
+    assert_eq!(op.read("b").await.unwrap().to_vec(), b"SRC");
+}
+
+#[tokio::test]
+async fn forced_truncating_open_after_a_release_broke_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let fs = Arc::new(fs);
+    let p = Some(OsStr::new("/f"));
+    let first = create(&fs, "f").await;
+    let second = open(&fs, "/f", libc::O_RDWR).await;
+    fs.write(req(), p, first, 0, b"content", 0, 0)
+        .await
+        .unwrap();
+    let pause = fs.pause_points().arm("release_upload");
+    let release = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.release(req(), p, first, 0, 0, false).await })
+    };
+    pause.reached().await;
+    // The truncating open waits on the state lock that the release holds.
+    let truncating = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.open(req(), OsStr::new("/f"), WRITE_FLAGS).await })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    // The release upload stops the file system at its last folder sync.
+    fs.pause_points().fail_once("dir_fsync");
+    pause.resume();
+    assert!(release.await.unwrap().is_err());
+    assert!(fs.states.is_broken());
+    assert!(truncating.await.unwrap().is_err());
+    assert_eq!(read_all(&fs, "/f", second).await, b"content");
+    assert_eq!(op.read("f").await.unwrap().to_vec(), b"content");
 }

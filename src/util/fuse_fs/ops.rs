@@ -419,16 +419,18 @@ impl PathFilesystem for Filesystem {
             }
         };
 
-        let mut state = state.lock().await;
+        let mut guard = state.lock().await;
         // Another operation may have stopped the file system meanwhile.
         self.check_writable()?;
-        if state.closed {
+        if guard.closed {
             return Err(Errno::from(libc::EBADF));
         }
         // With O_APPEND every write goes to the current end, also when other
         // handles made the file longer since the kernel last asked for its size.
-        let offset = if append { state.len } else { offset };
-        state.write_at(data, offset).map_err(io_errno)?;
+        let offset = if append { guard.len } else { offset };
+        self.states
+            .write(&state, &mut guard, data, offset)
+            .map_err(io_errno)?;
 
         Ok(ReplyWrite {
             written: data.len() as _,

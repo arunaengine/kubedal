@@ -531,6 +531,12 @@ fn mark_broken(broken: &AtomicBool, why: &str) {
     }
 }
 
+/// A refused [`States::may_persist`] as an I/O error.
+fn gate_error(status: Status) -> std::io::Error {
+    tracing::warn!("change refused: {}", status.message());
+    std::io::Error::from_raw_os_error(libc::EIO)
+}
+
 fn broken_status() -> Status {
     Status::internal("the FUSE file system stopped after a local disk error")
 }
@@ -673,6 +679,49 @@ impl States {
         }
     }
 
+    /// The one check before a state writes a journal, uploads or publishes.
+    /// Fails when the file system is broken or closing. Returns false for a
+    /// retired state (unlinked, closed, or no longer mapped under its key): it
+    /// may still change its local spool for its open handles, but it never
+    /// writes a journal or uploads again. The caller holds the state lock.
+    fn may_persist(&self, state: &FileState, data: &StateData) -> Result<bool, Status> {
+        self.check_broken()?;
+        self.fence.check()?;
+        if data.closed || state.is_unlinked() {
+            return Ok(false);
+        }
+        Ok(self
+            .get(&data.key)
+            .is_some_and(|mapped| std::ptr::eq(Arc::as_ptr(&mapped), state)))
+    }
+
+    /// Write to a state through an open handle, behind [`States::may_persist`].
+    pub fn write(
+        &self,
+        state: &FileState,
+        data: &mut StateData,
+        bytes: &[u8],
+        offset: u64,
+    ) -> std::io::Result<()> {
+        if self.may_persist(state, data).map_err(gate_error)? {
+            return data.write_at(bytes, offset);
+        }
+        data.write_spool(bytes, offset).map_err(|(err, _)| err)
+    }
+
+    /// Change the length of a state, behind [`States::may_persist`].
+    pub fn set_len(
+        &self,
+        state: &FileState,
+        data: &mut StateData,
+        len: u64,
+    ) -> std::io::Result<()> {
+        if self.may_persist(state, data).map_err(gate_error)? {
+            return data.set_len(len);
+        }
+        data.resize(len).map_err(|(err, _)| err)
+    }
+
     /// True after a local disk error in the middle of a change.
     pub fn is_broken(&self) -> bool {
         self.broken.load(Ordering::SeqCst)
@@ -735,7 +784,8 @@ impl States {
         if let Some(state) = self.live(&ns, key).await {
             let mut data = state.lock().await;
             if !keep {
-                data.set_len(0).map_err(|e| io_status(e, "truncate"))?;
+                self.set_len(&state, &mut data, 0)
+                    .map_err(|e| io_status(e, "truncate"))?;
             }
             data.handles += 1;
             drop(data);
@@ -837,11 +887,9 @@ impl States {
     /// Upload the content of a state now (flush and fsync).
     pub async fn upload(&self, op: &Operator, state: &FileState) -> Result<(), Status> {
         let mut data = state.lock().await;
-        if data.closed || state.is_unlinked() {
+        if !self.may_persist(state, &data)? {
             return Ok(());
         }
-        self.fence.check()?;
-        self.check_broken()?;
         data.upload(op).await
     }
 
@@ -862,16 +910,13 @@ impl States {
             // Nothing is uploaded or removed from memory any more.
             return (Err(broken_status()), false);
         }
-        let result = if state.is_unlinked() {
-            Ok(())
-        } else {
-            match self.fence.check() {
-                Ok(()) => {
-                    self.pause.hit("release_upload").await;
-                    data.upload(op).await
-                }
-                Err(err) => Err(err),
+        let result = match self.may_persist(state, &data) {
+            Ok(true) => {
+                self.pause.hit("release_upload").await;
+                data.upload(op).await
             }
+            Ok(false) => Ok(()),
+            Err(err) => Err(err),
         };
         if data.handles > 0 {
             return (result, false);
@@ -898,7 +943,7 @@ impl States {
         }
         // A rename may have changed the key meanwhile; upload under the new key.
         if data.dirty
-            && !state.is_unlinked()
+            && matches!(self.may_persist(state, &data), Ok(true))
             && let Err(err) = data.upload(op).await
         {
             return (Err(err), true);
@@ -917,7 +962,7 @@ impl States {
         if self.fence.is_closing() || self.is_broken() {
             return true;
         }
-        if !state.is_unlinked() && data.upload(op).await.is_err() {
+        if matches!(self.may_persist(state, &data), Ok(true)) && data.upload(op).await.is_err() {
             return false;
         }
         drop(data);
@@ -931,7 +976,7 @@ impl States {
             // Leave everything for the replay.
             return true;
         }
-        if data.dirty && !state.is_unlinked() {
+        if data.dirty && matches!(self.may_persist(state, &data), Ok(true)) {
             // A rename made it dirty again meanwhile: another upload is needed.
             return false;
         }
@@ -954,10 +999,7 @@ impl States {
         let Some(mut data) = state.lock_alive().await else {
             return Ok(false);
         };
-        if self.is_broken() {
-            return Err(std::io::Error::from_raw_os_error(libc::EIO));
-        }
-        data.set_len(size)?;
+        self.set_len(&state, &mut data, size)?;
         Ok(true)
     }
 

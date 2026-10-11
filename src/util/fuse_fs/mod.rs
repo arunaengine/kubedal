@@ -132,7 +132,9 @@ impl Filesystem {
                 // Another operation may have stopped the file system meanwhile.
                 self.check_writable()?;
                 if !data.closed {
-                    data.set_len(size).map_err(io_errno)?;
+                    self.states
+                        .set_len(&writer, &mut data, size)
+                        .map_err(io_errno)?;
                     return Ok(());
                 }
             }

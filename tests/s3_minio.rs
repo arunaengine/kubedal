@@ -309,3 +309,51 @@ async fn fuse_rmdir_removes_the_folder_marker() {
     assert!(!op.exists("d/").await.unwrap());
     assert!(op.list("d/").await.unwrap().is_empty());
 }
+
+#[tokio::test]
+async fn fuse_reader_copy_never_takes_a_newer_version() {
+    use fuse3::path::prelude::*;
+    use kubedal::util::fuse_fs::Filesystem;
+    use std::ffi::OsStr;
+    let Some(cfg) = s3_config() else {
+        eprintln!("KUBEDAL_TEST_S3_ENDPOINT is not set, skipping");
+        return;
+    };
+    check_bucket(&cfg).await;
+    let op = build_operator(&Backend::S3, cfg, "").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Arc::new(Filesystem::new(op.clone(), 0, 0, dir.path().join("spool")));
+    let req = || Request {
+        unique: 1,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    op.write("f", "version A").await.unwrap();
+    let fh = fs
+        .open(req(), OsStr::new("/f"), libc::O_RDONLY as u32)
+        .await
+        .unwrap()
+        .fh;
+    // The object is replaced after the reader's version was chosen and before
+    // the copy is made.
+    let pause = fs.pause_points().arm("preserve_copy");
+    let unlink = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.unlink(req(), OsStr::new("/"), OsStr::new("f")).await })
+    };
+    pause.reached().await;
+    op.write("f", "version B").await.unwrap();
+    pause.resume();
+    unlink.await.unwrap().unwrap();
+    // The handle never gets the bytes of version B: it has no copy, and its
+    // object is gone (ENOENT) or changed (ESTALE).
+    let read = fs.read(req(), None, fh, 0, 100).await;
+    let Err(err) = read else {
+        panic!("the read must fail");
+    };
+    assert!(
+        err == libc::ENOENT.into() || err == libc::ESTALE.into(),
+        "{err:?}"
+    );
+}

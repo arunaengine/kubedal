@@ -273,11 +273,17 @@ impl Filesystem {
         if self.states.pause.should_fail("preserve_fails") {
             return Err(Errno::from(libc::ENOSPC));
         }
+        self.states.pause.hit("preserve_copy").await;
         let copy = self
             .states
-            .snapshot(&self.op, key)
+            .snapshot(&self.op, key, current.as_deref())
             .await
             .map_err(status_errno)?;
+        // The object was replaced meanwhile: these handles get ESTALE like
+        // others whose object changed, never the bytes of the new version.
+        let Some(copy) = copy else {
+            return Ok(());
+        };
         for file in files {
             if let Some(handle) = self.opened_files.get(file) {
                 let _ = handle.snapshot.set(copy.clone());

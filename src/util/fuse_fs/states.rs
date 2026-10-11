@@ -453,10 +453,13 @@ impl StateData {
     }
 
     /// Copy the current object content into the spool file, in chunks.
-    async fn fill_from(&mut self, op: &Operator) -> Result<(), Status> {
+    async fn fill_from(&mut self, op: &Operator, if_match: Option<&str>) -> Result<(), Status> {
         let key = self.key.clone();
-        let mut stream = op
-            .reader(&key)
+        let mut reader = op.reader_with(&key);
+        if let Some(etag) = if_match.filter(|_| op.info().capability().read_with_if_match) {
+            reader = reader.if_match(etag);
+        }
+        let mut stream = reader
             .await
             .map_err(|e| opendal_status(e, &format!("open {key}")))?
             .into_bytes_stream(..)
@@ -848,7 +851,16 @@ impl States {
     /// counts as unlinked, so it never journals or uploads. Its spool file is
     /// removed from the folder at once: the open file keeps the content, and the
     /// space goes back to the budget when the last handle drops the copy.
-    pub async fn snapshot(&self, op: &Operator, key: &str) -> Result<Arc<FileState>, Status> {
+    ///
+    /// With `etag`, the copy must be of that version: it is read with If-Match
+    /// where the backend supports it, and the version is checked again after
+    /// the copy. Another version gives None.
+    pub async fn snapshot(
+        &self,
+        op: &Operator,
+        key: &str,
+        etag: Option<&str>,
+    ) -> Result<Option<Arc<FileState>>, Status> {
         std::fs::create_dir_all(&self.dir).map_err(|e| io_status(e, "create spool folder"))?;
         let name = uuid::Uuid::new_v4().simple().to_string();
         let data_path = self.dir.join(format!("{name}.data"));
@@ -883,8 +895,19 @@ impl States {
             }),
         });
         removed.map_err(|e| io_status(e, "remove snapshot spool file"))?;
-        state.data.lock().await.fill_from(op).await?;
-        Ok(state)
+        let filled = state.data.lock().await.fill_from(op, etag).await;
+        if let Some(etag) = etag {
+            let same = match op.stat(key).await {
+                Ok(meta) => meta.etag() == Some(etag),
+                Err(err) if err.kind() == opendal::ErrorKind::NotFound => false,
+                Err(err) => return Err(opendal_status(err, &format!("stat {key}"))),
+            };
+            if !same {
+                return Ok(None);
+            }
+        }
+        filled?;
+        Ok(Some(state))
     }
 
     async fn create(&self, op: &Operator, key: &str, keep: bool) -> Result<Arc<FileState>, Status> {
@@ -926,7 +949,7 @@ impl States {
         let mut data = state.data.lock().await;
         self.map().insert(key.to_string(), state.clone());
         let loaded = if keep {
-            match data.fill_from(op).await {
+            match data.fill_from(op, None).await {
                 Ok(()) => Ok(()),
                 // A missing object is a new, empty file.
                 Err(err) if err.code() == tonic::Code::NotFound => {
@@ -2340,7 +2363,7 @@ mod tests {
         op.write("f", "content").await.unwrap();
         let budget = Arc::new(SpoolBudget::new(u64::MAX));
         let states = States::new(dir.path().to_path_buf(), budget.clone());
-        let copy = states.snapshot(&op, "f").await.unwrap();
+        let copy = states.snapshot(&op, "f", None).await.unwrap().unwrap();
         assert_eq!(budget.used(), 7);
         // nothing is left in the spool folder for a replay
         assert_eq!(spool_files(dir.path()), 0);

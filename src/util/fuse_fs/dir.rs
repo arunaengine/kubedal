@@ -27,24 +27,19 @@ impl Filesystem {
     ) -> Result<ReplyDirectory<impl futures::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
         tracing::debug!("readdir(path={path:?}, fh={fh}, offset={offset})");
-        let entries = self.dir_snapshot(path, fh, offset as u64).await?;
+        let entries: Vec<DirectoryEntry> = match self.dir_snapshot(path, fh, offset as u64).await? {
+            Listing::Fresh(entries) => entries.into_iter().map(name_only).collect(),
+            Listing::Kept(entries) => entries.as_ref().clone(),
+        };
         let start = (offset as usize).min(entries.len());
         Ok(ReplyDirectory {
-            entries: stream::iter((start..entries.len()).map(move |i| {
-                let e = &entries[i];
-                Ok(DirectoryEntry {
-                    kind: e.kind,
-                    name: e.name.clone(),
-                    offset: e.offset,
-                })
-            }))
-            .boxed(),
+            entries: stream::iter(entries.into_iter().skip(start).map(Ok)).boxed(),
         })
     }
 
     pub(super) async fn readdirplus_impl<'a>(
         &'a self,
-        _req: Request,
+        req: Request,
         parent: &'a OsStr,
         fh: u64,
         offset: u64,
@@ -53,35 +48,65 @@ impl Filesystem {
         ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
         tracing::debug!("readdirplus(parent={parent:?}, fh={fh}, offset={offset})");
-        let entries = self.dir_snapshot(parent, fh, offset).await?;
-        let start = (offset as usize).min(entries.len());
+        let kept = match self.dir_snapshot(parent, fh, offset).await? {
+            Listing::Fresh(entries) => {
+                let start = (offset as usize).min(entries.len());
+                return Ok(ReplyDirectoryPlus {
+                    entries: stream::iter(entries.into_iter().skip(start).map(Ok)).boxed(),
+                });
+            }
+            Listing::Kept(entries) => entries,
+        };
+        // A kept listing holds only names. Attributes and type come fresh from
+        // lookup, so a name that is now another kind of entry never gets the
+        // old type; names that are gone are left out.
+        let now = SystemTime::now();
+        let dot_attr = dummy_file_attr(FileType::Directory, now, self.uid, self.gid);
+        let start = (offset as usize).min(kept.len());
+        let entries = stream::iter((start..kept.len()).map(move |i| kept[i].clone()))
+            .then(move |e| async move {
+                let (attr, ttl) = if e.name == "." || e.name == ".." {
+                    (dot_attr, TTL)
+                } else {
+                    match self.lookup(req, parent, &e.name).await {
+                        Ok(reply) => (reply.attr, reply.ttl),
+                        Err(err) if err == Errno::from(libc::ENOENT) => return None,
+                        Err(err) => return Some(Err(err)),
+                    }
+                };
+                Some(Ok(DirectoryEntryPlus {
+                    kind: attr.kind,
+                    name: e.name,
+                    offset: e.offset,
+                    attr,
+                    entry_ttl: ttl,
+                    attr_ttl: ttl,
+                }))
+            })
+            .filter_map(futures::future::ready);
         Ok(ReplyDirectoryPlus {
-            entries: stream::iter((start..entries.len()).map(move |i| Ok(entries[i].clone())))
-                .boxed(),
+            entries: entries.boxed(),
         })
     }
 
-    /// The listing of an open folder handle. It is made when a listing starts
-    /// (offset 0) and kept until `releasedir`, so all pages of one handle come
-    /// from the same listing: names added or removed in between never shift
-    /// the offsets. Without a handle (`fh` 0), every call makes a new listing.
-    async fn dir_snapshot(
-        &self,
-        path: &OsStr,
-        fh: u64,
-        offset: u64,
-    ) -> Result<Arc<Vec<DirectoryEntryPlus>>> {
+    /// The listing of an open folder handle. A new listing is made when a
+    /// listing starts (offset 0); its names are kept until `releasedir`, so all
+    /// pages of one handle use the same names and offsets: names added or
+    /// removed in between never shift them. Without a handle (`fh` 0), every
+    /// call makes a new listing.
+    async fn dir_snapshot(&self, path: &OsStr, fh: u64, offset: u64) -> Result<Listing> {
         if fh != 0
             && offset != 0
             && let Some(entries) = self.dir_snapshots().get(&fh)
         {
-            return Ok(entries.clone());
+            return Ok(Listing::Kept(entries.clone()));
         }
-        let entries = Arc::new(self.list_dir(path).await?);
+        let entries = self.list_dir(path).await?;
         if fh != 0 {
-            self.dir_snapshots().insert(fh, entries.clone());
+            let names = entries.iter().cloned().map(name_only).collect();
+            self.dir_snapshots().insert(fh, Arc::new(names));
         }
-        Ok(entries)
+        Ok(Listing::Fresh(entries))
     }
 
     /// List a folder with ".", ".." and offsets that start at 1.
@@ -164,6 +189,21 @@ impl Filesystem {
                 ..e
             })
             .collect())
+    }
+}
+
+/// A folder listing: made just now with attributes, or kept from the start of
+/// the listing with names only.
+enum Listing {
+    Fresh(Vec<DirectoryEntryPlus>),
+    Kept(Arc<Vec<DirectoryEntry>>),
+}
+
+fn name_only(e: DirectoryEntryPlus) -> DirectoryEntry {
+    DirectoryEntry {
+        kind: e.kind,
+        name: e.name,
+        offset: e.offset,
     }
 }
 

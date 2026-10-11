@@ -1727,3 +1727,28 @@ async fn pages_of_one_folder_handle_come_from_one_listing() {
     assert_eq!(names(all), [".", "..", "0", "a", "c"]);
     fs.releasedir(req(), root, fh, 0).await.unwrap();
 }
+
+#[tokio::test]
+async fn later_pages_of_readdirplus_use_fresh_attributes() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("x", "file").await.unwrap();
+    fs.op.write("z", "gone soon").await.unwrap();
+    let root = OsStr::new("/");
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdirplus(req(), root, fh, 0, 0).await.unwrap();
+    let first: Vec<_> = reply.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first.last().unwrap().name, "a");
+    // "x" becomes a folder and "z" goes away before the next page.
+    fs.op.delete("x").await.unwrap();
+    fs.op.write("x/child", "c").await.unwrap();
+    fs.op.delete("z").await.unwrap();
+    let reply = fs.readdirplus(req(), root, fh, 3, 0).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].name, "x");
+    assert_eq!(rest[0].kind, FileType::Directory);
+    assert_eq!(rest[0].attr.kind, FileType::Directory);
+    assert_eq!(rest[0].offset, 4);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+}

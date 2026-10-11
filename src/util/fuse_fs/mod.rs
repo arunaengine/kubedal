@@ -121,7 +121,7 @@ pub struct Filesystem {
     /// Number of the next open folder handle.
     next_dir_handle: std::sync::atomic::AtomicU64,
     /// Listings of open folder handles, see [`Filesystem::dir_snapshot`].
-    dir_snapshots: std::sync::Mutex<HashMap<u64, Arc<Vec<DirectoryEntryPlus>>>>,
+    dir_snapshots: std::sync::Mutex<HashMap<u64, Arc<Vec<DirectoryEntry>>>>,
 }
 
 impl Filesystem {
@@ -229,9 +229,7 @@ impl Filesystem {
         }
     }
 
-    fn dir_snapshots(
-        &self,
-    ) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Vec<DirectoryEntryPlus>>>> {
+    fn dir_snapshots(&self) -> std::sync::MutexGuard<'_, HashMap<u64, Arc<Vec<DirectoryEntry>>>> {
         self.dir_snapshots.lock().unwrap_or_else(|p| p.into_inner())
     }
 

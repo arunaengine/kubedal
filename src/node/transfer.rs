@@ -176,16 +176,36 @@ pub async fn download_tree(
         create_dir_all(&dest.join(dir)).await?;
     }
 
-    futures::stream::iter(tree.files.iter().map(Ok::<_, Status>))
-        .try_for_each_concurrent(CONCURRENCY, |file| async move {
-            let target = dest.join(&file.relative);
-            if let Some(parent) = target.parent() {
-                create_dir_all(parent).await?;
+    // Wait for every started download, also after an error. A dropped download
+    // may still have blocking file work running, which could finish after the
+    // caller removed `dest` or during a retry. After the first error no new
+    // file starts.
+    let first_error: std::sync::Mutex<Option<Status>> = std::sync::Mutex::new(None);
+    futures::stream::iter(tree.files.iter())
+        .for_each_concurrent(CONCURRENCY, |file| async {
+            let failed = || first_error.lock().is_ok_and(|e| e.is_some());
+            if failed() {
+                return;
             }
-            download_file(op, &file.key, &target, budget, false).await?;
-            Ok(())
+            let target = dest.join(&file.relative);
+            let result = async {
+                if let Some(parent) = target.parent() {
+                    create_dir_all(parent).await?;
+                }
+                download_file(op, &file.key, &target, budget, false).await
+            }
+            .await;
+            if let Err(err) = result
+                && let Ok(mut slot) = first_error.lock()
+            {
+                slot.get_or_insert(err);
+            }
         })
-        .await
+        .await;
+    match first_error.into_inner().unwrap_or_else(|p| p.into_inner()) {
+        Some(err) => Err(err),
+        None => Ok(()),
+    }
 }
 
 pub async fn create_dir_all(path: &Path) -> Result<(), Status> {
@@ -357,6 +377,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(err.code(), tonic::Code::ResourceExhausted);
+    }
+
+    #[tokio::test]
+    async fn a_failed_tree_download_returns_only_after_started_files_finished() {
+        let big = "x".repeat(32 << 20);
+        let op = memory_with(&[("p/big", &big), ("p/fails", "y")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let mut tree = list_tree(&op, "p").await.unwrap();
+        // The big file starts first.
+        tree.files.sort_by(|a, b| a.relative.cmp(&b.relative));
+        // A folder in the way makes the small file fail at once.
+        std::fs::create_dir(dir.path().join("fails")).unwrap();
+        let err = download_tree(&op, &tree, dir.path(), &ByteBudget::new(None)).await;
+        assert!(err.is_err());
+        // The big download started together with the failing one and was not
+        // cut off: nothing is still writing into the folder.
+        let size = std::fs::metadata(dir.path().join("big")).map(|m| m.len());
+        assert_eq!(size.unwrap(), big.len() as u64);
     }
 
     #[tokio::test]

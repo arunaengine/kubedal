@@ -44,7 +44,8 @@ pub fn run_from_env() -> Result<(), String> {
 /// logged, and the file is tried again in the next pass.
 ///
 /// A file is copied when it is missing in the replica, has another size there,
-/// or changed in the source since the last copy of this process.
+/// or changed in the source since the last copy of this process. Without a
+/// record of an earlier copy (the first pass), the content is compared.
 pub fn sync_once(source: &Path, replica: &Path, copied: &mut Copied) {
     let mut folders = vec![PathBuf::new()];
     while let Some(relative) = folders.pop() {
@@ -90,14 +91,38 @@ fn sync_entry(
     }
     let seen = (meta.len(), meta.modified().ok());
     let same_size = std::fs::metadata(&target).is_ok_and(|t| t.len() == meta.len());
-    // Without a record (first pass), a file of the same size counts as copied.
-    let changed = copied.get(path).is_some_and(|last| *last != seen);
+    let changed = match copied.get(path) {
+        Some(last) => *last != seen,
+        // The source may have changed while no sync pod ran.
+        None => same_size && !same_content(&source.join(path), &target)?,
+    };
     if !same_size || changed {
         tracing::info!("copy {}", path.display());
         std::fs::copy(source.join(path), &target)?;
     }
     copied.insert(path.to_path_buf(), seen);
     Ok(())
+}
+
+/// True if both files have the same bytes.
+fn same_content(a: &Path, b: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let (mut a, mut b) = (std::fs::File::open(a)?, std::fs::File::open(b)?);
+    let (mut buf_a, mut buf_b) = (vec![0u8; 64 * 1024], vec![0u8; 64 * 1024]);
+    loop {
+        let n = a.read(&mut buf_a)?;
+        if n == 0 {
+            return Ok(b.read(&mut buf_b[..1])? == 0);
+        }
+        match b.read_exact(&mut buf_b[..n]) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::UnexpectedEof => return Ok(false),
+            Err(err) => return Err(err),
+        }
+        if buf_a[..n] != buf_b[..n] {
+            return Ok(false);
+        }
+    }
 }
 
 #[cfg(test)]
@@ -137,6 +162,23 @@ mod tests {
         std::fs::remove_file(source.join("a/b/deep.txt")).unwrap();
         sync_once(&source, &replica, &mut copied);
         assert!(replica.join("a/b/deep.txt").exists());
+    }
+
+    #[test]
+    fn a_file_of_the_same_size_but_other_content_is_replaced_on_the_first_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        // The source changed from "one" to "two" while no sync pod ran.
+        std::fs::write(source.join("f"), "two").unwrap();
+        std::fs::write(replica.join("f"), "one").unwrap();
+        std::fs::write(source.join("same"), "abc").unwrap();
+        std::fs::write(replica.join("same"), "abc").unwrap();
+        let mut copied = Copied::new();
+        sync_once(&source, &replica, &mut copied);
+        assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"two");
+        assert!(copied.contains_key(Path::new("same")));
     }
 
     #[test]

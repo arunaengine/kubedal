@@ -1371,6 +1371,15 @@ pub async fn upload_pending(
                 .map_err(|e| Status::internal(format!("bad spool metadata {meta_path:?}: {e}")))?,
             Err(err) => return Err(io_status(err, "read spool metadata")),
         };
+        // A key that storage would change (written by an older version) could
+        // overwrite another object: stop before anything changes, keep all.
+        if !crate::util::opendal::is_exact_key(&meta.key) {
+            return Err(Status::failed_precondition(format!(
+                "spool journal {meta_path:?} names {:?}, which storage would store \
+                 under another name; the spool folder is kept as it is",
+                meta.key
+            )));
+        }
         let record = (meta.generation, meta_path.clone(), meta.tombstone);
         match newest.get(&meta.key) {
             Some((generation, _, _)) if *generation > meta.generation => {
@@ -2011,6 +2020,23 @@ mod tests {
         std::fs::write(dir.join(format!("{name}.data")), content).unwrap();
         let meta = serde_json::json!({"key": key, "generation": generation});
         std::fs::write(dir.join(format!("{name}.json")), meta.to_string()).unwrap();
+    }
+
+    #[tokio::test]
+    async fn replay_keeps_a_journal_whose_key_storage_would_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("x", "OLD").await.unwrap();
+        journal(dir.path(), "spaced", "x ", 5, "NEW");
+        journal(dir.path(), "fine", "y", 6, "Y");
+        let err = upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        // Nothing was uploaded or removed.
+        assert_eq!(op.read("x").await.unwrap().to_vec(), b"OLD");
+        assert!(!op.exists("y").await.unwrap());
+        assert_eq!(spool_files(dir.path()), 4);
     }
 
     #[tokio::test]

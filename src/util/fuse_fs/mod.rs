@@ -129,6 +129,8 @@ impl Filesystem {
             if let Some(writer) = writer {
                 // An open file is a local spool file, so any size works.
                 let mut data = writer.lock().await;
+                // Another operation may have stopped the file system meanwhile.
+                self.check_writable()?;
                 if !data.closed {
                     data.set_len(size).map_err(io_errno)?;
                     return Ok(());
@@ -138,6 +140,7 @@ impl Filesystem {
         // The namespace lock covers the state lookup and the storage fallback,
         // so no writable open can load the old content in between.
         let _ns = self.states.lock_namespace().await;
+        self.check_writable()?;
         // Another handle writes this file: truncate the shared content. A state
         // that closed meanwhile is skipped; its content is in storage then.
         if let Some(path) = path
@@ -170,6 +173,8 @@ impl Filesystem {
         if size != 0 {
             return Err(Errno::from(libc::EOPNOTSUPP));
         }
+        // A flush may have stopped the file system while this call waited.
+        self.check_writable()?;
         self.op
             .write(&path, Bytes::new())
             .await

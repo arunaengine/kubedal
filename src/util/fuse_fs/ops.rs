@@ -420,6 +420,8 @@ impl PathFilesystem for Filesystem {
         };
 
         let mut state = state.lock().await;
+        // Another operation may have stopped the file system meanwhile.
+        self.check_writable()?;
         if state.closed {
             return Err(Errno::from(libc::EBADF));
         }

@@ -1098,3 +1098,36 @@ async fn a_change_after_a_flush_survives_a_broken_mount() {
     break_and_replay(fs, &op, dir.path()).await;
     assert_eq!(op.read("victim").await.unwrap().to_vec(), b"later");
 }
+
+#[tokio::test]
+async fn forced_truncate_waiting_while_a_flush_breaks_changes_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let (fs, op) = fs_in(dir.path()).await;
+    let fs = Arc::new(fs);
+    op.write("victim", "KEEP").await.unwrap();
+    let other = create(&fs, "other").await;
+    fs.write(req(), Some(OsStr::new("/other")), other, 0, b"OTHER", 0, 0)
+        .await
+        .unwrap();
+    let pause = fs.pause_points().arm("truncate_fallback");
+    let truncate = {
+        let fs = fs.clone();
+        tokio::spawn(async move {
+            let size = SetAttr {
+                size: Some(0),
+                ..Default::default()
+            };
+            fs.setattr(req(), Some(OsStr::new("/victim")), None, size)
+                .await
+        })
+    };
+    pause.reached().await;
+    // The flush holds only its own state lock and stops the file system while
+    // the truncate waits.
+    fs.pause_points().fail_once("dir_fsync");
+    assert!(fs.flush(req(), None, other, 0).await.is_err());
+    pause.resume();
+    let result = truncate.await.unwrap();
+    assert_eq!(result.unwrap_err(), Errno::from(libc::EIO));
+    assert_eq!(op.read("victim").await.unwrap().to_vec(), b"KEEP");
+}

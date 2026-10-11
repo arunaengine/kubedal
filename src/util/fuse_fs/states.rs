@@ -925,6 +925,9 @@ impl States {
         let Some(mut data) = state.lock_alive().await else {
             return Ok(false);
         };
+        if self.is_broken() {
+            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        }
         data.set_len(size)?;
         Ok(true)
     }

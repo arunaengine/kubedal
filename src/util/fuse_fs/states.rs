@@ -1348,16 +1348,6 @@ pub async fn upload_pending(
         Err(err) => return Err(io_status(err, "list spool folder")),
     };
     let paths: Vec<PathBuf> = entries.filter_map(|e| e.ok().map(|e| e.path())).collect();
-    let cleanup = |e: std::io::Error| io_status(e, "clean up spool folder");
-    // Spool data without a journal is unfinished or removed: drop it.
-    for data_path in paths
-        .iter()
-        .filter(|p| p.extension().is_some_and(|e| e == "data"))
-    {
-        if !data_path.with_extension("json").exists() {
-            remove_and_refund(data_path, budget).map_err(cleanup)?;
-        }
-    }
     // Group all records (journals and tombstones) by key. Only the newest
     // generation of a key counts; the order never depends on file names.
     let mut newest: HashMap<String, (u64, PathBuf, bool)> = HashMap::new();
@@ -1390,6 +1380,17 @@ pub async fn upload_pending(
                     obsolete.push(older);
                 }
             }
+        }
+    }
+    // Every journal key is valid; only now anything is removed. Spool data
+    // without a journal is unfinished or removed: drop it.
+    let cleanup = |e: std::io::Error| io_status(e, "clean up spool folder");
+    for data_path in paths
+        .iter()
+        .filter(|p| p.extension().is_some_and(|e| e == "data"))
+    {
+        if !data_path.with_extension("json").exists() {
+            remove_and_refund(data_path, budget).map_err(cleanup)?;
         }
     }
     let mut tombstones = Vec::new();
@@ -2029,6 +2030,7 @@ mod tests {
         op.write("x", "OLD").await.unwrap();
         journal(dir.path(), "spaced", "x ", 5, "NEW");
         journal(dir.path(), "fine", "y", 6, "Y");
+        std::fs::write(dir.path().join("orphan.data"), "unfinished").unwrap();
         let err = upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
             .await
             .unwrap_err();
@@ -2036,7 +2038,7 @@ mod tests {
         // Nothing was uploaded or removed.
         assert_eq!(op.read("x").await.unwrap().to_vec(), b"OLD");
         assert!(!op.exists("y").await.unwrap());
-        assert_eq!(spool_files(dir.path()), 4);
+        assert_eq!(spool_files(dir.path()), 5);
     }
 
     #[tokio::test]

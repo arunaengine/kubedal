@@ -82,9 +82,14 @@ impl DataReplicaSet {
         if drs_replicas == 0 {
             let uid = self.metadata.uid.clone().unwrap_or_default();
             let all_data_pods = dp_api.list(&ListParams::default()).await?;
-            for dp in owned_by(&all_data_pods.items, &uid) {
-                delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
-                delete_if_present(&dp_api, &dp.name_any()).await?;
+            let all_pvcs = pvc_api.list(&ListParams::default()).await?;
+            let (pvcs, data_pods) =
+                zero_replica_cleanup(self, &uid, &all_data_pods.items, &all_pvcs.items);
+            for name in pvcs {
+                delete_if_present(&pvc_api, &name).await?;
+            }
+            for name in data_pods {
+                delete_if_present(&dp_api, &name).await?;
             }
             delete_if_present(&pod_api, &sync_pod_name(self)).await?;
             self.patch_status(&ctx, true).await?;
@@ -642,6 +647,28 @@ fn owned_by<'a, K: Resource>(items: &'a [K], uid: &str) -> Vec<&'a K> {
         .collect()
 }
 
+/// The PVC and DataPod names that scaling to zero removes: the replicas the set
+/// owns, their PVCs, and every other PVC the set owns (the one of its source).
+fn zero_replica_cleanup(
+    data_replica_set: &DataReplicaSet,
+    uid: &str,
+    data_pods: &[DataPod],
+    pvcs: &[PersistentVolumeClaim],
+) -> (Vec<String>, Vec<String>) {
+    let replicas = owned_by(data_pods, uid);
+    let mut pvc_names: Vec<String> = replicas
+        .iter()
+        .map(|dp| pvc_name(data_replica_set, dp))
+        .collect();
+    for pvc in owned_by(pvcs, uid) {
+        if !pvc_names.contains(&pvc.name_any()) {
+            pvc_names.push(pvc.name_any());
+        }
+    }
+    let data_pod_names = replicas.iter().map(|dp| dp.name_any()).collect();
+    (pvc_names, data_pod_names)
+}
+
 async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -789,6 +816,47 @@ mod tests {
         let names: Vec<_> = owned_by(&items, "u").iter().map(|d| d.name_any()).collect();
         assert_eq!(names, vec!["old-labels"]);
         assert!(owned_by(&items, "").is_empty());
+    }
+
+    #[test]
+    fn scaling_to_zero_also_removes_the_source_pvc() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let drs: DataReplicaSet = serde_json::from_value(json!({
+            "apiVersion": "kubedal.arunaengine.org/v1alpha1",
+            "kind": "DataReplicaSet",
+            "metadata": {"name": "set", "namespace": "ns", "uid": "u"},
+            "spec": {
+                "replicas": 0,
+                "selector": {"matchLabels": {}},
+                "sourceDataPodRef": {"name": "source"},
+                "template": {"metadata": {}, "spec": {}}
+            }
+        }))
+        .unwrap();
+        let owned = Some(vec![OwnerReference {
+            uid: "u".into(),
+            ..Default::default()
+        }]);
+        let mut replica = DataPod::new("u-replica-0", DataPodSpec::default());
+        replica.metadata.owner_references = owned.clone();
+        // The source DataPod belongs to someone else, but its PVC to the set.
+        let source = DataPod::new("source", DataPodSpec::default());
+        let pvc = |name: &str, owner_references| PersistentVolumeClaim {
+            metadata: ObjectMeta {
+                name: Some(name.into()),
+                owner_references,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let pvcs = [
+            pvc("set-u-replica-0", owned.clone()),
+            pvc("set-source", owned),
+            pvc("unrelated", None),
+        ];
+        let (pvc_names, data_pods) = zero_replica_cleanup(&drs, "u", &[replica, source], &pvcs);
+        assert_eq!(pvc_names, vec!["set-u-replica-0", "set-source"]);
+        assert_eq!(data_pods, vec!["u-replica-0"]);
     }
 
     #[test]

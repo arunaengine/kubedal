@@ -77,15 +77,12 @@ impl DataReplicaSet {
         let pod_api = Api::<Pod>::namespaced(client.clone(), &drs_ns);
 
         // Zero replicas need no source at all: remove every replica and the sync
-        // pod, even if the source is gone or invalid.
+        // pod, even if the source is gone or invalid. Replicas are found by owner,
+        // so also those that no longer match a changed selector go.
         if drs_replicas == 0 {
             let uid = self.metadata.uid.clone().unwrap_or_default();
-            let prefix = format!("{uid}-replica-");
-            for dp in drs_data_pods
-                .items
-                .iter()
-                .filter(|dp| dp.name_any().starts_with(&prefix))
-            {
+            let all_data_pods = dp_api.list(&ListParams::default()).await?;
+            for dp in owned_by(&all_data_pods.items, &uid) {
                 delete_if_present(&pvc_api, &pvc_name(self, dp)).await?;
                 delete_if_present(&dp_api, &dp.name_any()).await?;
             }
@@ -634,6 +631,17 @@ fn members_hash(source: &str, replicas: impl Iterator<Item = String>) -> String 
 
 /// Delete an object. A missing object is fine; every other error (like a
 /// missing RBAC permission) is returned, not ignored.
+/// The objects in `items` that have an owner reference with `uid`.
+fn owned_by<'a, K: Resource>(items: &'a [K], uid: &str) -> Vec<&'a K> {
+    if uid.is_empty() {
+        return vec![];
+    }
+    items
+        .iter()
+        .filter(|item| item.owner_references().iter().any(|o| o.uid == uid))
+        .collect()
+}
+
 async fn delete_if_present<K>(api: &Api<K>, name: &str) -> Result<(), Error>
 where
     K: kube::Resource + Clone + serde::de::DeserializeOwned + std::fmt::Debug,
@@ -757,6 +765,30 @@ mod tests {
                 .unwrap();
             assert!(verbs.contains("\"delete\""), "{resource}: {verbs}");
         }
+    }
+
+    #[test]
+    fn owned_objects_are_found_by_owner_uid_only() {
+        use k8s_openapi::apimachinery::pkg::apis::meta::v1::OwnerReference;
+        let dp = |name: &str, owner: Option<&str>| {
+            let mut dp = DataPod::new(name, DataPodSpec::default());
+            dp.metadata.owner_references = owner.map(|uid| {
+                vec![OwnerReference {
+                    uid: uid.to_string(),
+                    ..Default::default()
+                }]
+            });
+            dp
+        };
+        // A replica whose labels no longer match the selector is still owned.
+        let items = vec![
+            dp("old-labels", Some("u")),
+            dp("other-set", Some("v")),
+            dp("free", None),
+        ];
+        let names: Vec<_> = owned_by(&items, "u").iter().map(|d| d.name_any()).collect();
+        assert_eq!(names, vec!["old-labels"]);
+        assert!(owned_by(&items, "").is_empty());
     }
 
     #[test]

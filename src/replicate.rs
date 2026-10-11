@@ -105,6 +105,11 @@ fn sync_entry(
     if !same_size || changed {
         tracing::info!("copy {}", path.display());
         copy_file(&source.join(path), &target)?;
+    } else if !copied.contains_key(path) {
+        // Equal content without a record may still wait for its upload on a
+        // kubedal FUSE volume (for example after a failed fsync), so it only
+        // counts once an fsync of it worked.
+        fsync_path(&target)?;
     }
     copied.insert(path.to_path_buf(), seen);
     Ok(())
@@ -144,17 +149,23 @@ fn copy_file_via(from: &Path, to: &Path, temp: &Path) -> std::io::Result<()> {
         // On a kubedal FUSE volume, the kernel may send the release of the
         // temporary file after the rename, so the renamed content may not be
         // stored under its new name yet. An fsync of the new name uploads it.
-        let file = std::fs::File::options()
-            .write(true)
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(to)?;
-        file.sync_all()?;
-        close_file(file)
+        fsync_path(to)
     })();
     if result.is_err() {
         let _ = std::fs::remove_file(temp);
     }
     result
+}
+
+/// Open a file for writing without truncating it, fsync and close it. On a
+/// kubedal FUSE volume this uploads content that is not stored yet.
+fn fsync_path(path: &Path) -> std::io::Result<()> {
+    let file = std::fs::File::options()
+        .write(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(path)?;
+    file.sync_all()?;
+    close_file(file)
 }
 
 /// Open a file for reading, but fail if it is a symlink.
@@ -360,6 +371,26 @@ mod tests {
         std::fs::write(source.join(&name), "real data").unwrap();
         sync_once(&source, &replica, &mut Copied::new());
         assert_eq!(std::fs::read(replica.join(&name)).unwrap(), b"real data");
+    }
+
+    #[test]
+    fn equal_content_is_recorded_only_after_an_fsync_worked() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(source.join("f"), "same").unwrap();
+        std::fs::write(replica.join("f"), "same").unwrap();
+        // The replica file cannot be opened for the fsync.
+        let mode = |m| std::fs::Permissions::from_mode(m);
+        std::fs::set_permissions(replica.join("f"), mode(0o444)).unwrap();
+        let mut copied = Copied::new();
+        sync_once(&source, &replica, &mut copied);
+        assert!(copied.is_empty());
+        std::fs::set_permissions(replica.join("f"), mode(0o644)).unwrap();
+        sync_once(&source, &replica, &mut copied);
+        assert!(copied.contains_key(Path::new("f")));
     }
 
     #[test]

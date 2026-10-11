@@ -351,6 +351,13 @@ impl VolumeManager {
             VolumeSource::Tree {
                 node, path, mode, ..
             } => {
+                // Checked as written before any operator is built: a path that
+                // storage would change (like "//" for the root) never mounts.
+                if path != "." && crate::util::opendal::exact_user_key(path).is_none() {
+                    return Err(Status::invalid_argument(format!(
+                        "invalid path {path:?}: it would name another storage folder"
+                    )));
+                }
                 let resolved = self.cluster.resolve(node, &req.pod).await?;
                 if !record.read_only {
                     resolved.require_writable()?;

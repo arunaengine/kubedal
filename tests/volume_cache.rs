@@ -267,6 +267,26 @@ async fn publish_with_other_settings_fails() {
 }
 
 #[tokio::test]
+async fn paths_that_storage_would_change_never_mount() {
+    let env = Env::new();
+    env.add_store(None, false);
+    for (path, mode) in [
+        ("//", TreeMode::Fuse),
+        ("data//sub", TreeMode::Fuse),
+        ("data/./sub", TreeMode::Cache),
+    ] {
+        let target = env.target("p1");
+        let err = env
+            .manager
+            .publish(tree_request("vol-1", &target, path, mode, true))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::InvalidArgument, "{path:?}");
+        assert!(env.mounter.get(&target).is_none(), "{path:?}");
+    }
+}
+
+#[tokio::test]
 async fn publish_with_another_source_fails() {
     let env = Env::new();
     env.add_store(None, false);

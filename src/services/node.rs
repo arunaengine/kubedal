@@ -88,7 +88,16 @@ impl NodeService {
 /// of the DataNode.
 fn data_pod_path(data_pod: &DataPod) -> Result<String, Status> {
     match data_pod.spec.path.as_deref() {
-        Some(path) if !path.is_empty() && path != "/" => Ok(path.to_string()),
+        // An explicit path is taken exactly as written ("//" must never become
+        // the root, "team//run" never "team/run").
+        Some(path) if !path.is_empty() && path != "/" => {
+            if crate::util::opendal::exact_user_key(path).is_none() {
+                return Err(Status::invalid_argument(format!(
+                    "DataPod path {path:?} would name another storage folder"
+                )));
+            }
+            Ok(path.to_string())
+        }
         _ => {
             let uid = data_pod.metadata.uid.as_deref().ok_or_else(|| {
                 Status::unavailable("the DataPod has no path and no uid yet; try again later")
@@ -256,6 +265,18 @@ mod tests {
         assert_eq!(
             data_pod_path(&data_pod(None, None)).unwrap_err().code(),
             tonic::Code::Unavailable
+        );
+    }
+
+    #[test]
+    fn explicit_data_pod_paths_are_taken_exactly_as_written() {
+        for path in ["//", "team//run", "team/./run", "run ", "//team"] {
+            let err = data_pod_path(&data_pod(Some(path), Some("u1"))).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{path:?}");
+        }
+        assert_eq!(
+            data_pod_path(&data_pod(Some("team/run"), Some("u1"))).unwrap(),
+            "team/run"
         );
     }
 }

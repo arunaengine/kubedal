@@ -80,6 +80,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value(DEFAULT_NAME)
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("storage-class")
+                .long("storage-class")
+                .help("StorageClass of the PVCs that DataReplicaSets create")
+                .default_value("kubedal")
+                .value_parser(clap::value_parser!(String)),
+        )
         .get_matches();
 
     // Both arguments have default values, so they are always present.
@@ -144,7 +151,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let builder = if is_controller {
         // Is a controller node
-        let controller_service = ControllerService::new(client.clone()).await;
+        let storage_class = matches
+            .get_one::<String>("storage-class")
+            .cloned()
+            .unwrap_or_default();
+        let controller_service = ControllerService::new(client.clone(), storage_class).await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder

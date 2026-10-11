@@ -29,9 +29,12 @@ pub struct ControllerService {
 }
 
 impl ControllerService {
-    pub async fn new(client: Client) -> Self {
+    pub async fn new(client: Client, storage_class: String) -> Self {
         // Spawn the controller / resource reconciler
-        tokio::spawn(crate::resource::controller::run(client.clone()));
+        tokio::spawn(crate::resource::controller::run(
+            client.clone(),
+            storage_class,
+        ));
 
         Self {
             client,

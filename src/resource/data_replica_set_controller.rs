@@ -222,6 +222,7 @@ impl DataReplicaSet {
             self,
             MountAccess::FuseReadOnly,
             &pvc_api,
+            &ctx.storage_class,
         )
         .await?;
         let mut replica_resources = vec![];
@@ -238,6 +239,7 @@ impl DataReplicaSet {
                 self,
                 MountAccess::FuseReadWrite,
                 &pvc_api,
+                &ctx.storage_class,
             )
             .await?;
             replica_resources.push((replica, pvc));
@@ -377,6 +379,7 @@ async fn ensure_replica_pvc(
     data_replica_set: &DataReplicaSet,
     mount_access: MountAccess,
     pvc_api: &Api<PersistentVolumeClaim>,
+    storage_class: &str,
 ) -> Result<PersistentVolumeClaim, Error> {
     let name = pvc_name(data_replica_set, data_pod);
     if let Some(pvc) = pvc_api.get_opt(&name).await? {
@@ -437,7 +440,7 @@ async fn ensure_replica_pvc(
                 ),
                 ..Default::default()
             }),
-            storage_class_name: Some("kubedal".to_string()),
+            storage_class_name: Some(storage_class.to_string()),
             ..Default::default()
         }),
         status: None,
@@ -857,6 +860,14 @@ mod tests {
         let (pvc_names, data_pods) = zero_replica_cleanup(&drs, "u", &[replica, source], &pvcs);
         assert_eq!(pvc_names, vec!["set-u-replica-0", "set-source"]);
         assert_eq!(data_pods, vec!["u-replica-0"]);
+    }
+
+    /// The chart passes its StorageClass name, so DataReplicaSet PVCs use the
+    /// class the chart created.
+    #[test]
+    fn the_chart_passes_its_storage_class_to_the_controller() {
+        let controller = include_str!("../../charts/kubedal/templates/controller.yaml");
+        assert!(controller.contains("- --storage-class={{ .Values.storageClass.name }}"));
     }
 
     #[test]

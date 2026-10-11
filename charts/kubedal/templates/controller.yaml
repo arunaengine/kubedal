@@ -58,6 +58,7 @@ spec:
             - --endpoint=unix:///csi/csi.sock
             - --driver-name={{ .Values.driverName }}
             - --node-id=controller
+            - --storage-class={{ .Values.storageClass.name }}
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

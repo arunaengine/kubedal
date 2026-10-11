@@ -33,6 +33,7 @@ impl ControllerService {
         client: Client,
         storage_class: String,
         sync_image: String,
+        sync_pull_policy: String,
         sync_pull_secrets: Vec<String>,
     ) -> Self {
         // Spawn the controller / resource reconciler
@@ -40,6 +41,7 @@ impl ControllerService {
             client.clone(),
             storage_class,
             sync_image,
+            sync_pull_policy,
             sync_pull_secrets,
         ));
 

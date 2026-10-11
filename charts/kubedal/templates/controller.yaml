@@ -60,6 +60,7 @@ spec:
             - --node-id=controller
             - --storage-class={{ .Values.storageClass.name }}
             - --sync-image={{ include "kubedal.image" . }}
+            - --sync-image-pull-policy={{ .Values.image.pullPolicy }}
             {{- range .Values.imagePullSecrets }}
             - --sync-image-pull-secret={{ .name }}
             {{- end }}

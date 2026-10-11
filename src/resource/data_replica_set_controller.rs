@@ -509,7 +509,7 @@ async fn create_replica_pod(
     let container = Container {
         name: "sync-replica".to_string(),
         image: Some(ctx.sync_image.clone()),
-        image_pull_policy: Some("IfNotPresent".to_string()),
+        image_pull_policy: Some(ctx.sync_pull_policy.clone()),
         args: Some(vec!["replicate".to_string()]),
         env: Some(vec![
             EnvVar {
@@ -833,9 +833,18 @@ fn pod_members(pod: &Pod) -> Option<&str> {
         .map(String::as_str)
 }
 
-/// The image and the pull secrets of the sync pods, for the members hash.
+/// The image, pull policy and pull secrets of the sync pods, for the members
+/// hash.
 fn sync_pod_settings(ctx: &Context) -> String {
-    format!("{}|{}", ctx.sync_image, ctx.sync_pull_secrets.join(","))
+    pod_settings(
+        &ctx.sync_image,
+        &ctx.sync_pull_policy,
+        &ctx.sync_pull_secrets,
+    )
+}
+
+fn pod_settings(image: &str, pull_policy: &str, pull_secrets: &[String]) -> String {
+    format!("{image}|{pull_policy}|{}", pull_secrets.join(","))
 }
 
 /// Image pull secrets of a pod, or none if the list is empty.
@@ -1065,6 +1074,15 @@ mod tests {
         assert!(controller.contains("- --storage-class={{ .Values.storageClass.name }}"));
         assert!(controller.contains("- --sync-image={{ include \"kubedal.image\" . }}"));
         assert!(controller.contains("- --sync-image-pull-secret={{ .name }}"));
+        assert!(controller.contains("- --sync-image-pull-policy={{ .Values.image.pullPolicy }}"));
+    }
+
+    #[test]
+    fn a_new_pull_policy_replaces_the_sync_pod() {
+        assert_ne!(
+            pod_settings("img", "IfNotPresent", &[]),
+            pod_settings("img", "Always", &[])
+        );
     }
 
     #[test]

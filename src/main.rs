@@ -98,6 +98,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .value_parser(clap::value_parser!(String)),
         )
         .arg(
+            Arg::new("sync-image-pull-policy")
+                .long("sync-image-pull-policy")
+                .help("Image pull policy of the DataReplicaSet sync pods")
+                .default_value("IfNotPresent")
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
             Arg::new("sync-image-pull-secret")
                 .long("sync-image-pull-secret")
                 .help("Image pull secret of the DataReplicaSet sync pods (may be repeated)")
@@ -189,9 +196,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or_default()
             .cloned()
             .collect();
-        let controller_service =
-            ControllerService::new(client.clone(), storage_class, sync_image, sync_pull_secrets)
-                .await;
+        let sync_pull_policy = matches
+            .get_one::<String>("sync-image-pull-policy")
+            .cloned()
+            .unwrap_or_default();
+        let controller_service = ControllerService::new(
+            client.clone(),
+            storage_class,
+            sync_image,
+            sync_pull_policy,
+            sync_pull_secrets,
+        )
+        .await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder

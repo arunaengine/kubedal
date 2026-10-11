@@ -941,9 +941,17 @@ impl States {
         if self.fence.is_closing() {
             return (result, true);
         }
+        self.pause.hit("release_gate").await;
+        let persist = match self.may_persist(state, &data) {
+            Ok(persist) => persist,
+            // Broken or closing since the checks above: keep every recovery
+            // file, change nothing.
+            Err(err) => return (Err(err), !self.is_broken()),
+        };
         // A rename may have changed the key meanwhile; upload under the new key.
-        if data.dirty
-            && matches!(self.may_persist(state, &data), Ok(true))
+        // Only a retired state closes without upload.
+        if persist
+            && data.dirty
             && let Err(err) = data.upload(op).await
         {
             return (Err(err), true);
@@ -962,8 +970,15 @@ impl States {
         if self.fence.is_closing() || self.is_broken() {
             return true;
         }
-        if matches!(self.may_persist(state, &data), Ok(true)) && data.upload(op).await.is_err() {
-            return false;
+        match self.may_persist(state, &data) {
+            Ok(true) => {
+                if data.upload(op).await.is_err() {
+                    return false;
+                }
+            }
+            Ok(false) => {}
+            // Leave everything for the replay.
+            Err(_) => return true,
         }
         drop(data);
         self.pause.hit("retry_close").await;
@@ -976,7 +991,14 @@ impl States {
             // Leave everything for the replay.
             return true;
         }
-        if data.dirty && matches!(self.may_persist(state, &data), Ok(true)) {
+        self.pause.hit("retry_gate").await;
+        let persist = match self.may_persist(state, &data) {
+            Ok(persist) => persist,
+            // Broken or closing since the checks above: leave everything for
+            // the replay.
+            Err(_) => return true,
+        };
+        if data.dirty && persist {
             // A rename made it dirty again meanwhile: another upload is needed.
             return false;
         }
@@ -1561,6 +1583,63 @@ mod tests {
         retry.await.unwrap();
         assert!(!a.lock().await.closed);
         assert_eq!(spool_files(dir.path()), before);
+    }
+
+    /// Run `release` (or `retry`) of state a: a rename to b in its unlocked
+    /// phase, then shutdown starts right before its last gate. Replay must
+    /// still restore b.
+    async fn close_during_gate_keeps_the_spool(retry: bool) {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = Arc::new(states(dir.path()));
+        let a = states.open_write(&op, "a", false).await.unwrap();
+        a.lock().await.write_at(b"A", 0).unwrap();
+        if retry {
+            a.lock().await.handles = 0;
+        }
+        let (unlocked, gate) = if retry {
+            ("retry_close", "retry_gate")
+        } else {
+            ("release_close", "release_gate")
+        };
+        let unlocked = states.pause.arm(unlocked);
+        let gate = states.pause.arm(gate);
+        let task = {
+            let (states, op, a) = (states.clone(), op.clone(), a.clone());
+            tokio::spawn(async move {
+                if retry {
+                    states.retry(&op, &a).await;
+                } else {
+                    let _ = states.release(&op, &a).await;
+                }
+            })
+        };
+        unlocked.reached().await;
+        {
+            let ns = states.lock_namespace().await;
+            assert!(states.rename(&ns, &op, "a", "b").await.unwrap());
+        }
+        unlocked.resume();
+        gate.reached().await;
+        // Shutdown starts; nothing is in flight, so this returns at once.
+        states.fence.close_and_wait().await;
+        gate.resume();
+        task.await.unwrap();
+        assert!(!a.lock().await.closed);
+        upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"A");
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_before_the_release_gate_keeps_the_spool() {
+        close_during_gate_keeps_the_spool(false).await;
+    }
+
+    #[tokio::test]
+    async fn forced_shutdown_before_the_retry_gate_keeps_the_spool() {
+        close_during_gate_keeps_the_spool(true).await;
     }
 
     #[tokio::test]

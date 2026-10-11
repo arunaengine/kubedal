@@ -34,7 +34,7 @@ impl PathFilesystem for Filesystem {
         let path = PathBuf::from(parent).join(name);
         let now = SystemTime::now();
         // A file that is being written may not be uploaded yet.
-        if let Some(size) = self.spool_size(path.as_os_str()).await {
+        if let Some(size) = self.spool_size(path.as_os_str()).await? {
             let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
             return Ok(ReplyEntry {
                 ttl: TTL,
@@ -42,7 +42,7 @@ impl PathFilesystem for Filesystem {
             });
         }
         let metadata = self
-            .stat_entry(&path.to_string_lossy())
+            .stat_entry(&key_of(path.as_os_str())?)
             .await
             .map_err(opendal_error2errno)?;
         let attr = metadata2file_attr(&metadata, now, self.uid, self.gid);
@@ -106,7 +106,7 @@ impl PathFilesystem for Filesystem {
         });
         let spool_path = path.map(OsStr::to_os_string).or(fh_path);
         let spool_size = match &spool_path {
-            Some(p) => self.spool_size(p).await,
+            Some(p) => self.spool_size(p).await?,
             None => None,
         };
         if let Some(size) = spool_size {
@@ -131,7 +131,7 @@ impl PathFilesystem for Filesystem {
         };
 
         let metadata = self
-            .stat_entry(&file_path.unwrap_or_default().to_string_lossy())
+            .stat_entry(&key_of(file_path.unwrap_or_default().as_os_str())?)
             .await
             .map_err(opendal_error2errno)?;
 
@@ -170,10 +170,9 @@ impl PathFilesystem for Filesystem {
         self.check_writable()?;
         tracing::debug!("mkdir(parent={parent:?}, name={name:?}, mode=0o{mode:o})");
 
-        let mut path = PathBuf::from(parent).join(name);
-        path.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
+        let path = PathBuf::from(parent).join(name);
         self.op
-            .create_dir(&path.to_string_lossy())
+            .create_dir(&dir_key_of(path.as_os_str())?)
             .await
             .map_err(opendal_error2errno)?;
 
@@ -203,14 +202,12 @@ impl PathFilesystem for Filesystem {
         // A folder with files that exist only in the spool (not uploaded yet) is
         // not empty; removing it would let their upload create it again.
         let ns = self.states.lock_namespace().await;
-        let prefix = format!("{}/", key_of(path.as_os_str()));
+        let key = key_of(path.as_os_str())?;
+        let prefix = format!("{key}/");
         if self.states.has_live_under(&ns, &prefix).await {
             return Err(Errno::from(libc::ENOTEMPTY));
         }
-        self.op
-            .delete(&path.to_string_lossy())
-            .await
-            .map_err(opendal_error2errno)?;
+        self.op.delete(&key).await.map_err(opendal_error2errno)?;
 
         Ok(())
     }
@@ -232,7 +229,7 @@ impl PathFilesystem for Filesystem {
         let origin_path = PathBuf::from(origin_parent).join(origin_name);
         let path = PathBuf::from(parent).join(name);
 
-        let (from, to) = (key_of(origin_path.as_os_str()), key_of(path.as_os_str()));
+        let (from, to) = (key_of(origin_path.as_os_str())?, key_of(path.as_os_str())?);
         // The namespace lock is held for the whole rename, also during storage
         // calls, so no other name change can come in between.
         let ns = self.states.lock_namespace().await;
@@ -301,13 +298,13 @@ impl PathFilesystem for Filesystem {
         // the size and version (etag) of the object. So it never sees content of
         // another file that later gets the same name.
         let read_state = match write {
-            None => self.live_state(path).await,
+            None => self.live_state(path).await?,
             Some(_) => None,
         };
         let (size, etag, mtime) = if write.is_none() && read_state.is_none() {
             let meta = self
                 .op
-                .stat(&path.to_string_lossy())
+                .stat(&key_of(path)?)
                 .await
                 .map_err(opendal_error2errno)?;
             (
@@ -355,7 +352,7 @@ impl PathFilesystem for Filesystem {
                 Err(Errno::from(libc::EACCES))?;
             }
             (
-                file.path.to_string_lossy().to_string(),
+                key_of(file.path.as_os_str())?,
                 file.size,
                 file.write.clone().or_else(|| file.read_state.clone()),
                 file.etag.clone(),
@@ -512,7 +509,7 @@ impl PathFilesystem for Filesystem {
     async fn access(&self, _req: Request, path: &OsStr, mask: u32) -> Result<()> {
         tracing::debug!("access(path={path:?}, mask=0x{mask:x})");
 
-        self.stat_entry(&path.to_string_lossy())
+        self.stat_entry(&key_of(path)?)
             .await
             .map_err(opendal_error2errno)?;
 
@@ -599,14 +596,14 @@ impl PathFilesystem for Filesystem {
                 // Checked before the rename; not atomic against a file created
                 // at the same moment by another program.
                 let path = PathBuf::from(parent).join(name);
-                if self.spool_size(path.as_os_str()).await.is_some() {
+                if self.spool_size(path.as_os_str()).await?.is_some() {
                     return Err(Errno::from(libc::EEXIST));
                 }
                 // Only "not found" means the name is free; other errors are real.
                 let lookup = if self.states.pause.should_fail("noreplace_lookup") {
                     Err(opendal::Error::new(ErrorKind::PermissionDenied, "injected"))
                 } else {
-                    self.stat_entry(&key_of(path.as_os_str())).await
+                    self.stat_entry(&key_of(path.as_os_str())?).await
                 };
                 match lookup {
                     Ok(_) => return Err(Errno::from(libc::EEXIST)),

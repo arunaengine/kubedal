@@ -148,7 +148,7 @@ impl Filesystem {
         if let Some(path) = path
             && self
                 .states
-                .truncate(&key_of(path), size)
+                .truncate(&key_of(path)?, size)
                 .await
                 .map_err(io_errno)?
         {
@@ -156,12 +156,12 @@ impl Filesystem {
         }
         self.states.pause.hit("truncate_fallback").await;
         let path = match (path, fh) {
-            (Some(path), _) => path.to_string_lossy().to_string(),
-            (None, Some(fh)) => self
-                .get_opened_file(FileKey::try_from(fh)?, None)?
-                .path
-                .to_string_lossy()
-                .to_string(),
+            (Some(path), _) => key_of(path)?,
+            (None, Some(fh)) => key_of(
+                self.get_opened_file(FileKey::try_from(fh)?, None)?
+                    .path
+                    .as_os_str(),
+            )?,
             (None, None) => return Err(Errno::from(libc::EINVAL)),
         };
         let current = self
@@ -219,20 +219,20 @@ impl Filesystem {
     }
 
     /// Size of the spool content of `path`, if the file is being written.
-    async fn spool_size(&self, path: &OsStr) -> Option<u64> {
-        self.states.size(&key_of(path)).await
+    async fn spool_size(&self, path: &OsStr) -> Result<Option<u64>> {
+        Ok(self.states.size(&key_of(path)?).await)
     }
 
     /// The live state of `path`, for reads by handles without their own state.
-    async fn live_state(&self, path: &OsStr) -> Option<Arc<FileState>> {
-        self.states.open_read(&key_of(path)).await
+    async fn live_state(&self, path: &OsStr) -> Result<Option<Arc<FileState>>> {
+        Ok(self.states.open_read(&key_of(path)?).await)
     }
 
     /// Join or create the shared write state of `path` for a new handle. With
     /// `keep`, a new state starts with the current object content.
     async fn open_write(&self, path: &OsStr, keep: bool) -> Result<Arc<FileState>> {
         self.states
-            .open_write(&self.op, &key_of(path), keep)
+            .open_write(&self.op, &key_of(path)?, keep)
             .await
             .map_err(status_errno)
     }
@@ -321,7 +321,7 @@ impl Filesystem {
     /// a live state existed. The state only loses its name if the delete worked.
     async fn unlink_state(&self, path: &OsStr) -> Result<bool> {
         self.states
-            .unlink(&self.op, &key_of(path))
+            .unlink(&self.op, &key_of(path)?)
             .await
             .map_err(status_errno)
     }
@@ -460,9 +460,33 @@ const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) ->
     }
 }
 
-/// Object key of a path in the file system.
-fn key_of(path: &OsStr) -> String {
-    path.to_string_lossy().trim_start_matches('/').to_string()
+/// Object key of a path in the file system. The root is "".
+///
+/// Names that storage would change refuse: two different names must never
+/// reach the same object. Invalid UTF-8 fails with EILSEQ. A path that OpenDAL
+/// normalizes into another one (leading or trailing white space, empty parts)
+/// or that has "." or ".." parts fails with EINVAL.
+fn key_of(path: &OsStr) -> Result<String> {
+    let raw = path.to_str().ok_or_else(|| Errno::from(libc::EILSEQ))?;
+    let key = raw.trim_start_matches('/');
+    if key.is_empty() {
+        return Ok(String::new());
+    }
+    let dots = key.split('/').any(|part| part == "." || part == "..");
+    if dots || normalize_path(key) != key {
+        return Err(Errno::from(libc::EINVAL));
+    }
+    Ok(key.to_string())
+}
+
+/// Object key of a folder: the key with a trailing "/", or "/" for the root.
+fn dir_key_of(path: &OsStr) -> Result<String> {
+    let key = key_of(path)?;
+    Ok(if key.is_empty() {
+        "/".into()
+    } else {
+        format!("{key}/")
+    })
 }
 
 fn upload_errno(result: std::result::Result<(), tonic::Status>) -> Result<()> {

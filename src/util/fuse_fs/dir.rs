@@ -28,12 +28,10 @@ impl Filesystem {
     {
         tracing::debug!("readdir(path={path:?}, fh={fh}, offset={offset})");
 
-        let mut current_dir = PathBuf::from(path);
-        current_dir.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
-        let path = current_dir.to_string_lossy().to_string();
+        let path = dir_key_of(path)?;
         let children = self
             .op
-            .lister(&current_dir.to_string_lossy())
+            .lister(&path)
             .await
             .map_err(opendal_error2errno)?
             .filter_map(move |entry| {
@@ -87,12 +85,10 @@ impl Filesystem {
         tracing::debug!("readdirplus(parent={parent:?}, fh={fh}, offset={offset})");
 
         let now = SystemTime::now();
-        let mut current_dir = PathBuf::from(parent);
-        current_dir.push(""); // ref https://users.rust-lang.org/t/trailing-in-paths/43166
         let uid = self.uid;
         let gid = self.gid;
 
-        let path = current_dir.to_string_lossy().to_string();
+        let path = dir_key_of(parent)?;
         let children = self
             .op
             .lister_with(&path)

@@ -1282,3 +1282,49 @@ async fn a_rename_copy_whose_source_fails_early_stops_nothing() {
     assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"old b");
     assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"source");
 }
+
+#[tokio::test]
+async fn names_that_storage_would_change_are_refused() {
+    use std::os::unix::ffi::OsStrExt;
+    let fs = fs_with("report", "KEEP").await;
+    // The lossy form of f\xff and f\xfe.
+    fs.op.write("f\u{fffd}", "OTHER").await.unwrap();
+    let root = OsStr::new("/");
+    let invalid = OsStr::from_bytes(b"f\xff");
+    let invalid_path = OsStr::from_bytes(b"/f\xfe");
+    let spaced = OsStr::new("report ");
+    let eilseq = Errno::from(libc::EILSEQ);
+    let einval = Errno::from(libc::EINVAL);
+    let create = |name| fs.create(req(), root, name, 0o644, WRITE_FLAGS);
+    assert_eq!(create(invalid).await.unwrap_err(), eilseq);
+    assert_eq!(create(spaced).await.unwrap_err(), einval);
+    let flags = (libc::O_RDWR | libc::O_TRUNC) as u32;
+    assert_eq!(
+        fs.open(req(), invalid_path, flags).await.unwrap_err(),
+        eilseq
+    );
+    assert_eq!(
+        fs.open(req(), OsStr::new("/report "), flags)
+            .await
+            .unwrap_err(),
+        einval
+    );
+    assert_eq!(fs.unlink(req(), root, invalid).await.unwrap_err(), eilseq);
+    assert_eq!(fs.unlink(req(), root, spaced).await.unwrap_err(), einval);
+    let rename = |from, to| fs.rename(req(), root, from, root, to);
+    assert_eq!(
+        rename(OsStr::new("report"), invalid).await.unwrap_err(),
+        eilseq
+    );
+    assert_eq!(rename(spaced, OsStr::new("x")).await.unwrap_err(), einval);
+    assert_eq!(
+        fs.lookup(req(), root, OsStr::new(" report"))
+            .await
+            .unwrap_err(),
+        einval
+    );
+    // The objects with the names they would have changed into stay intact.
+    assert_eq!(fs.op.read("report").await.unwrap().to_vec(), b"KEEP");
+    assert_eq!(fs.op.read("f\u{fffd}").await.unwrap().to_vec(), b"OTHER");
+    assert!(!fs.op.exists("x").await.unwrap());
+}

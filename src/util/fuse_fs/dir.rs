@@ -104,20 +104,28 @@ impl Filesystem {
                 }
             })
             .enumerate()
-            .map(move |(i, entry)| {
-                entry
-                    .map(|e| {
-                        let metadata = e.metadata();
-                        DirectoryEntryPlus {
-                            kind: entry_mode2file_type(metadata.mode()),
-                            name: e.name().trim_matches('/').into(),
-                            offset: (i + 3) as i64,
-                            attr: metadata2file_attr(metadata, now, uid, gid),
-                            entry_ttl: TTL,
-                            attr_ttl: TTL,
-                        }
-                    })
-                    .map_err(opendal_error2errno)
+            .then(move |(i, entry)| async move {
+                let e = entry.map_err(opendal_error2errno)?;
+                let metadata = e.metadata();
+                let mut attr = metadata2file_attr(metadata, now, uid, gid);
+                // Like getattr: a file that is being written has its local size.
+                // The kernel applies these attributes to its cached inode.
+                if !metadata.is_dir()
+                    && let Some(size) = self.states.size(e.path()).await
+                {
+                    attr = FileAttr {
+                        size,
+                        ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
+                    };
+                }
+                Ok(DirectoryEntryPlus {
+                    kind: entry_mode2file_type(metadata.mode()),
+                    name: e.name().trim_matches('/').into(),
+                    offset: (i + 3) as i64,
+                    attr,
+                    entry_ttl: TTL,
+                    attr_ttl: TTL,
+                })
             });
 
         let relative_path_attr = dummy_file_attr(FileType::Directory, now, uid, gid);

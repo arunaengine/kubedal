@@ -1388,3 +1388,35 @@ async fn rmdir_removes_the_folder_marker_and_refuses_folders_with_children() {
     fs.rmdir(req(), root, OsStr::new("d")).await.unwrap();
     assert!(!fs.op.exists("d/").await.unwrap());
 }
+
+#[tokio::test]
+async fn readdirplus_reports_the_live_size_like_getattr() {
+    use futures::StreamExt;
+    let fs = fs_with("f", "abc").await;
+    let p = Some(OsStr::new("/f"));
+    let fh = open(&fs, "/f", libc::O_RDWR).await;
+    fs.write(req(), p, fh, 0, b"123456789", 0, 0).await.unwrap();
+    let listed_size = || async {
+        let reply = fs
+            .readdirplus(req(), OsStr::new("/"), 0, 0, 0)
+            .await
+            .unwrap();
+        let entries: Vec<_> = reply.entries.collect().await;
+        entries
+            .into_iter()
+            .map(|e| e.unwrap())
+            .find(|e| e.name == "f")
+            .unwrap()
+            .attr
+            .size
+    };
+    let getattr_size = fs.getattr(req(), p, None, 0).await.unwrap().attr.size;
+    assert_eq!(getattr_size, 9);
+    assert_eq!(listed_size().await, 9);
+    let zero = SetAttr {
+        size: Some(0),
+        ..Default::default()
+    };
+    fs.setattr(req(), p, Some(fh), zero).await.unwrap();
+    assert_eq!(listed_size().await, 0);
+}

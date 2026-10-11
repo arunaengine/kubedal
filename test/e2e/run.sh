@@ -239,6 +239,15 @@ printf new > clobber.txt
 if printf again > clobber.txt; then exit 1; fi
 set +C
 test "$(cat clobber.txt)" = new
+# A listing shows the live size of a file that is being written, so the
+# kernel keeps the whole cached content.
+printf abc > grow.txt
+exec 3<>grow.txt
+printf 123456789 >&3
+ls -l /vol > /dev/null
+test "$(wc -c < grow.txt)" -eq 9
+test "$(cat grow.txt)" = 123456789
+exec 3>&-
 echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB
@@ -248,6 +257,7 @@ expect_object results/fuse-ops/ra.txt xA
 expect_object results/fuse-ops/moved.txt "one two"
 expect_object results/fuse-ops/excl.txt excl
 expect_object results/fuse-ops/clobber.txt new
+expect_object results/fuse-ops/grow.txt 123456789
 inline_pod fuse-ops-check "dataNode: store
 path: results/fuse-ops
 mount: cache-read-only" '

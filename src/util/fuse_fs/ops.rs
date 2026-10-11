@@ -422,11 +422,24 @@ impl PathFilesystem for Filesystem {
             }
             end = end.min(file_size);
         }
+        self.states.pause.hit("read_storage").await;
         let mut read = self.op.read_with(&file_path).range(offset..end);
         if let Some(etag) = etag {
             read = read.if_match(&etag);
         }
-        let data = match read.await {
+        let result = read.await;
+        // An unlink or rename may have given this handle a copy while the read
+        // waited on storage; the copy has the content it opened.
+        let copy = self
+            .get_opened_file(FileKey::try_from(fh)?, path)?
+            .snapshot
+            .get()
+            .cloned();
+        if let Some(copy) = copy {
+            let data = copy.lock().await.read_at(offset, size).map_err(io_errno)?;
+            return Ok(ReplyData { data: data.into() });
+        }
+        let data = match result {
             Ok(buffer) => buffer.to_bytes(),
             // The object changed since this handle opened it.
             Err(err) if err.kind() == ErrorKind::ConditionNotMatch => {

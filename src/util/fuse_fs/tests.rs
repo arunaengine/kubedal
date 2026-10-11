@@ -1503,3 +1503,21 @@ async fn read_only_handles_follow_renames_and_lose_links_only_after_commit() {
     assert_eq!(nlink().await, 0);
     assert_eq!(read_all(&fs, "/f", fh).await, b"original");
 }
+
+#[tokio::test]
+async fn forced_read_waiting_on_storage_during_unlink_uses_the_copy() {
+    let fs = Arc::new(fs_with("f", "original").await);
+    let fh = open(&fs, "/f", libc::O_RDONLY).await;
+    let pause = fs.pause_points().arm("read_storage");
+    let read = {
+        let fs = fs.clone();
+        tokio::spawn(async move { fs.read(req(), None, fh, 0, 100).await })
+    };
+    pause.reached().await;
+    fs.unlink(req(), OsStr::new("/"), OsStr::new("f"))
+        .await
+        .unwrap();
+    pause.resume();
+    let data = read.await.unwrap().unwrap().data;
+    assert_eq!(data.as_ref(), b"original");
+}

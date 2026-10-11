@@ -391,6 +391,9 @@ helm lint charts/kubedal
 
 `tests/s3_minio.rs` runs against a real S3 compatible server when
 `KUBEDAL_TEST_S3_ENDPOINT` is set. See the comment at the top of the file.
+`tests/gcs_azblob.rs` does the same for Google Cloud Storage and Azure Blob
+Storage emulators, when `KUBEDAL_TEST_GCS_ENDPOINT` or
+`KUBEDAL_TEST_AZBLOB_ENDPOINT` is set.
 
 kubedal builds fuse3 from the fork <https://github.com/arunaengine/fuse3> (set in
 `[patch.crates-io]` in `Cargo.toml`). fuse3 0.9.0 gives an inode number to a new

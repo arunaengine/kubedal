@@ -2,7 +2,7 @@
 driverName: kubedal.arunaengine.org
 
 image:
-  repository: harbor.computational.bio.uni-giessen.de/aruna/kubedal
+  repository: ghcr.io/arunaengine/kubedal
   # Defaults to the chart appVersion.
   tag: ""
   pullPolicy: IfNotPresent

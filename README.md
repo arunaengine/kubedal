@@ -55,17 +55,38 @@ returns an error. kubelet then retries the unpublish later.
 
 ## Install
 
-kubedal is installed with Helm. The chart lives in `charts/kubedal`.
+kubedal is installed with Helm. Every release publishes the chart and the
+container image to the GitHub container registry:
+
+| What | Where |
+| --- | --- |
+| Helm chart | `oci://ghcr.io/arunaengine/charts/kubedal` |
+| Image (amd64 and arm64) | `ghcr.io/arunaengine/kubedal:<version>` and `:latest` |
+
+Install the latest release into `kube-system`:
 
 ```sh
-helm install kubedal ./charts/kubedal --namespace kube-system
+helm install kubedal oci://ghcr.io/arunaengine/charts/kubedal --namespace kube-system
 ```
+
+Pin a version with `--version 0.2.0` (the chart version and the image tag are
+always the same). Upgrade with `helm upgrade kubedal oci://ghcr.io/arunaengine/charts/kubedal
+--namespace kube-system`. Change values with `--set` or a values file:
+
+```sh
+helm show values oci://ghcr.io/arunaengine/charts/kubedal > values.yaml
+# edit values.yaml
+helm install kubedal oci://ghcr.io/arunaengine/charts/kubedal --namespace kube-system -f values.yaml
+```
+
+To install from a checkout instead, use `./charts/kubedal` as the chart.
 
 Useful values (see `charts/kubedal/values.yaml` for all of them):
 
 | Value | Default | Meaning |
 | --- | --- | --- |
-| `image.repository`, `image.tag` | see values.yaml | kubedal image |
+| `image.repository` | `ghcr.io/arunaengine/kubedal` | kubedal image |
+| `image.tag` | chart `appVersion` | image tag |
 | `logLevel` | `info` | passed as `RUST_LOG` |
 | `kubeletDir` | `/var/lib/kubelet` | kubelet directory on the nodes |
 | `node.dataDir` | `<kubeletDir>/plugins/<driverName>` | volume data and state on the nodes |
@@ -75,14 +96,25 @@ Useful values (see `charts/kubedal/values.yaml` for all of them):
 | `controller.replicas` | `1` | more than 1 turns on leader election |
 | `storageClass.create` | `true` | create the `kubedal` StorageClass |
 
-The chart installs the CRDs from `charts/kubedal/crds`. For plain manifests, run
-`helm template kubedal ./charts/kubedal --namespace kube-system`.
+The chart installs the CRDs from its `crds` folder. Helm does not upgrade CRDs, so
+after an upgrade that changes them, apply them again:
+`kubectl apply -f charts/kubedal/crds` from a checkout of that version. For plain
+manifests, run `helm template kubedal oci://ghcr.io/arunaengine/charts/kubedal
+--namespace kube-system`.
 
 To build the image yourself (amd64 and arm64 work):
 
 ```sh
 docker build -t kubedal:dev .
 ```
+
+### Releases
+
+A release happens when the version in `Cargo.toml` changes on `main`
+(`.github/workflows/release.yml`). The chart `version` and `appVersion` in
+`charts/kubedal/Chart.yaml` must match it. The workflow pushes the image and
+the chart to ghcr.io, then creates the `v<version>` tag and a GitHub release
+with the packaged chart attached.
 
 ## DataNode
 

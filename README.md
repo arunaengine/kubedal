@@ -357,6 +357,11 @@ the cache. The least recently used files are removed when the cache grows over
   written, or else the object version it saw (on backends with ETags). If that
   object is replaced, further reads fail with ESTALE. On backends without ETags
   (for example HTTP), a reader can see a newer object under the same name.
+- A FUSE folder listing keeps the names it saw when it started, so its later
+  pages do not shift when files come and go. All open listings of a mount keep
+  at most 1,000,000 names together. Past that, the oldest listing loses its
+  names and makes a new list at its next call, so its pages may skip or repeat
+  names.
 - Renaming a closed file on S3, GCS or Azure Blob copies the object and removes the
   old one. Renaming a folder there fails with EXDEV, so tools like `mv` copy the
   files instead.

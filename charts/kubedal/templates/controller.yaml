@@ -60,6 +60,9 @@ spec:
             - --node-id=controller
             - --storage-class={{ .Values.storageClass.name }}
             - --sync-image={{ include "kubedal.image" . }}
+            {{- range .Values.imagePullSecrets }}
+            - --sync-image-pull-secret={{ .name }}
+            {{- end }}
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

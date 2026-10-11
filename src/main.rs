@@ -97,6 +97,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 ))
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("sync-image-pull-secret")
+                .long("sync-image-pull-secret")
+                .help("Image pull secret of the DataReplicaSet sync pods (may be repeated)")
+                .action(clap::ArgAction::Append)
+                .value_parser(clap::value_parser!(String)),
+        )
         .subcommand(
             Command::new("replicate")
                 .about("Copy a DataReplicaSet source to its replicas (runs in the sync pod)"),
@@ -177,8 +184,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get_one::<String>("sync-image")
             .cloned()
             .unwrap_or_default();
+        let sync_pull_secrets = matches
+            .get_many::<String>("sync-image-pull-secret")
+            .unwrap_or_default()
+            .cloned()
+            .collect();
         let controller_service =
-            ControllerService::new(client.clone(), storage_class, sync_image).await;
+            ControllerService::new(client.clone(), storage_class, sync_image, sync_pull_secrets)
+                .await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder

@@ -7,6 +7,8 @@ image:
   tag: ""
   pullPolicy: IfNotPresent
 
+# Also used by the DataReplicaSet sync pods. Such a secret must then exist in
+# the namespace of each DataReplicaSet, for example: [{name: registry}]
 imagePullSecrets: []
 
 # Log level of kubedal, passed as RUST_LOG (for example "info", "debug" or "kubedal=debug").

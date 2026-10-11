@@ -2,7 +2,7 @@ use super::controller::{Context, Error};
 use crate::resource::crd::{DataNode, DataPod, MountAccess};
 use crate::resource::crd::{DataPodSpec, DataReplicaSet, DataReplicaSetStatus, Ref};
 use k8s_openapi::api::core::v1::{
-    Container, EnvVar, PersistentVolumeClaim, PersistentVolumeClaimSpec,
+    Container, EnvVar, LocalObjectReference, PersistentVolumeClaim, PersistentVolumeClaimSpec,
     PersistentVolumeClaimVolumeSource, Pod, PodSpec, Volume, VolumeMount,
     VolumeResourceRequirements,
 };
@@ -168,11 +168,12 @@ impl DataReplicaSet {
         }
         // The replacements count as synced once the sync pod runs with exactly
         // the current replicas.
-        // The image is part of the hash, so a new image replaces the sync pod.
+        // The image and its pull secrets are part of the hash, so a change
+        // replaces the sync pod.
         let members = members_hash(
             &format!(
                 "{}|{}",
-                ctx.sync_image,
+                sync_pod_settings(&ctx),
                 member_id(&source_data_pod, &pvc_name(self, &source_data_pod))
             ),
             replicas.iter().map(|dp| member_id(dp, &pvc_name(self, dp))),
@@ -240,7 +241,7 @@ impl DataReplicaSet {
         let members = members_hash(
             &format!(
                 "{}|{}",
-                ctx.sync_image,
+                sync_pod_settings(&ctx),
                 member_id(&source_data_pod, &source_pvc.name_any())
             ),
             replica_resources
@@ -261,7 +262,7 @@ impl DataReplicaSet {
             None => {
                 let pod = create_replica_pod(
                     self,
-                    &ctx.sync_image,
+                    &ctx,
                     &source_pvc,
                     replica_resources,
                     &members,
@@ -452,7 +453,7 @@ async fn ensure_replica_pvc(
 
 async fn create_replica_pod(
     data_replica_set: &DataReplicaSet,
-    image: &str,
+    ctx: &Context,
     source_pvc: &PersistentVolumeClaim,
     replica_resources: Vec<(DataPod, PersistentVolumeClaim)>,
     members: &str,
@@ -507,7 +508,7 @@ async fn create_replica_pod(
     // The kubedal image itself copies the data (`kubedal replicate`).
     let container = Container {
         name: "sync-replica".to_string(),
-        image: Some(image.to_string()),
+        image: Some(ctx.sync_image.clone()),
         image_pull_policy: Some("IfNotPresent".to_string()),
         args: Some(vec!["replicate".to_string()]),
         env: Some(vec![
@@ -547,6 +548,7 @@ async fn create_replica_pod(
         spec: Some(PodSpec {
             containers: vec![container],
             volumes: Some(volumes),
+            image_pull_secrets: pull_secrets(&ctx.sync_pull_secrets),
             ..Default::default()
         }),
         status: None,
@@ -831,6 +833,21 @@ fn pod_members(pod: &Pod) -> Option<&str> {
         .map(String::as_str)
 }
 
+/// The image and the pull secrets of the sync pods, for the members hash.
+fn sync_pod_settings(ctx: &Context) -> String {
+    format!("{}|{}", ctx.sync_image, ctx.sync_pull_secrets.join(","))
+}
+
+/// Image pull secrets of a pod, or none if the list is empty.
+fn pull_secrets(names: &[String]) -> Option<Vec<LocalObjectReference>> {
+    (!names.is_empty()).then(|| {
+        names
+            .iter()
+            .map(|name| LocalObjectReference { name: name.clone() })
+            .collect()
+    })
+}
+
 /// Name of the sync pod of this set.
 fn sync_pod_name(data_replica_set: &DataReplicaSet) -> String {
     format!("{}-sync", data_replica_set.name_any())
@@ -1047,6 +1064,14 @@ mod tests {
         let controller = include_str!("../../charts/kubedal/templates/controller.yaml");
         assert!(controller.contains("- --storage-class={{ .Values.storageClass.name }}"));
         assert!(controller.contains("- --sync-image={{ include \"kubedal.image\" . }}"));
+        assert!(controller.contains("- --sync-image-pull-secret={{ .name }}"));
+    }
+
+    #[test]
+    fn sync_pods_get_the_configured_pull_secrets() {
+        assert_eq!(pull_secrets(&[]), None);
+        let secrets = pull_secrets(&["registry".to_string()]).unwrap();
+        assert_eq!(secrets[0].name, "registry");
     }
 
     #[test]

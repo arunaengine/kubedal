@@ -377,7 +377,9 @@ the cache. The least recently used files are removed when the cache grows over
 - `DataReplicaSet` is experimental. Its sync pod runs `kubedal replicate` from the
   kubedal image (the controller flag `--sync-image`, set by the chart). Every
   second it copies new and changed files from the source to the replicas. Files
-  deleted in the source stay in the replicas.
+  deleted in the source stay in the replicas. The sync pods use the chart
+  `imagePullSecrets` too (controller flag `--sync-image-pull-secret`), and such
+  a secret must exist in the namespace of the DataReplicaSet.
 
 ## Development
 

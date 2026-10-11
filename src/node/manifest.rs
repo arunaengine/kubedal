@@ -262,6 +262,16 @@ pub fn plan(manifest: Manifest) -> Result<FilePlan, Status> {
             if upload.data_node.trim().is_empty() {
                 return Err(invalid("upload.dataNode must not be empty".into()));
             }
+            // Checked as written, so the upload never lands in another folder
+            // (like "results//run" in "results/run/"). "." means the root.
+            if upload.prefix != "."
+                && crate::util::opendal::exact_user_key(&upload.prefix).is_none()
+            {
+                return Err(invalid(format!(
+                    "upload prefix {:?} would name another storage folder",
+                    upload.prefix
+                )));
+            }
             let prefix = paths::normalize_prefix(&upload.prefix)
                 .map_err(|e| invalid(format!("upload prefix: {e}")))?;
             let path = if upload.path.trim_matches('/').is_empty() {
@@ -337,6 +347,35 @@ mod tests {
         let manifest =
             serde_json::json!({"version": 1, "files": [{"path": "a b", "source": "a b"}]});
         assert!(parse_str(&manifest.to_string()).is_ok());
+    }
+
+    #[test]
+    fn upload_prefixes_are_taken_exactly_as_given() {
+        for prefix in [
+            "results//run",
+            "results/./run",
+            "results/run ",
+            " results",
+            "//a",
+        ] {
+            let manifest = serde_json::json!({
+                "version": 1,
+                "upload": {"dataNode": "d", "prefix": prefix}
+            });
+            let err = parse_str(&manifest.to_string()).unwrap_err();
+            assert!(
+                err.message().contains("another storage folder"),
+                "{prefix:?}"
+            );
+        }
+        for (prefix, planned) in [("/runs/42", "runs/42/"), ("runs/42/", "runs/42/"), ("", "")] {
+            let manifest = serde_json::json!({
+                "version": 1,
+                "upload": {"dataNode": "d", "prefix": prefix}
+            });
+            let plan = parse_str(&manifest.to_string()).unwrap();
+            assert_eq!(plan.upload.unwrap().prefix, planned, "{prefix:?}");
+        }
     }
 
     #[test]

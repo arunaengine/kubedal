@@ -1580,3 +1580,19 @@ async fn listings_show_files_that_are_not_uploaded_yet() {
     let reply = fs.readdir(req(), d, 0, 3).await.unwrap();
     assert_eq!(reply.entries.collect::<Vec<_>>().await.len(), 2);
 }
+
+#[tokio::test]
+async fn a_live_file_hides_a_stored_folder_with_the_same_name() {
+    use futures::StreamExt;
+    let fs = fs_with("x/inner", "stored").await;
+    let root = OsStr::new("/");
+    create(&fs, "x").await;
+    let reply = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let xs: Vec<_> = entries.iter().filter(|e| e.name == "x").collect();
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].kind, FileType::RegularFile);
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let names: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names.iter().filter(|n| *n == "x").count(), 1);
+}

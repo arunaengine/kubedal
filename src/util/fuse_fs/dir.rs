@@ -43,7 +43,7 @@ impl Filesystem {
                 async move {
                     match entry {
                         Ok(e) if e.path() == dir => None,
-                        Ok(e) if is_live_file(&live, &e) => None,
+                        Ok(e) if has_live_name(&live, &e) => None,
                         _ => Some(entry),
                     }
                 }
@@ -132,7 +132,7 @@ impl Filesystem {
                 async move {
                     match entry {
                         Ok(e) if e.path() == dir => None,
-                        Ok(e) if is_live_file(&live, &e) => None,
+                        Ok(e) if has_live_name(&live, &e) => None,
                         _ => Some(entry),
                     }
                 }
@@ -200,8 +200,9 @@ fn live_prefix(dir: &str) -> &str {
     if dir == "/" { "" } else { dir }
 }
 
-/// True if a listed object is a file that also has a live state. Such a file
-/// is listed from the state instead.
-fn is_live_file(live: &[(String, u64)], entry: &opendal::Entry) -> bool {
-    !entry.metadata().is_dir() && live.iter().any(|(name, _)| name == entry.name())
+/// True if a listed object (a file or a folder) has the name of a live state.
+/// The name is listed once, from the state, like lookup finds the live file.
+fn has_live_name(live: &[(String, u64)], entry: &opendal::Entry) -> bool {
+    let name = entry.name().trim_end_matches('/');
+    live.iter().any(|(live_name, _)| live_name == name)
 }

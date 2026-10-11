@@ -257,16 +257,18 @@ impl PathFilesystem for Filesystem {
         self.states
             .rename_closed(
                 &ns,
+                &self.op,
+                &from,
                 &to,
                 || async {
                     if self.op.info().capability().rename {
-                        return self
-                            .op
+                        self.op
                             .rename(&from, &to)
                             .await
-                            .map_err(opendal_error2errno);
+                            .map_err(opendal_error2errno)?;
+                        return Ok(false);
                     }
-                    self.rename_by_copy(&from, &to).await
+                    self.copy_for_rename(&from, &to).await.map(|()| true)
                 },
                 status_errno,
             )

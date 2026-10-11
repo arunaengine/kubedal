@@ -319,10 +319,10 @@ impl Filesystem {
             .map_err(status_errno)
     }
 
-    /// Rename a closed file on a backend without native rename (S3, GCS, Azure
-    /// Blob): copy it, then remove the old object. Folders fail with EXDEV, which
-    /// tells programs like `mv` to copy the files themselves.
-    async fn rename_by_copy(&self, from: &str, to: &str) -> Result<()> {
+    /// Copy a closed file for a rename on a backend without native rename (S3,
+    /// GCS, Azure Blob); the caller then removes the old object. Folders fail
+    /// with EXDEV, which tells programs like `mv` to copy the files themselves.
+    async fn copy_for_rename(&self, from: &str, to: &str) -> Result<()> {
         let meta = self.stat_entry(from).await.map_err(opendal_error2errno)?;
         if meta.is_dir() {
             return Err(Errno::from(libc::EXDEV));
@@ -354,7 +354,7 @@ impl Filesystem {
             }
             writer.close().await.map_err(opendal_error2errno)?;
         }
-        self.op.delete(from).await.map_err(opendal_error2errno)
+        Ok(())
     }
 
     /// Returns (read, write, append) for open flags.

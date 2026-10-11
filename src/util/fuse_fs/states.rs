@@ -1076,29 +1076,68 @@ impl States {
         Ok(true)
     }
 
-    /// Rename a closed file onto `to` with `backend` (a storage rename or copy).
-    /// A live state at `to` stays locked during `backend`, so it cannot upload in
-    /// between, and it is retired only if `backend` succeeds. On failure nothing
-    /// changes.
+    /// Rename the closed file `from` onto `to`. `place` makes the storage
+    /// rename or copy and returns true for a copy, whose source is then deleted
+    /// here.
+    ///
+    /// A live state at `to` stays locked, so it cannot upload in between. Its
+    /// journal is covered by a tombstone first, so a replay after a crash never
+    /// uploads the old destination over the renamed content. Once the new
+    /// content is in place, every later failure stops the file system.
     pub async fn rename_closed<F, Fut, E>(
         &self,
         ns: &NsGuard<'_>,
+        op: &Operator,
+        from: &str,
         to: &str,
-        backend: F,
+        place: F,
         on_status: impl Fn(Status) -> E,
     ) -> Result<(), E>
     where
         F: FnOnce() -> Fut,
-        Fut: std::future::Future<Output = Result<(), E>>,
+        Fut: std::future::Future<Output = Result<bool, E>>,
     {
         self.check_broken().map_err(&on_status)?;
         let Some(dst) = self.live(ns, to).await else {
-            return backend().await;
+            if place().await? {
+                self.delete_object(op, from).await.map_err(&on_status)?;
+            }
+            return Ok(());
         };
         let mut data = dst.lock().await;
-        backend().await?;
+        // A missing source is a clean failure, before anything changes.
+        op.stat(from)
+            .await
+            .map_err(|e| on_status(opendal_status(e, "stat")))?;
+        let tomb = self.write_tombstone(to).map_err(&on_status)?;
+        self.pause.hit("rename_closed_tombstoned").await;
+        let copied = match place().await {
+            Ok(copied) => copied,
+            // A storage rename that applied despite the error left no source.
+            Err(err) => match self.object_gone(op, from).await {
+                Ok(true) => false,
+                Ok(false) => {
+                    self.undo_tombstone(&mut data, &tomb).map_err(&on_status)?;
+                    return Err(err);
+                }
+                Err(status) => return Err(on_status(status)),
+            },
+        };
+        if copied {
+            self.pause.hit("rename_closed_copied").await;
+            if self.delete_object(op, from).await.is_err()
+                && !self.object_gone(op, from).await.map_err(&on_status)?
+            {
+                mark_broken(
+                    &self.broken,
+                    &format!("deleting {from} after copying it to {to} failed"),
+                );
+                return Err(on_status(broken_status()));
+            }
+        }
+        self.pause.hit("rename_closed_moved").await;
         // The renamed object is in storage now. If the old file cannot be
-        // retired, it must never upload again: fail closed.
+        // retired, it must never upload again: fail closed. The tombstone stays.
         if let Err(err) = retire(&dst, &mut data) {
             mark_broken(
                 &self.broken,
@@ -1107,6 +1146,8 @@ impl States {
             return Err(on_status(broken_status()));
         }
         self.unmap(to, &dst);
+        self.pause.hit("rename_closed_retired").await;
+        self.remove_tombstone(&tomb);
         Ok(())
     }
 }
@@ -1539,6 +1580,21 @@ mod tests {
                 f.lock().await.write_at(b"new", 0).unwrap();
                 states.unlink(&op, "f").await.unwrap();
             }
+            "rename" => {
+                let b = states.open_write(&op, "b", false).await.unwrap();
+                b.lock().await.write_at(b"pending b", 0).unwrap();
+                let ns = states.lock_namespace().await;
+                let copy = || async {
+                    op.copy("a", "b")
+                        .await
+                        .map_err(|e| opendal_status(e, "copy"))?;
+                    Ok(true)
+                };
+                states
+                    .rename_closed(&ns, &op, "a", "b", copy, |s| s)
+                    .await
+                    .unwrap();
+            }
             other => panic!("unknown crash scenario {other}"),
         }
         panic!("the child did not reach the crash point {point}");
@@ -1582,6 +1638,41 @@ mod tests {
                 let err = op.stat("f").await.unwrap_err();
                 assert_eq!(err.kind(), opendal::ErrorKind::NotFound, "{point}");
             }
+            assert_eq!(spool_files(&spool), 0, "{point}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_crash_during_a_rename_onto_an_open_file_keeps_the_source_content() {
+        for point in [
+            "rename_closed_tombstoned",
+            "rename_closed_copied",
+            "rename_closed_moved",
+            "rename_closed_retired",
+        ] {
+            let dir = tempfile::tempdir().unwrap();
+            let op = fs_op(dir.path());
+            op.write("a", "source").await.unwrap();
+            op.write("b", "old b").await.unwrap();
+            crash_in_child("rename", point, dir.path());
+            let spool = dir.path().join("spool");
+            upload_pending(&op, &spool, &SpoolBudget::new(u64::MAX))
+                .await
+                .unwrap();
+            let read = |key| {
+                let op = op.clone();
+                async move { op.read(key).await.ok().map(|b| b.to_vec()) }
+            };
+            let (a, b) = (read("a").await, read("b").await);
+            // The pending content of the old b never comes back, and the source
+            // content is always somewhere.
+            let expected: (Option<&[u8]>, &[u8]) = match point {
+                "rename_closed_tombstoned" => (Some(b"source"), b"old b"),
+                "rename_closed_copied" => (Some(b"source"), b"source"),
+                _ => (None, b"source"),
+            };
+            assert_eq!(a.as_deref(), expected.0, "{point}");
+            assert_eq!(b.as_deref(), Some(expected.1), "{point}");
             assert_eq!(spool_files(&spool), 0, "{point}");
         }
     }

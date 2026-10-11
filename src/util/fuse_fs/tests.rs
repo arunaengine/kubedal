@@ -1016,3 +1016,39 @@ async fn rmdir_sees_files_that_exist_only_in_the_spool() {
         .await
         .unwrap();
 }
+
+#[tokio::test]
+async fn a_rename_copy_whose_delete_applied_despite_an_error_finishes() {
+    let fs = fs_with("a", "source").await;
+    assert!(!fs.op.info().capability().rename);
+    let pb = Some(OsStr::new("/b"));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"old b", 0, 0).await.unwrap();
+    fs.states.pause.fail_once("delete_fails_after_apply");
+    let root = OsStr::new("/");
+    fs.rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await
+        .unwrap();
+    let _ = fs.release(req(), pb, wb, 0, 0, false).await;
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"source");
+    assert!(!fs.op.exists("a").await.unwrap());
+}
+
+#[tokio::test]
+async fn a_failed_delete_after_a_rename_copy_stops_changes() {
+    let fs = fs_with("a", "source").await;
+    let pb = Some(OsStr::new("/b"));
+    let wb = create(&fs, "b").await;
+    fs.write(req(), pb, wb, 0, b"old b", 0, 0).await.unwrap();
+    fs.states.pause.fail_once("delete_fails");
+    let root = OsStr::new("/");
+    let renamed = fs
+        .rename(req(), root, OsStr::new("a"), root, OsStr::new("b"))
+        .await;
+    assert_eq!(renamed.unwrap_err(), Errno::from(libc::EIO));
+    assert!(fs.states.is_broken());
+    // The old b never uploads over the copied content.
+    assert!(fs.release(req(), pb, wb, 0, 0, false).await.is_err());
+    assert_eq!(fs.op.read("b").await.unwrap().to_vec(), b"source");
+    assert_eq!(fs.op.read("a").await.unwrap().to_vec(), b"source");
+}

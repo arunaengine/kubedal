@@ -357,8 +357,6 @@ the cache. The least recently used files are removed when the cache grows over
   written, or else the object version it saw (on backends with ETags). If that
   object is replaced, further reads fail with ESTALE. On backends without ETags
   (for example HTTP), a reader can see a newer object under the same name.
-- A FUSE file that is written but not uploaded yet can be opened, read and
-  stat'ed, but it does not show up in directory listings.
 - Renaming a closed file on S3, GCS or Azure Blob copies the object and removes the
   old one. Renaming a folder there fails with EXDEV, so tools like `mv` copy the
   files instead.

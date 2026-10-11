@@ -1521,3 +1521,62 @@ async fn forced_read_waiting_on_storage_during_unlink_uses_the_copy() {
     let data = read.await.unwrap().unwrap().data;
     assert_eq!(data.as_ref(), b"original");
 }
+
+#[tokio::test]
+async fn listings_show_files_that_are_not_uploaded_yet() {
+    use futures::StreamExt;
+    let fs = fs_with("d/old", "old").await;
+    let d = OsStr::new("/d");
+    // A new file, an existing file that is being written, and a file in a
+    // sub folder that belongs to another listing.
+    let new = fs
+        .create(req(), d, OsStr::new("new"), 0o644, WRITE_FLAGS)
+        .await
+        .unwrap()
+        .fh;
+    fs.write(req(), Some(OsStr::new("/d/new")), new, 0, b"12345", 0, 0)
+        .await
+        .unwrap();
+    assert!(!fs.op.exists("d/new").await.unwrap());
+    let old = open(&fs, "/d/old", libc::O_RDWR).await;
+    fs.write(req(), Some(OsStr::new("/d/old")), old, 3, b"er", 0, 0)
+        .await
+        .unwrap();
+    fs.mkdir(req(), d, OsStr::new("sub"), 0o755, 0)
+        .await
+        .unwrap();
+    fs.create(
+        req(),
+        OsStr::new("/d/sub"),
+        OsStr::new("x"),
+        0o644,
+        WRITE_FLAGS,
+    )
+    .await
+    .unwrap();
+
+    let reply = fs.readdir(req(), d, 0, 0).await.unwrap();
+    let mut names: Vec<_> = reply
+        .entries
+        .map(|e| e.unwrap().name.into_string().unwrap())
+        .collect()
+        .await;
+    names.sort();
+    assert_eq!(names, [".", "..", "new", "old", "sub"]);
+
+    let reply = fs.readdirplus(req(), d, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let sizes: HashMap<_, _> = entries
+        .iter()
+        .filter(|e| e.kind == FileType::RegularFile)
+        .map(|e| (e.name.to_str().unwrap().to_string(), e.attr.size))
+        .collect();
+    assert_eq!(sizes, HashMap::from([("new".into(), 5), ("old".into(), 5)]));
+    // Offsets go up by one, so the kernel can continue a listing.
+    let offsets: Vec<_> = entries.iter().map(|e| e.offset).collect();
+    assert_eq!(offsets, (1..=entries.len() as i64).collect::<Vec<_>>());
+
+    // A listing that goes on after offset 3 skips the first three entries.
+    let reply = fs.readdir(req(), d, 0, 3).await.unwrap();
+    assert_eq!(reply.entries.collect::<Vec<_>>().await.len(), 2);
+}

@@ -807,6 +807,28 @@ impl States {
         false
     }
 
+    /// Names and sizes of the live states directly in the folder `prefix` (like
+    /// `dir/`, or empty for the root), sorted by name.
+    pub async fn live_children(&self, prefix: &str) -> Vec<(String, u64)> {
+        let mut keys: Vec<String> = self
+            .map()
+            .keys()
+            .filter(|k| {
+                k.strip_prefix(prefix)
+                    .is_some_and(|name| !name.is_empty() && !name.contains('/'))
+            })
+            .cloned()
+            .collect();
+        keys.sort();
+        let mut children = Vec::new();
+        for key in keys {
+            if let Some(size) = self.size(&key).await {
+                children.push((key[prefix.len()..].to_string(), size));
+            }
+        }
+        children
+    }
+
     /// Take the namespace lock.
     pub async fn lock_namespace(&self) -> NsGuard<'_> {
         NsGuard(self.ns.lock().await)

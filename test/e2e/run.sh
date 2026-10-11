@@ -262,6 +262,11 @@ test "$(cat <&8)" = new
 test "$(stat -L -c %i /proc/self/fd/6)" != "$(stat -L -c %i /proc/self/fd/8)"
 exec 4>&- 6<&- 7>&- 8<&-
 test ! -e keep.txt
+# A file that is open for writing shows up in the listing.
+exec 3>listed.txt
+printf x >&3
+ls /vol | grep -qx listed.txt
+exec 3>&-
 echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB

@@ -29,6 +29,9 @@ impl Filesystem {
         tracing::debug!("readdir(path={path:?}, fh={fh}, offset={offset})");
 
         let path = dir_key_of(path)?;
+        // Files that are written but not uploaded yet are listed too, once.
+        let live = Arc::new(self.states.live_children(live_prefix(&path)).await);
+        let live_names = live.clone();
         let children = self
             .op
             .lister(&path)
@@ -36,22 +39,33 @@ impl Filesystem {
             .map_err(opendal_error2errno)?
             .filter_map(move |entry| {
                 let dir = normalize_path(path.as_str());
+                let live = live_names.clone();
                 async move {
                     match entry {
                         Ok(e) if e.path() == dir => None,
+                        Ok(e) if is_live_file(&live, &e) => None,
                         _ => Some(entry),
                     }
                 }
             })
-            .enumerate()
-            .map(|(i, entry)| {
+            .map(|entry| {
                 entry
-                    .map(|e| DirectoryEntry {
-                        kind: entry_mode2file_type(e.metadata().mode()),
-                        name: e.name().trim_matches('/').into(),
-                        offset: (i + 3) as i64,
+                    .map(|e| {
+                        let name = e.name().trim_matches('/').into();
+                        (entry_mode2file_type(e.metadata().mode()), name)
                     })
                     .map_err(opendal_error2errno)
+            })
+            .chain(stream::iter((0..live.len()).map(move |i| {
+                Ok((FileType::RegularFile, live[i].0.clone().into()))
+            })))
+            .enumerate()
+            .map(|(i, entry)| {
+                entry.map(|(kind, name)| DirectoryEntry {
+                    kind,
+                    name,
+                    offset: (i + 3) as i64,
+                })
             });
 
         let relative_paths = stream::iter([
@@ -89,6 +103,24 @@ impl Filesystem {
         let gid = self.gid;
 
         let path = dir_key_of(parent)?;
+        // Files that are written but not uploaded yet are listed too, once,
+        // with their live size.
+        let live = Arc::new(self.states.live_children(live_prefix(&path)).await);
+        let live_names = live.clone();
+        let live_entries = stream::iter((0..live.len()).map(move |i| {
+            let (name, size) = &live[i];
+            Ok(DirectoryEntryPlus {
+                kind: FileType::RegularFile,
+                name: name.clone().into(),
+                offset: 0,
+                attr: FileAttr {
+                    size: *size,
+                    ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
+                },
+                entry_ttl: TTL,
+                attr_ttl: TTL,
+            })
+        }));
         let children = self
             .op
             .lister_with(&path)
@@ -96,15 +128,16 @@ impl Filesystem {
             .map_err(opendal_error2errno)?
             .filter_map(move |entry| {
                 let dir = normalize_path(path.as_str());
+                let live = live_names.clone();
                 async move {
                     match entry {
                         Ok(e) if e.path() == dir => None,
+                        Ok(e) if is_live_file(&live, &e) => None,
                         _ => Some(entry),
                     }
                 }
             })
-            .enumerate()
-            .then(move |(i, entry)| async move {
+            .then(move |entry| async move {
                 let e = entry.map_err(opendal_error2errno)?;
                 let metadata = e.metadata();
                 let mut attr = metadata2file_attr(metadata, now, uid, gid);
@@ -121,10 +154,18 @@ impl Filesystem {
                 Ok(DirectoryEntryPlus {
                     kind: entry_mode2file_type(metadata.mode()),
                     name: e.name().trim_matches('/').into(),
-                    offset: (i + 3) as i64,
+                    offset: 0,
                     attr,
                     entry_ttl: TTL,
                     attr_ttl: TTL,
+                })
+            })
+            .chain(live_entries)
+            .enumerate()
+            .map(|(i, entry)| {
+                entry.map(|e| DirectoryEntryPlus {
+                    offset: (i + 3) as i64,
+                    ..e
                 })
             });
 
@@ -152,4 +193,15 @@ impl Filesystem {
             entries: relative_paths.chain(children).skip(offset as usize).boxed(),
         })
     }
+}
+
+/// Prefix of the state keys in the folder with object key `dir`.
+fn live_prefix(dir: &str) -> &str {
+    if dir == "/" { "" } else { dir }
+}
+
+/// True if a listed object is a file that also has a live state. Such a file
+/// is listed from the state instead.
+fn is_live_file(live: &[(String, u64)], entry: &opendal::Entry) -> bool {
+    !entry.metadata().is_dir() && live.iter().any(|(name, _)| name == entry.name())
 }

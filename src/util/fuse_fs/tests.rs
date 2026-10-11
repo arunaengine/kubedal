@@ -1661,3 +1661,30 @@ async fn fsync_of_the_new_name_stores_a_file_renamed_before_its_release() {
     fs.release(req(), None, fh, 0, 0, false).await.unwrap();
     assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"new");
 }
+
+#[tokio::test]
+async fn a_closed_file_hides_a_stored_folder_with_the_same_name() {
+    use futures::StreamExt;
+    let fs = fs_with("other", "").await;
+    let root = OsStr::new("/");
+    let fh = create(&fs, "x").await;
+    fs.op.write("x/child", "c").await.unwrap();
+    let x = Some(OsStr::new("/x"));
+    fs.write(req(), x, fh, 0, b"file", 0, 0).await.unwrap();
+    fs.fsync(req(), x, fh, false).await.unwrap();
+    fs.release(req(), x, fh, 0, 0, false).await.unwrap();
+    let reply = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let xs: Vec<_> = entries.iter().filter(|e| e.name == "x").collect();
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].kind, FileType::RegularFile);
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let kinds: Vec<_> = reply
+        .entries
+        .map(|e| e.unwrap())
+        .filter(|e| futures::future::ready(e.name == "x"))
+        .map(|e| e.kind)
+        .collect()
+        .await;
+    assert_eq!(kinds, [FileType::RegularFile]);
+}

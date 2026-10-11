@@ -48,7 +48,12 @@ impl Filesystem {
         );
         // Sorted by name, the offset of an entry does not depend on whether it
         // is live or stored, so a listing can go on after a file is closed.
-        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        // A name is listed once; like lookup, a file wins over a folder.
+        entries.sort_by(|a, b| {
+            let is_dir = |kind: &FileType| *kind == FileType::Directory;
+            a.0.cmp(&b.0).then(is_dir(&a.1).cmp(&is_dir(&b.1)))
+        });
+        entries.dedup_by(|a, b| a.0 == b.0);
         let children = stream::iter(entries.into_iter().enumerate().map(|(i, (name, kind))| {
             Ok(DirectoryEntry {
                 kind,
@@ -140,7 +145,12 @@ impl Filesystem {
             attr_ttl: TTL,
         }));
         // Sorted by name, like readdir, so offsets depend only on the names.
-        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        // A name is listed once; like lookup, a file wins over a folder.
+        entries.sort_by(|a, b| {
+            let is_dir = |e: &DirectoryEntryPlus| e.kind == FileType::Directory;
+            a.name.cmp(&b.name).then(is_dir(a).cmp(&is_dir(b)))
+        });
+        entries.dedup_by(|a, b| a.name == b.name);
         let children = stream::iter(entries.into_iter().enumerate().map(|(i, e)| {
             Ok(DirectoryEntryPlus {
                 offset: (i + 3) as i64,

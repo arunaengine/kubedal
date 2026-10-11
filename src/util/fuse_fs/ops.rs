@@ -92,9 +92,15 @@ impl PathFilesystem for Filesystem {
             let size = state.lock().await.len;
             let attr =
                 dummy_file_attr(FileType::RegularFile, SystemTime::now(), self.uid, self.gid);
+            // An open file whose name was removed has no links left.
+            let nlink = if state.is_unlinked() { 0 } else { attr.nlink };
             return Ok(ReplyAttr {
                 ttl: TTL,
-                attr: FileAttr { size, ..attr },
+                attr: FileAttr {
+                    size,
+                    nlink,
+                    ..attr
+                },
             });
         }
 

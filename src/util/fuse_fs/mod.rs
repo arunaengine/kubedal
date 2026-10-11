@@ -448,7 +448,12 @@ const fn dummy_file_attr(kind: FileType, now: SystemTime, uid: u32, gid: u32) ->
         ctime: now,
         kind,
         perm: fuse3::perm_from_mode_and_kind(kind, 0o775),
-        nlink: 0,
+        // Programs like find use the link count; a folder has "." and its name.
+        nlink: if matches!(kind, FileType::Directory) {
+            2
+        } else {
+            1
+        },
         uid,
         gid,
         rdev: 0,

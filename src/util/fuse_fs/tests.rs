@@ -1347,3 +1347,27 @@ async fn replies_set_no_fopen_flags_from_the_request() {
         .unwrap();
     assert_eq!(dir.flags, 0);
 }
+
+#[tokio::test]
+async fn link_counts_are_one_for_files_two_for_folders_and_zero_after_unlink() {
+    let fs = fs_with("f", "abc").await;
+    fs.op.create_dir("d/").await.unwrap();
+    let nlink = |path: &'static str| {
+        let fs = &fs;
+        async move {
+            fs.getattr(req(), Some(OsStr::new(path)), None, 0)
+                .await
+                .unwrap()
+                .attr
+                .nlink
+        }
+    };
+    assert_eq!(nlink("/f").await, 1);
+    assert_eq!(nlink("/d").await, 2);
+    let fh = open(&fs, "/f", libc::O_RDWR).await;
+    fs.unlink(req(), OsStr::new("/"), OsStr::new("f"))
+        .await
+        .unwrap();
+    let attr = fs.getattr(req(), None, Some(fh), 0).await.unwrap().attr;
+    assert_eq!(attr.nlink, 0);
+}

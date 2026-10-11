@@ -1688,3 +1688,42 @@ async fn a_closed_file_hides_a_stored_folder_with_the_same_name() {
         .await;
     assert_eq!(kinds, [FileType::RegularFile]);
 }
+
+#[tokio::test]
+async fn pages_of_one_folder_handle_come_from_one_listing() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("b", "2").await.unwrap();
+    fs.op.write("c", "3").await.unwrap();
+    let root = OsStr::new("/");
+    let names = |entries: Vec<std::ffi::OsString>| -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|n| n.into_string().unwrap())
+            .collect()
+    };
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdir(req(), root, fh, 0).await.unwrap();
+    let first: Vec<_> = reply
+        .entries
+        .take(3)
+        .map(|e| e.unwrap().name)
+        .collect()
+        .await;
+    assert_eq!(names(first), [".", "..", "a"]);
+    // Names come and go between two pages.
+    fs.op.write("0", "new").await.unwrap();
+    fs.op.delete("b").await.unwrap();
+    let reply = fs.readdir(req(), root, fh, 3).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+    assert!(fs.dir_snapshots().is_empty());
+
+    // A new handle sees the new names, also in readdirplus.
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdirplus(req(), root, fh, 0, 0).await.unwrap();
+    let all: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(all), [".", "..", "0", "a", "c"]);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+}

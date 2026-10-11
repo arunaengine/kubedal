@@ -316,8 +316,18 @@ impl PathFilesystem for Filesystem {
 
     async fn opendir(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {
         tracing::debug!("opendir(path={path:?}, flags=0x{flags:x})");
+        // Each handle gets its own number, for its listing snapshot.
+        let fh = self
+            .next_dir_handle
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // Reply flags are FOPEN_* bits, not the O_* flags of the request.
-        Ok(ReplyOpen { fh: 0, flags: 0 })
+        Ok(ReplyOpen { fh, flags: 0 })
+    }
+
+    async fn releasedir(&self, _req: Request, path: &OsStr, fh: u64, _flags: u32) -> Result<()> {
+        tracing::debug!("releasedir(path={path:?}, fh={fh})");
+        self.dir_snapshots().remove(&fh);
+        Ok(())
     }
 
     async fn open(&self, _req: Request, path: &OsStr, flags: u32) -> Result<ReplyOpen> {

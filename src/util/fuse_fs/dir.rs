@@ -27,56 +27,18 @@ impl Filesystem {
     ) -> Result<ReplyDirectory<impl futures::Stream<Item = Result<DirectoryEntry>> + Send + 'a>>
     {
         tracing::debug!("readdir(path={path:?}, fh={fh}, offset={offset})");
-
-        let path = dir_key_of(path)?;
-        // Files that are written but not uploaded yet are listed too, once.
-        let live = self.states.live_children(live_prefix(&path)).await;
-        let dir = normalize_path(path.as_str());
-        let mut entries = Vec::new();
-        let mut lister = self.op.lister(&path).await.map_err(opendal_error2errno)?;
-        while let Some(entry) = lister.next().await {
-            let e = entry.map_err(opendal_error2errno)?;
-            if e.path() == dir || has_live_name(&live, &e) {
-                continue;
-            }
-            let name = e.name().trim_matches('/').to_string();
-            entries.push((name, entry_mode2file_type(e.metadata().mode())));
-        }
-        entries.extend(
-            live.into_iter()
-                .map(|(name, _)| (name, FileType::RegularFile)),
-        );
-        // Sorted by name, the offset of an entry does not depend on whether it
-        // is live or stored, so a listing can go on after a file is closed.
-        // A name is listed once; like lookup, a file wins over a folder.
-        entries.sort_by(|a, b| {
-            let is_dir = |kind: &FileType| *kind == FileType::Directory;
-            a.0.cmp(&b.0).then(is_dir(&a.1).cmp(&is_dir(&b.1)))
-        });
-        entries.dedup_by(|a, b| a.0 == b.0);
-        let children = stream::iter(entries.into_iter().enumerate().map(|(i, (name, kind))| {
-            Ok(DirectoryEntry {
-                kind,
-                name: name.into(),
-                offset: (i + 3) as i64,
-            })
-        }));
-
-        let relative_paths = stream::iter([
-            Result::Ok(DirectoryEntry {
-                kind: FileType::Directory,
-                name: ".".into(),
-                offset: 1,
-            }),
-            Result::Ok(DirectoryEntry {
-                kind: FileType::Directory,
-                name: "..".into(),
-                offset: 2,
-            }),
-        ]);
-
+        let entries = self.dir_snapshot(path, fh, offset as u64).await?;
+        let start = (offset as usize).min(entries.len());
         Ok(ReplyDirectory {
-            entries: relative_paths.chain(children).skip(offset as usize).boxed(),
+            entries: stream::iter((start..entries.len()).map(move |i| {
+                let e = &entries[i];
+                Ok(DirectoryEntry {
+                    kind: e.kind,
+                    name: e.name.clone(),
+                    offset: e.offset,
+                })
+            }))
+            .boxed(),
         })
     }
 
@@ -91,7 +53,39 @@ impl Filesystem {
         ReplyDirectoryPlus<impl futures::Stream<Item = Result<DirectoryEntryPlus>> + Send + 'a>,
     > {
         tracing::debug!("readdirplus(parent={parent:?}, fh={fh}, offset={offset})");
+        let entries = self.dir_snapshot(parent, fh, offset).await?;
+        let start = (offset as usize).min(entries.len());
+        Ok(ReplyDirectoryPlus {
+            entries: stream::iter((start..entries.len()).map(move |i| Ok(entries[i].clone())))
+                .boxed(),
+        })
+    }
 
+    /// The listing of an open folder handle. It is made when a listing starts
+    /// (offset 0) and kept until `releasedir`, so all pages of one handle come
+    /// from the same listing: names added or removed in between never shift
+    /// the offsets. Without a handle (`fh` 0), every call makes a new listing.
+    async fn dir_snapshot(
+        &self,
+        path: &OsStr,
+        fh: u64,
+        offset: u64,
+    ) -> Result<Arc<Vec<DirectoryEntryPlus>>> {
+        if fh != 0
+            && offset != 0
+            && let Some(entries) = self.dir_snapshots().get(&fh)
+        {
+            return Ok(entries.clone());
+        }
+        let entries = Arc::new(self.list_dir(path).await?);
+        if fh != 0 {
+            self.dir_snapshots().insert(fh, entries.clone());
+        }
+        Ok(entries)
+    }
+
+    /// List a folder with ".", ".." and offsets that start at 1.
+    async fn list_dir(&self, parent: &OsStr) -> Result<Vec<DirectoryEntryPlus>> {
         let now = SystemTime::now();
         let uid = self.uid;
         let gid = self.gid;
@@ -144,43 +138,32 @@ impl Filesystem {
             entry_ttl: TTL,
             attr_ttl: TTL,
         }));
-        // Sorted by name, like readdir, so offsets depend only on the names.
-        // A name is listed once; like lookup, a file wins over a folder.
+        // Sorted by name, the offset of an entry does not depend on whether it
+        // is live or stored. A name is listed once; like lookup, a file wins
+        // over a folder.
         entries.sort_by(|a, b| {
             let is_dir = |e: &DirectoryEntryPlus| e.kind == FileType::Directory;
             a.name.cmp(&b.name).then(is_dir(a).cmp(&is_dir(b)))
         });
         entries.dedup_by(|a, b| a.name == b.name);
-        let children = stream::iter(entries.into_iter().enumerate().map(|(i, e)| {
-            Ok(DirectoryEntryPlus {
-                offset: (i + 3) as i64,
+
+        let relative = |name: &str| DirectoryEntryPlus {
+            kind: FileType::Directory,
+            name: name.into(),
+            offset: 0,
+            attr: dummy_file_attr(FileType::Directory, now, uid, gid),
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        };
+        Ok([relative("."), relative("..")]
+            .into_iter()
+            .chain(entries)
+            .enumerate()
+            .map(|(i, e)| DirectoryEntryPlus {
+                offset: (i + 1) as i64,
                 ..e
             })
-        }));
-
-        let relative_path_attr = dummy_file_attr(FileType::Directory, now, uid, gid);
-        let relative_paths = stream::iter([
-            Result::Ok(DirectoryEntryPlus {
-                kind: FileType::Directory,
-                name: ".".into(),
-                offset: 1,
-                attr: relative_path_attr,
-                entry_ttl: TTL,
-                attr_ttl: TTL,
-            }),
-            Result::Ok(DirectoryEntryPlus {
-                kind: FileType::Directory,
-                name: "..".into(),
-                offset: 2,
-                attr: relative_path_attr,
-                entry_ttl: TTL,
-                attr_ttl: TTL,
-            }),
-        ]);
-
-        Ok(ReplyDirectoryPlus {
-            entries: relative_paths.chain(children).skip(offset as usize).boxed(),
-        })
+            .collect())
     }
 }
 

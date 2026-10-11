@@ -102,6 +102,24 @@ fn non_empty<'a>(ctx: &'a HashMap<String, String>, key: &str) -> Option<&'a str>
     ctx.get(key).map(|v| v.trim()).filter(|v| !v.is_empty())
 }
 
+/// A storage path attribute exactly as given: it is not trimmed, so it can
+/// never name another object than the one written. Empty means not set.
+fn exact_attribute<'a>(
+    ctx: &'a HashMap<String, String>,
+    key: &str,
+) -> Result<Option<&'a str>, Status> {
+    let Some(value) = ctx.get(key).filter(|v| !v.is_empty()) else {
+        return Ok(None);
+    };
+    if crate::util::opendal::exact_user_key(value).is_none() {
+        return Err(Status::invalid_argument(format!(
+            "volume attribute {key} {value:?} would name another storage path \
+             (white space at the ends, empty, \".\" or \"..\" parts)"
+        )));
+    }
+    Ok(Some(value))
+}
+
 fn inline_source(ctx: &HashMap<String, String>, pod: &PodRef) -> Result<ContextSource, Status> {
     let name = non_empty(ctx, ATTR_DATA_NODE).ok_or_else(|| {
         Status::invalid_argument(format!(
@@ -115,7 +133,7 @@ fn inline_source(ctx: &HashMap<String, String>, pod: &PodRef) -> Result<ContextS
             .to_string(),
     };
 
-    if let Some(manifest) = non_empty(ctx, ATTR_MANIFEST) {
+    if let Some(manifest) = exact_attribute(ctx, ATTR_MANIFEST)? {
         return Ok(ContextSource::Direct(VolumeSource::FileList {
             node,
             manifest: manifest.to_string(),
@@ -125,7 +143,7 @@ fn inline_source(ctx: &HashMap<String, String>, pod: &PodRef) -> Result<ContextS
     let (mode, writable) = parse_mount(non_empty(ctx, ATTR_MOUNT).unwrap_or(""))?;
     Ok(ContextSource::Direct(VolumeSource::Tree {
         node,
-        path: non_empty(ctx, ATTR_PATH).unwrap_or("/").to_string(),
+        path: exact_attribute(ctx, ATTR_PATH)?.unwrap_or("/").to_string(),
         mode,
         writable,
     }))
@@ -184,6 +202,34 @@ mod tests {
             ctx.insert(k.to_string(), v.to_string());
         }
         ctx
+    }
+
+    #[test]
+    fn storage_paths_are_taken_exactly_as_given() {
+        for (attr, value) in [
+            (ATTR_PATH, "x "),
+            (ATTR_PATH, "a//b"),
+            (ATTR_PATH, "a/./b"),
+            (ATTR_MANIFEST, "m /"),
+            (ATTR_MANIFEST, " m"),
+        ] {
+            let ctx = pod_ctx(&[
+                (EPHEMERAL, "true"),
+                (ATTR_DATA_NODE, "store"),
+                (attr, value),
+            ]);
+            let pod = pod_from_context(&ctx).unwrap();
+            let err = source_from_context(&ctx, &pod).unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{attr}={value:?}");
+        }
+        // One leading "/" is fine.
+        let ctx = pod_ctx(&[
+            (EPHEMERAL, "true"),
+            (ATTR_DATA_NODE, "store"),
+            (ATTR_PATH, "/a b"),
+        ]);
+        let pod = pod_from_context(&ctx).unwrap();
+        assert!(source_from_context(&ctx, &pod).is_ok());
     }
 
     #[test]

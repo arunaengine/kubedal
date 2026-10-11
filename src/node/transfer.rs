@@ -99,16 +99,16 @@ fn path_status(err: PathError, key: &str) -> Status {
 /// If `prefix` points to a single file, the tree holds only that file, named after it.
 /// A prefix that does not exist gives an empty tree.
 pub async fn list_tree(op: &Operator, prefix: &str) -> Result<RemoteTree, Status> {
-    let prefix = paths::normalize_prefix(prefix)
-        .map_err(|e| Status::invalid_argument(format!("invalid path {prefix:?}: {e}")))?;
-    // The path is also read as a single object key; it must reach exactly
-    // that object.
-    let key = prefix.strip_suffix('/').unwrap_or_default();
-    if !crate::util::opendal::is_exact_key(key) {
+    // The path is checked as written: only one leading "/" may go ("." and
+    // "/" still mean the root). It is also read as a single object key, so it
+    // must reach exactly that object.
+    if prefix != "." && crate::util::opendal::exact_user_key(prefix).is_none() {
         return Err(Status::invalid_argument(format!(
-            "invalid path {key:?}: storage would read another object"
+            "invalid path {prefix:?}: storage would read another object"
         )));
     }
+    let prefix = paths::normalize_prefix(prefix)
+        .map_err(|e| Status::invalid_argument(format!("invalid path {prefix:?}: {e}")))?;
 
     if let Some(key) = prefix.strip_suffix('/') {
         match op.stat(key).await {
@@ -416,8 +416,10 @@ mod tests {
     async fn keys_that_storage_would_change_are_not_read() {
         let op = memory_with(&[("x", "content of x")]).await;
         let dir = tempfile::tempdir().unwrap();
-        let err = list_tree(&op, "x ").await.unwrap_err();
-        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        for path in ["x ", "a//x", "./x", "x /"] {
+            let err = list_tree(&op, path).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{path:?}");
+        }
         let err = download_file(
             &op,
             "x ",

@@ -446,6 +446,8 @@ mod tests {
             "a/../b",
             "y\u{2003}",
             ".",
+            "m /",
+            "a//",
         ] {
             assert!(!is_exact_key(key), "{key:?}");
         }

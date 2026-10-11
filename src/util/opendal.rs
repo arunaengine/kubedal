@@ -9,14 +9,25 @@ use tonic::Status;
 
 /// True if OpenDAL uses `key` exactly as it is, so two different keys never
 /// reach the same object. Such a key has no leading "/", no white space at its
-/// ends, and no empty, "." or ".." parts (a trailing "/" for a folder is fine).
-/// The empty key is the root.
+/// ends, and no empty, "." or ".." parts (a trailing "/" for a folder is fine,
+/// but the key without it must be exact too). The empty key is the root.
 pub fn is_exact_key(key: &str) -> bool {
     if key.is_empty() {
         return true;
     }
-    let dots = key.split('/').any(|part| part == "." || part == "..");
-    !key.starts_with('/') && !dots && opendal::raw::normalize_path(key) == key
+    let file = key.strip_suffix('/').unwrap_or(key);
+    let exact = |k: &str| opendal::raw::normalize_path(k) == k;
+    let parts_ok = file
+        .split('/')
+        .all(|part| !part.is_empty() && part != "." && part != "..");
+    !key.starts_with('/') && parts_ok && exact(key) && exact(file)
+}
+
+/// A user-given storage path with at most one leading "/" removed, if it is an
+/// exact key (see [`is_exact_key`]). Nothing else is trimmed or changed.
+pub fn exact_user_key(path: &str) -> Option<&str> {
+    let key = path.strip_prefix('/').unwrap_or(path);
+    is_exact_key(key).then_some(key)
 }
 
 /// Build an operator for the root of a DataNode.

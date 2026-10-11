@@ -15,7 +15,16 @@ use tonic::Status;
 /// Read and check a manifest object.
 pub async fn read_manifest(op: &Operator, key: &str) -> Result<FilePlan, Status> {
     // Check the key before any storage access, so ".." cannot leave the DataNode root.
-    let key = crate::node::paths::safe_relative(key.trim_start_matches('/'))
+    // The name is checked as written: only one leading "/" may go, so it can
+    // never read another object (like "m /" reading "m").
+    let exact = crate::util::opendal::exact_user_key(key)
+        .filter(|k| !k.is_empty() && !k.ends_with('/'))
+        .ok_or_else(|| {
+            Status::invalid_argument(format!(
+                "invalid manifest path {key:?}: storage would read another object"
+            ))
+        })?;
+    let key = crate::node::paths::safe_relative(exact)
         .map_err(|e| Status::invalid_argument(format!("invalid manifest path: {e}")))?;
     let key = key.as_str();
     let meta = op
@@ -210,6 +219,17 @@ async fn place_file(
 mod tests {
     use super::*;
     use opendal::services::Memory;
+
+    #[tokio::test]
+    async fn manifest_paths_are_read_exactly_as_given() {
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("m", r#"{"version": 1}"#).await.unwrap();
+        for key in ["m /", "m ", "./m", "//m"] {
+            let err = read_manifest(&op, key).await.unwrap_err();
+            assert_eq!(err.code(), tonic::Code::InvalidArgument, "{key:?}");
+        }
+        assert!(read_manifest(&op, "/m").await.is_ok());
+    }
 
     #[tokio::test]
     async fn manifest_path_must_stay_in_the_data_node() {

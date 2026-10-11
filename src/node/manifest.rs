@@ -132,13 +132,19 @@ pub const MAX_PATH_BYTES: usize = 4096;
 pub const MAX_PATH_PARTS: usize = 256;
 
 /// A file source is a storage key: it must reach exactly the object it names.
+/// The name is checked as written, before anything is trimmed: only one
+/// leading "/" may go.
 fn check_source(value: &str) -> Result<String, Status> {
-    let source = check_path("file source", value)?;
-    if !crate::util::opendal::is_exact_key(&source) {
+    let exact = crate::util::opendal::exact_user_key(value)
+        .filter(|key| !key.is_empty() && !key.ends_with('/'));
+    let Some(key) = exact else {
         return Err(invalid(format!(
-            "file source {source:?} would read another object (white space at the ends)"
+            "file source {value:?} would read another object (white space at the ends, \
+             empty, \".\" or \"..\" parts)"
         )));
-    }
+    };
+    let source = check_path("file source", key)?;
+    debug_assert_eq!(source, key);
     Ok(source)
 }
 
@@ -233,7 +239,7 @@ pub fn plan(manifest: Manifest) -> Result<FilePlan, Status> {
     for file in manifest.files {
         files.push(PlannedFile {
             path: check_path("file path", &file.path)?,
-            source: check_source(file.source.trim_start_matches('/'))?,
+            source: check_source(&file.source)?,
             sha256: file.sha256.as_deref().map(check_digest).transpose()?,
             size: file.size,
             executable: file.executable,
@@ -318,7 +324,7 @@ mod tests {
 
     #[test]
     fn sources_that_storage_would_change_are_refused() {
-        for source in ["x ", "dir/x\u{2003}"] {
+        for source in ["x ", "dir/x\u{2003}", "a//b", "a/./b", "//a", "a/"] {
             let manifest =
                 serde_json::json!({"version": 1, "files": [{"path": "x", "source": source}]});
             let err = parse_str(&manifest.to_string()).unwrap_err();

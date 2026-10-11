@@ -25,6 +25,7 @@ fn request(volume_id: &str, target: &Path, manifest: &str) -> PublishRequest {
             node: store(),
             manifest: manifest.into(),
         },
+        data_pod_uid: None,
     }
 }
 

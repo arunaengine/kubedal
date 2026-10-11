@@ -267,6 +267,34 @@ async fn publish_with_other_settings_fails() {
 }
 
 #[tokio::test]
+async fn publish_with_another_source_fails() {
+    let env = Env::new();
+    env.add_store(None, false);
+    let target = env.target("p1");
+    let request = |path: &str, uid: &str| {
+        let mut req = tree_request("vol-1", &target, path, TreeMode::Cache, false);
+        req.data_pod_uid = Some(uid.into());
+        req
+    };
+    env.manager.publish(request("data", "dp-1")).await.unwrap();
+    // The same request again is fine.
+    env.manager.publish(request("data", "dp-1")).await.unwrap();
+    // Another path, or another DataPod with the same path, is refused.
+    let err = env
+        .manager
+        .publish(request("other", "dp-1"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists);
+    let err = env
+        .manager
+        .publish(request("data", "dp-2"))
+        .await
+        .unwrap_err();
+    assert_eq!(err.code(), Code::AlreadyExists);
+}
+
+#[tokio::test]
 async fn unpublish_of_unknown_volume_succeeds() {
     let env = Env::new();
     let target = env.target("p1");

@@ -85,6 +85,11 @@ pub struct VolumeRecord {
     pub phase: Phase,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub upload: Option<UploadPlan>,
+    /// What the volume shows: DataNode, path or manifest, and the DataPod UID.
+    /// A repeated publish with another source is refused. Records from older
+    /// versions have none.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub source: Option<String>,
 }
 
 /// Stores one JSON file per volume in a directory.
@@ -184,6 +189,7 @@ pub(crate) mod tests {
             mode: VolumeMode::Cache,
             read_only: false,
             phase: Phase::Published,
+            source: None,
             upload: Some(UploadPlan {
                 data_node: DataNodeRef {
                     name: "store".into(),

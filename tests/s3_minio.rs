@@ -131,6 +131,7 @@ async fn cache_download_and_write_back() {
                 mode: TreeMode::Cache,
                 writable: true,
             },
+            data_pod_uid: None,
         })
         .await
         .unwrap();
@@ -185,6 +186,7 @@ async fn file_list_with_upload() {
                 node: node(),
                 manifest: "jobs/1.json".into(),
             },
+            data_pod_uid: None,
         })
         .await
         .unwrap();

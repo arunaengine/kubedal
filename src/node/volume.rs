@@ -57,6 +57,23 @@ pub struct PublishRequest {
     pub read_only: bool,
     pub pod: PodRef,
     pub source: VolumeSource,
+    /// UID of the DataPod the source comes from, if any.
+    pub data_pod_uid: Option<String>,
+}
+
+impl PublishRequest {
+    /// The identity of what this request shows, stored in the volume record.
+    fn source_identity(&self) -> String {
+        let uid = self.data_pod_uid.as_deref().unwrap_or("-");
+        match &self.source {
+            VolumeSource::Tree { node, path, .. } => {
+                format!("tree {node} {path} data-pod-uid={uid}")
+            }
+            VolumeSource::FileList { node, manifest } => {
+                format!("file-list {node} {manifest} data-pod-uid={uid}")
+            }
+        }
+    }
 }
 
 pub struct VolumeManager {
@@ -230,8 +247,10 @@ impl VolumeManager {
             .state
             .load(&id)
             .map_err(|e| io_status(e, "load volume state"))?;
+        let source = req.source_identity();
         if let Some(record) = existing {
-            if record.mode != mode || record.read_only != read_only {
+            let other_source = record.source.as_ref().is_some_and(|s| *s != source);
+            if record.mode != mode || record.read_only != read_only || other_source {
                 return Err(Status::already_exists(
                     "the volume is already published at this path with other settings",
                 ));
@@ -248,6 +267,7 @@ impl VolumeManager {
             read_only,
             phase: Phase::Preparing,
             upload: None,
+            source: Some(source),
         };
         self.save(&id, &record)?;
 

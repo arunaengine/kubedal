@@ -35,9 +35,9 @@ impl NodeService {
         &self,
         source: ContextSource,
         pod: &PodRef,
-    ) -> Result<VolumeSource, Status> {
+    ) -> Result<(VolumeSource, Option<String>), Status> {
         let (name, namespace, node, mode, writable) = match source {
-            ContextSource::Direct(source) => return Ok(source),
+            ContextSource::Direct(source) => return Ok((source, None)),
             ContextSource::DataPod {
                 name,
                 namespace,
@@ -71,12 +71,13 @@ impl NodeService {
                 ))
             })?,
         };
-        Ok(VolumeSource::Tree {
+        let source = VolumeSource::Tree {
             node,
             path,
             mode,
             writable,
-        })
+        };
+        Ok((source, data_pod.metadata.uid))
     }
 }
 
@@ -145,7 +146,7 @@ impl Node for NodeService {
 
         let pod = request::pod_from_context(&request.volume_context)?;
         let source = request::source_from_context(&request.volume_context, &pod)?;
-        let source = self.resolve_source(source, &pod).await?;
+        let (source, data_pod_uid) = self.resolve_source(source, &pod).await?;
 
         tracing::info!(
             "publishing volume {} for pod {}/{} at {}",
@@ -161,6 +162,7 @@ impl Node for NodeService {
                 read_only: request.readonly,
                 pod,
                 source,
+                data_pod_uid,
             })
             .await?;
         Ok(Response::new(NodePublishVolumeResponse {}))

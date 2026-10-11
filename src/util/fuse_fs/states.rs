@@ -372,26 +372,43 @@ impl StateData {
         let end = checked_end(offset, data.len()).map_err(|e| (e, false))?;
         let before = self.charged;
         self.charge_to(self.len.max(end)).map_err(|e| (e, false))?;
-        if let Err(err) = self.write_file(data, offset) {
+        if let Err((err, written)) = self.write_file(data, offset) {
             // The write may have extended the file in part. Cut it back to the
             // old length and charge what is really on disk.
-            let _ = self.file.set_len(self.len);
+            if written > 0 {
+                let _ = self.file.set_len(self.len);
+            }
             let on_disk = self.file.metadata().map(|m| m.len()).unwrap_or(before);
             let _ = self.charge_to(on_disk);
-            return Err((err, true));
+            // Only a failure after some bytes were written changed the file.
+            return Err((err, written > 0));
         }
         self.len = self.len.max(end);
         Ok(())
     }
 
-    fn write_file(&mut self, data: &[u8], offset: u64) -> std::io::Result<()> {
+    /// Write all of `data` at `offset`. An error also says how many bytes were
+    /// written before it.
+    fn write_file(&mut self, data: &[u8], offset: u64) -> Result<(), (std::io::Error, usize)> {
+        // Test hook: write only part of the data, then fail.
         #[cfg(test)]
-        if let Some(n) = self.fail_after.take() {
-            // Test hook: write only part of the data, then fail.
-            self.file.write_all_at(&data[..n.min(data.len())], offset)?;
-            return Err(std::io::Error::from_raw_os_error(libc::EIO));
+        let fail_after = self.fail_after.take();
+        #[cfg(not(test))]
+        let fail_after: Option<usize> = None;
+        let limit = fail_after.map_or(data.len(), |n| n.min(data.len()));
+        let mut done = 0;
+        while done < limit {
+            match self.file.write_at(&data[done..limit], offset + done as u64) {
+                Ok(0) => return Err((std::io::ErrorKind::WriteZero.into(), done)),
+                Ok(n) => done += n,
+                Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(err) => return Err((err, done)),
+            }
         }
-        self.file.write_all_at(data, offset)
+        if fail_after.is_some() {
+            return Err((std::io::Error::from_raw_os_error(libc::EIO), done));
+        }
+        Ok(())
     }
 
     pub fn read_at(&self, offset: u64, size: u32) -> std::io::Result<Vec<u8>> {
@@ -2152,6 +2169,28 @@ mod tests {
     /// Block the temp file of a journal with a folder of the same name.
     fn block_journal_tmp(meta: &Path) {
         std::fs::create_dir(meta.with_extension("json.tmp")).unwrap();
+    }
+
+    #[tokio::test]
+    async fn failures_before_any_byte_changed_do_not_stop_the_file_system() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        let states = states(dir.path());
+        let joined = states.open_write(&op, "a", false).await.unwrap();
+        let mut data = joined.lock().await;
+        data.write_at(b"12", 0).unwrap();
+        // Sizes no file can have fail before the spool file is touched.
+        let err = data.set_len(u64::MAX).unwrap_err();
+        assert_eq!(err.raw_os_error(), Some(libc::EFBIG));
+        // A write that fails before its first byte changes nothing.
+        data.fail_after = Some(0);
+        assert!(data.write_at(b"xyz", 0).is_err());
+        assert!(!states.is_broken());
+        assert_eq!(data.read_at(0, 10).unwrap(), b"12");
+        // One that fails after some bytes stops the file system.
+        data.fail_after = Some(1);
+        assert!(data.write_at(b"xyz", 0).is_err());
+        assert!(states.is_broken());
     }
 
     #[tokio::test]

@@ -78,9 +78,23 @@ impl VolumeManager {
         let mut report = ReconcileReport::default();
         for (id, record) in records {
             let target = record.target_path.clone();
+            let target_mounted = match self.mounter().is_mounted(&target) {
+                Ok(mounted) => mounted,
+                Err(err) => {
+                    // Without the mount table nothing is safe to do; leave the
+                    // record for the next start or the next kubelet call.
+                    report.failed += 1;
+                    tracing::warn!(
+                        "reconcile of volume {} failed: {}",
+                        record.volume_id,
+                        err.message()
+                    );
+                    continue;
+                }
+            };
             let observed = Observed {
                 target_exists: target.exists(),
-                target_mounted: self.mounter().is_mounted(&target),
+                target_mounted,
             };
             let action = plan(&record, observed);
             tracing::info!(

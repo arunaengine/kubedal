@@ -35,8 +35,9 @@ pub trait Mounter: Send + Sync {
     /// Unmount `target`. Unmounting a path that is not mounted is not an error.
     async fn unmount(&self, target: &Path) -> Result<(), Status>;
 
-    /// Is `target` a mount point right now?
-    fn is_mounted(&self, target: &Path) -> bool;
+    /// Is `target` a mount point right now? Fails if the mount table cannot
+    /// be read.
+    fn is_mounted(&self, target: &Path) -> Result<bool, Status>;
 
     /// Does this process serve a FUSE file system at `target`?
     async fn has_fuse_session(&self, target: &Path) -> bool;
@@ -48,6 +49,8 @@ pub struct SystemMounter {
     fuse_sessions: Mutex<HashMap<PathBuf, (MountHandle, Arc<Workers>)>>,
     /// Space limit for FUSE spool files on this node. None means no limit.
     spool_budget: Option<Arc<SpoolBudget>>,
+    /// Mount table to read. None means `/proc/self/mountinfo`.
+    mount_table: Option<PathBuf>,
 }
 
 impl SystemMounter {
@@ -200,7 +203,7 @@ impl Mounter for SystemMounter {
                 Err(err) => tracing::warn!("FUSE unmount of {target:?} failed: {err}"),
             }
         }
-        if !self.is_mounted(target) {
+        if !self.is_mounted(target)? {
             return Ok(());
         }
         let target_c = c_path(target)?;
@@ -215,11 +218,37 @@ impl Mounter for SystemMounter {
         .map_err(|e| Status::internal(format!("unmount task failed: {e}")))?
     }
 
-    fn is_mounted(&self, target: &Path) -> bool {
-        mountinfo::is_mount_point(target)
+    fn is_mounted(&self, target: &Path) -> Result<bool, Status> {
+        let mounts = match &self.mount_table {
+            Some(path) => mountinfo::read_mounts_from(path),
+            None => mountinfo::read_mounts(),
+        };
+        // The read can work on the next try, so the caller should retry.
+        mounts
+            .map(|mounts| mountinfo::find_mount_in(&mounts, target).is_some())
+            .map_err(|e| Status::unavailable(format!("read mount table: {e}")))
     }
 
     async fn has_fuse_session(&self, target: &Path) -> bool {
         self.fuse_sessions.lock().await.contains_key(target)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn unmount_fails_when_the_mount_table_cannot_be_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = SystemMounter {
+            mount_table: Some(dir.path().join("missing")),
+            ..Default::default()
+        };
+        let err = mounter
+            .unmount(&dir.path().join("target"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::Unavailable);
     }
 }

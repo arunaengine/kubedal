@@ -129,11 +129,12 @@ impl VolumeManager {
     /// their space back.
     ///
     /// Spool files that are already on disk (from before a restart) are charged
-    /// to the budget right away.
-    pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> Self {
-        budget.charge_existing(existing_spool_bytes(&self.root.join("volumes")));
+    /// to the budget right away. A spool folder that cannot be scanned is an
+    /// error, so the budget never counts too little.
+    pub fn with_spool_budget(mut self, budget: Arc<SpoolBudget>) -> std::io::Result<Self> {
+        budget.charge_existing(existing_spool_bytes(&self.root.join("volumes"))?);
         self.spool_budget = budget;
-        self
+        Ok(self)
     }
 
     pub fn with_content_cache_limit(mut self, max_bytes: u64) -> Self {
@@ -323,7 +324,7 @@ impl VolumeManager {
                         Ok(false)
                     }
                     VolumeMode::Cache | VolumeMode::FileList => {
-                        if self.mounter.is_mounted(target) {
+                        if self.mounter.is_mounted(target)? {
                             return Ok(true);
                         }
                         let data = self.data_dir(id);
@@ -611,20 +612,33 @@ impl VolumeManager {
     }
 }
 
-/// Size of all spool data files below `volumes/*/spool`.
-fn existing_spool_bytes(volumes: &Path) -> u64 {
-    let Ok(entries) = std::fs::read_dir(volumes) else {
-        return 0;
+/// Size of all spool data files below `volumes/*/spool`. Missing folders count
+/// as 0; any other read error is returned.
+fn existing_spool_bytes(volumes: &Path) -> std::io::Result<u64> {
+    let scan_error = |path: &Path, e: std::io::Error| {
+        std::io::Error::new(e.kind(), format!("scan {}: {e}", path.display()))
     };
-    entries
-        .filter_map(Result::ok)
-        .filter_map(|volume| std::fs::read_dir(volume.path().join("spool")).ok())
-        .flatten()
-        .filter_map(Result::ok)
-        .filter(|e| e.path().extension().is_some_and(|x| x == "data"))
-        .filter_map(|e| e.metadata().ok())
-        .map(|m| m.len())
-        .sum()
+    let read_dir = |path: &Path| match std::fs::read_dir(path) {
+        Ok(entries) => Ok(Some(entries)),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(err) => Err(scan_error(path, err)),
+    };
+    let mut total = 0;
+    for volume in read_dir(volumes)?.into_iter().flatten() {
+        let spool = volume
+            .map_err(|e| scan_error(volumes, e))?
+            .path()
+            .join("spool");
+        for entry in read_dir(&spool)?.into_iter().flatten() {
+            let path = entry.map_err(|e| scan_error(&spool, e))?.path();
+            if path.extension().is_some_and(|x| x == "data") {
+                total += std::fs::metadata(&path)
+                    .map_err(|e| scan_error(&path, e))?
+                    .len();
+            }
+        }
+    }
+    Ok(total)
 }
 
 /// True if a spool folder holds content that may still need an upload. A
@@ -683,6 +697,20 @@ mod tests {
         // a file where the folder should be cannot be scanned
         std::fs::write(&spool, "").unwrap();
         assert!(has_pending_spool(&spool).is_err());
+    }
+
+    #[test]
+    fn existing_spool_bytes_fails_on_an_unreadable_spool() {
+        let dir = tempfile::tempdir().unwrap();
+        let volumes = dir.path().join("volumes");
+        assert_eq!(existing_spool_bytes(&volumes).unwrap(), 0);
+        std::fs::create_dir_all(volumes.join("a/spool")).unwrap();
+        std::fs::write(volumes.join("a/spool/1.data"), "abc").unwrap();
+        std::fs::create_dir_all(volumes.join("b")).unwrap();
+        assert_eq!(existing_spool_bytes(&volumes).unwrap(), 3);
+        // a file where the spool folder should be cannot be scanned
+        std::fs::write(volumes.join("b/spool"), "").unwrap();
+        assert!(existing_spool_bytes(&volumes).is_err());
     }
 
     #[tokio::test]

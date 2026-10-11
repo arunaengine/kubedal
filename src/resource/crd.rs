@@ -48,6 +48,12 @@ pub struct DataNodeSpec {
     #[serde(rename = "secretRef")]
     pub secret_ref: Option<Ref>,
 
+    /// Shared, non-secret config options for the backend in a Kubernetes
+    /// ConfigMap. Values from the Secret and from `config` override them.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    #[serde(rename = "configMapRef")]
+    pub config_map_ref: Option<Ref>,
+
     /// Additional config options for the backend
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub config: HashMap<String, String>,

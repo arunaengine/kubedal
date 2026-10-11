@@ -87,7 +87,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("kubedal")
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("sync-image")
+                .long("sync-image")
+                .help("Image of the DataReplicaSet sync pods")
+                .default_value(concat!(
+                    "ghcr.io/arunaengine/kubedal:",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
+            Arg::new("sync-image-pull-policy")
+                .long("sync-image-pull-policy")
+                .help("Image pull policy of the DataReplicaSet sync pods")
+                .default_value("IfNotPresent")
+                .value_parser(clap::value_parser!(String)),
+        )
+        .arg(
+            Arg::new("sync-image-pull-secret")
+                .long("sync-image-pull-secret")
+                .help("Image pull secret of the DataReplicaSet sync pods (may be repeated)")
+                .action(clap::ArgAction::Append)
+                .value_parser(clap::value_parser!(String)),
+        )
+        .subcommand(
+            Command::new("replicate")
+                .about("Copy a DataReplicaSet source to its replicas (runs in the sync pod)"),
+        )
         .get_matches();
+
+    if matches.subcommand_matches("replicate").is_some() {
+        return kubedal::replicate::run_from_env().map_err(Into::into);
+    }
 
     // Both arguments have default values, so they are always present.
     let endpoint = matches
@@ -155,7 +187,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get_one::<String>("storage-class")
             .cloned()
             .unwrap_or_default();
-        let controller_service = ControllerService::new(client.clone(), storage_class).await;
+        let sync_image = matches
+            .get_one::<String>("sync-image")
+            .cloned()
+            .unwrap_or_default();
+        let sync_pull_secrets = matches
+            .get_many::<String>("sync-image-pull-secret")
+            .unwrap_or_default()
+            .cloned()
+            .collect();
+        let sync_pull_policy = matches
+            .get_one::<String>("sync-image-pull-policy")
+            .cloned()
+            .unwrap_or_default();
+        let controller_service = ControllerService::new(
+            client.clone(),
+            storage_class,
+            sync_image,
+            sync_pull_policy,
+            sync_pull_secrets,
+        )
+        .await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder
@@ -176,7 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES);
         let manager = VolumeManager::new(&data_dir, cluster, mounter)?
             .with_content_cache_limit(cache_size)
-            .with_spool_budget(spool_budget);
+            .with_spool_budget(spool_budget)?;
         tracing::info!("Data directory: {}", data_dir.display());
         // Clean up what a previous run of the plugin left behind.
         let report = manager.reconcile().await?;

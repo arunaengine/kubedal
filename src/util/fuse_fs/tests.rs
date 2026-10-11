@@ -1521,3 +1521,234 @@ async fn forced_read_waiting_on_storage_during_unlink_uses_the_copy() {
     let data = read.await.unwrap().unwrap().data;
     assert_eq!(data.as_ref(), b"original");
 }
+
+#[tokio::test]
+async fn listings_show_files_that_are_not_uploaded_yet() {
+    use futures::StreamExt;
+    let fs = fs_with("d/old", "old").await;
+    let d = OsStr::new("/d");
+    // A new file, an existing file that is being written, and a file in a
+    // sub folder that belongs to another listing.
+    let new = fs
+        .create(req(), d, OsStr::new("new"), 0o644, WRITE_FLAGS)
+        .await
+        .unwrap()
+        .fh;
+    fs.write(req(), Some(OsStr::new("/d/new")), new, 0, b"12345", 0, 0)
+        .await
+        .unwrap();
+    assert!(!fs.op.exists("d/new").await.unwrap());
+    let old = open(&fs, "/d/old", libc::O_RDWR).await;
+    fs.write(req(), Some(OsStr::new("/d/old")), old, 3, b"er", 0, 0)
+        .await
+        .unwrap();
+    fs.mkdir(req(), d, OsStr::new("sub"), 0o755, 0)
+        .await
+        .unwrap();
+    fs.create(
+        req(),
+        OsStr::new("/d/sub"),
+        OsStr::new("x"),
+        0o644,
+        WRITE_FLAGS,
+    )
+    .await
+    .unwrap();
+
+    let reply = fs.readdir(req(), d, 0, 0).await.unwrap();
+    let mut names: Vec<_> = reply
+        .entries
+        .map(|e| e.unwrap().name.into_string().unwrap())
+        .collect()
+        .await;
+    names.sort();
+    assert_eq!(names, [".", "..", "new", "old", "sub"]);
+
+    let reply = fs.readdirplus(req(), d, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let sizes: HashMap<_, _> = entries
+        .iter()
+        .filter(|e| e.kind == FileType::RegularFile)
+        .map(|e| (e.name.to_str().unwrap().to_string(), e.attr.size))
+        .collect();
+    assert_eq!(sizes, HashMap::from([("new".into(), 5), ("old".into(), 5)]));
+    // Offsets go up by one, so the kernel can continue a listing.
+    let offsets: Vec<_> = entries.iter().map(|e| e.offset).collect();
+    assert_eq!(offsets, (1..=entries.len() as i64).collect::<Vec<_>>());
+
+    // A listing that goes on after offset 3 skips the first three entries.
+    let reply = fs.readdir(req(), d, 0, 3).await.unwrap();
+    assert_eq!(reply.entries.collect::<Vec<_>>().await.len(), 2);
+}
+
+#[tokio::test]
+async fn a_live_file_hides_a_stored_folder_with_the_same_name() {
+    use futures::StreamExt;
+    let fs = fs_with("x/inner", "stored").await;
+    let root = OsStr::new("/");
+    create(&fs, "x").await;
+    let reply = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let xs: Vec<_> = entries.iter().filter(|e| e.name == "x").collect();
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].kind, FileType::RegularFile);
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let names: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names.iter().filter(|n| *n == "x").count(), 1);
+}
+
+#[tokio::test]
+async fn a_listing_goes_on_correctly_after_a_writer_is_closed() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("b", "2").await.unwrap();
+    fs.op.write("c", "3").await.unwrap();
+    let root = OsStr::new("/");
+    let fh = open(&fs, "/a", libc::O_RDWR).await;
+    fs.write(req(), Some(OsStr::new("/a")), fh, 0, b"x", 0, 0)
+        .await
+        .unwrap();
+    let names = |entries: Vec<std::ffi::OsString>| -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|n| n.into_string().unwrap())
+            .collect()
+    };
+    // The first page ends after "a" (offset 3) while "a" is live.
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let first: Vec<_> = reply.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first.last().unwrap().offset, 3);
+    assert_eq!(first.last().unwrap().name, "a");
+    let plus = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let first_plus: Vec<_> = plus.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first_plus.last().unwrap().offset, 3);
+    assert_eq!(
+        names(first.into_iter().map(|e| e.name).collect()),
+        names(first_plus.into_iter().map(|e| e.name).collect())
+    );
+
+    fs.release(req(), Some(OsStr::new("/a")), fh, 0, 0, false)
+        .await
+        .unwrap();
+    let reply = fs.readdir(req(), root, 0, 3).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+    let plus = fs.readdirplus(req(), root, 0, 3, 0).await.unwrap();
+    let rest: Vec<_> = plus.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+}
+
+/// `kubedal replicate` relies on this: the release of a renamed file may come
+/// after the rename, and an fsync of the new name stores the content there.
+#[tokio::test]
+async fn fsync_of_the_new_name_stores_a_file_renamed_before_its_release() {
+    let fs = fs_with("f", "old").await;
+    let root = OsStr::new("/");
+    let fh = create(&fs, "tmp").await;
+    let tmp = Some(OsStr::new("/tmp"));
+    fs.write(req(), tmp, fh, 0, b"new", 0, 0).await.unwrap();
+    fs.fsync(req(), tmp, fh, false).await.unwrap();
+    fs.rename(req(), root, OsStr::new("tmp"), root, OsStr::new("f"))
+        .await
+        .unwrap();
+    // The release of "tmp" has not come yet.
+    let f = Some(OsStr::new("/f"));
+    let fh2 = open(&fs, "/f", libc::O_WRONLY).await;
+    fs.fsync(req(), f, fh2, false).await.unwrap();
+    assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"new");
+    assert!(!fs.op.exists("tmp").await.unwrap());
+    fs.release(req(), f, fh2, 0, 0, false).await.unwrap();
+    fs.release(req(), None, fh, 0, 0, false).await.unwrap();
+    assert_eq!(fs.op.read("f").await.unwrap().to_vec(), b"new");
+}
+
+#[tokio::test]
+async fn a_closed_file_hides_a_stored_folder_with_the_same_name() {
+    use futures::StreamExt;
+    let fs = fs_with("other", "").await;
+    let root = OsStr::new("/");
+    let fh = create(&fs, "x").await;
+    fs.op.write("x/child", "c").await.unwrap();
+    let x = Some(OsStr::new("/x"));
+    fs.write(req(), x, fh, 0, b"file", 0, 0).await.unwrap();
+    fs.fsync(req(), x, fh, false).await.unwrap();
+    fs.release(req(), x, fh, 0, 0, false).await.unwrap();
+    let reply = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let entries: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    let xs: Vec<_> = entries.iter().filter(|e| e.name == "x").collect();
+    assert_eq!(xs.len(), 1);
+    assert_eq!(xs[0].kind, FileType::RegularFile);
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let kinds: Vec<_> = reply
+        .entries
+        .map(|e| e.unwrap())
+        .filter(|e| futures::future::ready(e.name == "x"))
+        .map(|e| e.kind)
+        .collect()
+        .await;
+    assert_eq!(kinds, [FileType::RegularFile]);
+}
+
+#[tokio::test]
+async fn pages_of_one_folder_handle_come_from_one_listing() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("b", "2").await.unwrap();
+    fs.op.write("c", "3").await.unwrap();
+    let root = OsStr::new("/");
+    let names = |entries: Vec<std::ffi::OsString>| -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|n| n.into_string().unwrap())
+            .collect()
+    };
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdir(req(), root, fh, 0).await.unwrap();
+    let first: Vec<_> = reply
+        .entries
+        .take(3)
+        .map(|e| e.unwrap().name)
+        .collect()
+        .await;
+    assert_eq!(names(first), [".", "..", "a"]);
+    // Names come and go between two pages.
+    fs.op.write("0", "new").await.unwrap();
+    fs.op.delete("b").await.unwrap();
+    let reply = fs.readdir(req(), root, fh, 3).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+    assert!(fs.dir_snapshots().is_empty());
+
+    // A new handle sees the new names, also in readdirplus.
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdirplus(req(), root, fh, 0, 0).await.unwrap();
+    let all: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(all), [".", "..", "0", "a", "c"]);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+}
+
+#[tokio::test]
+async fn later_pages_of_readdirplus_use_fresh_attributes() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("x", "file").await.unwrap();
+    fs.op.write("z", "gone soon").await.unwrap();
+    let root = OsStr::new("/");
+    let fh = fs.opendir(req(), root, 0).await.unwrap().fh;
+    let reply = fs.readdirplus(req(), root, fh, 0, 0).await.unwrap();
+    let first: Vec<_> = reply.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first.last().unwrap().name, "a");
+    // "x" becomes a folder and "z" goes away before the next page.
+    fs.op.delete("x").await.unwrap();
+    fs.op.write("x/child", "c").await.unwrap();
+    fs.op.delete("z").await.unwrap();
+    let reply = fs.readdirplus(req(), root, fh, 3, 0).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap()).collect().await;
+    assert_eq!(rest.len(), 1);
+    assert_eq!(rest[0].name, "x");
+    assert_eq!(rest[0].kind, FileType::Directory);
+    assert_eq!(rest[0].attr.kind, FileType::Directory);
+    assert_eq!(rest[0].offset, 4);
+    fs.releasedir(req(), root, fh, 0).await.unwrap();
+}

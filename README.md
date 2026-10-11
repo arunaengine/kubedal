@@ -120,7 +120,10 @@ with the packaged chart attached.
 
 A DataNode describes a storage location. `config` takes any
 [OpenDAL option](https://opendal.apache.org/docs/rust/opendal/services/index.html)
-of the backend. Values from the Secret in `secretRef` are merged in.
+of the backend. Settings can also come from a ConfigMap (`configMapRef`), so
+several DataNodes can share them, and credentials from a Secret (`secretRef`).
+If a key is set in more than one place, the Secret beats the ConfigMap, and
+`config` beats both.
 
 ```yaml
 apiVersion: v1
@@ -133,6 +136,15 @@ stringData:
   access_key_id: "..."
   secret_access_key: "..."
 ---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: s3-shared
+  namespace: team-a
+data:
+  endpoint: https://s3.example.com
+  region: us-east-1
+---
 apiVersion: kubedal.arunaengine.org/v1alpha1
 kind: DataNode
 metadata:
@@ -144,10 +156,10 @@ spec:
   limit: 10Gi          # largest amount of data one volume may copy to a node
   secretRef:
     name: s3-credentials   # must be in the namespace of the DataNode
+  configMapRef:
+    name: s3-shared        # optional, must be in the namespace of the DataNode
   config:
     bucket: my-bucket
-    endpoint: https://s3.example.com
-    region: us-east-1
     root: /projects/a      # optional folder inside the bucket
 ```
 
@@ -159,7 +171,8 @@ spec:
   permission to `get` that DataNode (a Role and RoleBinding in the namespace of the
   DataNode). kubedal checks this with a SubjectAccessReview.
 - Pods never need access to the Secret.
-- The Secret of a DataNode must be in the same namespace as the DataNode.
+- The Secret and the ConfigMap of a DataNode must be in the same namespace as
+  the DataNode.
 
 ## Inline volumes
 
@@ -344,8 +357,11 @@ the cache. The least recently used files are removed when the cache grows over
   written, or else the object version it saw (on backends with ETags). If that
   object is replaced, further reads fail with ESTALE. On backends without ETags
   (for example HTTP), a reader can see a newer object under the same name.
-- A FUSE file that is written but not uploaded yet can be opened, read and
-  stat'ed, but it does not show up in directory listings.
+- A FUSE folder listing keeps the names it saw when it started, so its later
+  pages do not shift when files come and go. All open listings of a mount keep
+  at most 1,000,000 names together. Past that, the oldest listing loses its
+  names and makes a new list at its next call, so its pages may skip or repeat
+  names.
 - Renaming a closed file on S3, GCS or Azure Blob copies the object and removes the
   old one. Renaming a folder there fails with EXDEV, so tools like `mv` copy the
   files instead.
@@ -363,7 +379,15 @@ the cache. The least recently used files are removed when the cache grows over
   compatible backends do.
 - The DataNode `limit` applies per volume. It is not checked for FUSE volumes.
 - The HTTP backend cannot list, so it only works for paths to single files.
-- `DataReplicaSet` is experimental. It starts its own sync pods with a fixed image.
+- `DataReplicaSet` is experimental. Its sync pod runs `kubedal replicate` from the
+  kubedal image (the controller flags `--sync-image` and
+  `--sync-image-pull-policy`, set by the chart from `image`). Every
+  second it copies new and changed files from the source to the replicas. Files
+  deleted in the source stay in the replicas. The sync pods use the chart
+  `imagePullSecrets` too (controller flag `--sync-image-pull-secret`), and such
+  a secret must exist in the namespace of the DataReplicaSet. Each file is
+  copied to a temporary file `.kdc-<32 hex digits>` next to it first. If the
+  sync pod is killed during a copy, that temporary file stays in the replica.
 
 ## Development
 
@@ -377,6 +401,9 @@ helm lint charts/kubedal
 
 `tests/s3_minio.rs` runs against a real S3 compatible server when
 `KUBEDAL_TEST_S3_ENDPOINT` is set. See the comment at the top of the file.
+`tests/gcs_azblob.rs` does the same for Google Cloud Storage and Azure Blob
+Storage emulators, when `KUBEDAL_TEST_GCS_ENDPOINT` or
+`KUBEDAL_TEST_AZBLOB_ENDPOINT` is set.
 
 kubedal builds fuse3 from the fork <https://github.com/arunaengine/fuse3> (set in
 `[patch.crates-io]` in `Cargo.toml`). fuse3 0.9.0 gives an inode number to a new

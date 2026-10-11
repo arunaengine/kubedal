@@ -50,22 +50,24 @@ fn unescape(value: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-/// Read the current mount table. Returns an empty list if it cannot be read.
-pub fn read_mounts() -> Vec<MountEntry> {
-    match std::fs::read_to_string("/proc/self/mountinfo") {
-        Ok(content) => parse_mountinfo(&content),
-        Err(err) => {
-            tracing::warn!("cannot read /proc/self/mountinfo: {err}");
-            Vec::new()
-        }
-    }
+/// Read the current mount table. A failed read is an error, never an empty
+/// table, so a mount is never taken as gone when it cannot be checked.
+pub fn read_mounts() -> std::io::Result<Vec<MountEntry>> {
+    read_mounts_from(Path::new("/proc/self/mountinfo"))
+}
+
+/// Read a mount table in the `mountinfo` format from `path`.
+pub fn read_mounts_from(path: &Path) -> std::io::Result<Vec<MountEntry>> {
+    std::fs::read_to_string(path)
+        .map(|content| parse_mountinfo(&content))
+        .map_err(|e| std::io::Error::new(e.kind(), format!("read {}: {e}", path.display())))
 }
 
 /// Find the mount entry for exactly this path, if it is a mount point.
 ///
 /// If a path is mounted several times, the last (top) entry is returned.
-pub fn find_mount(path: &Path) -> Option<MountEntry> {
-    find_mount_in(&read_mounts(), path)
+pub fn find_mount(path: &Path) -> std::io::Result<Option<MountEntry>> {
+    Ok(find_mount_in(&read_mounts()?, path))
 }
 
 /// Same as [`find_mount`], but on a given mount table.
@@ -74,8 +76,8 @@ pub fn find_mount_in(mounts: &[MountEntry], path: &Path) -> Option<MountEntry> {
 }
 
 /// Returns true if the path is a mount point.
-pub fn is_mount_point(path: &Path) -> bool {
-    find_mount(path).is_some()
+pub fn is_mount_point(path: &Path) -> std::io::Result<bool> {
+    Ok(find_mount(path)?.is_some())
 }
 
 #[cfg(test)]
@@ -105,6 +107,15 @@ broken line
         let target = Path::new("/var/lib/kubelet/pods/abc/volumes/kubernetes.io~csi/data/mount");
         assert!(find_mount_in(&mounts, target).is_some());
         assert!(find_mount_in(&mounts, Path::new("/var/lib/kubelet")).is_none());
+    }
+
+    #[test]
+    fn a_mount_table_that_cannot_be_read_is_an_error() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(read_mounts_from(&dir.path().join("missing")).is_err());
+        let file = dir.path().join("mountinfo");
+        std::fs::write(&file, SAMPLE).unwrap();
+        assert_eq!(read_mounts_from(&file).unwrap().len(), 3);
     }
 
     #[test]

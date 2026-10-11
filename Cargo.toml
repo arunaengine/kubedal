@@ -1,6 +1,6 @@
 [package]
 name = "kubedal"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2024"
 rust-version = "1.88"
 
@@ -53,4 +53,4 @@ path = "src/crdgen.rs"
 # fuse3 0.9.0 reuses an inode number while an unlinked file is still open. The
 # fork keeps a number until the kernel forgets the inode. See the README.
 [patch.crates-io]
-fuse3 = { git = "https://github.com/arunaengine/fuse3", rev = "fd12cfce29a108323b82905c1a129b7b1f87151d" }
+fuse3 = { git = "https://github.com/arunaengine/fuse3", rev = "8044dbe620df2a099d708745ddc702e7f62856b4" }

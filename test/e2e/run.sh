@@ -2,7 +2,7 @@
 # End-to-end test of kubedal on a kind cluster with an S3 compatible server.
 #
 # Covers persistent and inline volumes, cache and FUSE mounts, read-only and
-# read-write access, and a file-list volume with upload.
+# read-write access, a file-list volume with upload, and a DataReplicaSet.
 #
 # Needs: docker, kind, kubectl, helm.
 # Environment:
@@ -262,6 +262,11 @@ test "$(cat <&8)" = new
 test "$(stat -L -c %i /proc/self/fd/6)" != "$(stat -L -c %i /proc/self/fd/8)"
 exec 4>&- 6<&- 7>&- 8<&-
 test ! -e keep.txt
+# A file that is open for writing shows up in the listing.
+exec 3>listed.txt
+printf x >&3
+ls /vol | grep -qx listed.txt
+exec 3>&-
 echo ok' | run_pod fuse-ops || true
 delete_pod fuse-ops || true
 expect_object results/fuse-ops/two.txt xAB
@@ -344,6 +349,77 @@ spec:
         claimName: data
 EOF
 delete_pod persistent || true
+
+log "DataReplicaSet copies its source to a replica"
+kubectl apply -f - <<EOF
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataNode
+metadata:
+  name: replica-store
+  namespace: $NS
+spec:
+  backend: S3
+  read_only: false
+  secretRef:
+    name: s3-credentials
+  config:
+    bucket: e2e
+    endpoint: http://s3.e2e.svc:9000
+    region: us-east-1
+    root: /replicas
+---
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataPod
+metadata:
+  name: drs-source
+  namespace: $NS
+spec:
+  path: /data
+  dataNodeRef:
+    name: store
+---
+apiVersion: kubedal.arunaengine.org/v1alpha1
+kind: DataReplicaSet
+metadata:
+  name: drs
+  namespace: $NS
+spec:
+  replicas: 1
+  selector:
+    matchLabels:
+      replica-of: drs-source
+  sourceDataPodRef:
+    name: drs-source
+  template:
+    metadata:
+      labels:
+        replica-of: drs-source
+    spec: {}
+EOF
+replicated=""
+for _ in $(seq 1 30); do
+  replica_path=$(kubectl -n "$NS" get datapods -l replica-of=drs-source \
+    -o jsonpath='{.items[0].spec.path}' 2>/dev/null || true)
+  if [[ -n $replica_path ]]; then
+    name="drs-check-$RANDOM"
+    # The copy may still be running, so a failed try is not a failure yet.
+    inline_pod "$name" "dataNode: store
+path: replicas$replica_path
+mount: cache-read-only" 'test "$(cat /vol/hello.txt)" = hello
+test "$(cat /vol/sub/world.txt)" = world
+echo replicated' | FAIL_FILE=/dev/null run_pod "$name" >/dev/null 2>&1 && replicated=yes
+    delete_pod "$name" || true
+    [[ $replicated == yes ]] && break
+  fi
+  sleep 5
+done
+if [[ $replicated == yes ]]; then
+  echo "  the replica holds the source files"
+else
+  kubectl -n "$NS" logs drs-sync --tail=50 || true
+  fail "DataReplicaSet did not copy its source to the replica"
+fi
+kubectl -n "$NS" delete datareplicaset drs --wait=false >/dev/null || true
 
 log "a pod in another namespace may not use the DataNode"
 kubectl create namespace e2e-other --dry-run=client -o yaml | kubectl apply -f - >/dev/null

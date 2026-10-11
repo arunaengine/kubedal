@@ -43,6 +43,11 @@ jobs:
           RUSTFS_SECRET_KEY: minioadmin
         ports:
           - 9000:9000
+      # Azure Blob Storage emulator for tests/gcs_azblob.rs.
+      azurite:
+        image: mcr.microsoft.com/azure-storage/azurite:latest
+        ports:
+          - 10000:10000
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -56,9 +61,25 @@ jobs:
             sleep 2
           done
           exit 1
+      # A service cannot pass arguments to its image, and fake-gcs-server
+      # needs them.
+      - name: Start the GCS emulator and create the test bucket
+        run: |
+          docker run -d -p 4443:4443 fsouza/fake-gcs-server:1.56.1 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443
+          for i in $(seq 1 30); do
+            curl -sf -X POST -H 'Content-Type: application/json' -d '{"name": "kubedal-test"}' \
+              http://127.0.0.1:4443/storage/v1/b && exit 0
+            sleep 2
+          done
+          exit 1
+      - name: Create test container
+        run: python3 test/azurite_container.py
       - run: cargo test --all-targets --locked
         env:
           KUBEDAL_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+          KUBEDAL_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+          KUBEDAL_TEST_AZBLOB_ENDPOINT: http://127.0.0.1:10000/devstoreaccount1
 
   helm:
     runs-on: ubuntu-latest

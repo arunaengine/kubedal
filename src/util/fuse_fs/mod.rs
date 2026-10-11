@@ -118,6 +118,10 @@ pub struct Filesystem {
     /// Read-only handles without a state, by the key they opened. They read the
     /// object in storage, so they need a copy before that name goes away.
     readers: std::sync::Mutex<HashMap<String, Vec<usize>>>,
+    /// Number of the next open folder handle.
+    next_dir_handle: std::sync::atomic::AtomicU64,
+    /// Listings of open folder handles, see [`Filesystem::dir_snapshot`].
+    dir_snapshots: std::sync::Mutex<dir::DirSnapshots>,
 }
 
 impl Filesystem {
@@ -220,7 +224,13 @@ impl Filesystem {
             states,
             opened_files: Slab::new(),
             readers: Default::default(),
+            next_dir_handle: std::sync::atomic::AtomicU64::new(1),
+            dir_snapshots: std::sync::Mutex::new(dir::DirSnapshots::new(dir::MAX_SNAPSHOT_NAMES)),
         }
+    }
+
+    fn dir_snapshots(&self) -> std::sync::MutexGuard<'_, dir::DirSnapshots> {
+        self.dir_snapshots.lock().unwrap_or_else(|p| p.into_inner())
     }
 
     fn readers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<usize>>> {

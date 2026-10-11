@@ -1212,6 +1212,16 @@ impl States {
             // A storage rename that applied despite the error left no source.
             Err(err) => match self.object_gone(op, from).await {
                 Ok(true) => false,
+                // A copy may have applied with a lost reply, also while the
+                // source is still there. The destination is unknown: keep the
+                // tombstone, so the old destination never uploads, and stop.
+                Ok(false) if !op.info().capability().rename => {
+                    mark_broken(
+                        &self.broken,
+                        &format!("copying {from} to {to} failed with an unclear result"),
+                    );
+                    return Err(on_status(broken_status()));
+                }
                 Ok(false) => {
                     self.undo_tombstone(&mut data, &tomb).map_err(&on_status)?;
                     return Err(err);
@@ -1771,6 +1781,34 @@ mod tests {
             assert_eq!(b.as_deref(), Some(expected.1), "{point}");
             assert_eq!(spool_files(&spool), 0, "{point}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_copy_with_an_unclear_result_keeps_the_old_destination_from_uploading() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        assert!(!op.info().capability().rename);
+        op.write("a", "SOURCE").await.unwrap();
+        let states = states(dir.path());
+        let b = states.open_write(&op, "b", false).await.unwrap();
+        b.lock().await.write_at(b"OLD DEST", 0).unwrap();
+        let ns = states.lock_namespace().await;
+        // The copy applies, but its reply is lost.
+        let copy = || async {
+            op.write("b", "SOURCE").await.unwrap();
+            Err::<bool, _>(Status::unavailable("reply lost"))
+        };
+        let result = states.rename_closed(&ns, &op, "a", "b", copy, |s| s).await;
+        drop(ns);
+        assert!(result.is_err());
+        assert!(states.is_broken());
+        assert!(states.upload(&op, &b).await.is_err());
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
+        // The tombstone stays, so a replay drops the old destination too.
+        upload_pending(&op, dir.path(), &SpoolBudget::new(u64::MAX))
+            .await
+            .unwrap();
+        assert_eq!(op.read("b").await.unwrap().to_vec(), b"SOURCE");
     }
 
     #[tokio::test]

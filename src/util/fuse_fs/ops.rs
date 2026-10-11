@@ -213,7 +213,17 @@ impl PathFilesystem for Filesystem {
         if self.states.has_live_under(&ns, &prefix).await {
             return Err(Errno::from(libc::ENOTEMPTY));
         }
-        self.op.delete(&key).await.map_err(opendal_error2errno)?;
+        // mkdir writes the folder marker "dir/"; that is what goes. A folder
+        // that still lists children in storage is not empty.
+        let dir = dir_key_of(path.as_os_str())?;
+        let mut lister = self.op.lister(&dir).await.map_err(opendal_error2errno)?;
+        while let Some(entry) = lister.next().await {
+            let entry = entry.map_err(opendal_error2errno)?;
+            if entry.path() != dir {
+                return Err(Errno::from(libc::ENOTEMPTY));
+            }
+        }
+        self.op.delete(&dir).await.map_err(opendal_error2errno)?;
 
         Ok(())
     }

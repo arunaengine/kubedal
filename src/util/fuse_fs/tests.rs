@@ -1371,3 +1371,20 @@ async fn link_counts_are_one_for_files_two_for_folders_and_zero_after_unlink() {
     let attr = fs.getattr(req(), None, Some(fh), 0).await.unwrap().attr;
     assert_eq!(attr.nlink, 0);
 }
+
+#[tokio::test]
+async fn rmdir_removes_the_folder_marker_and_refuses_folders_with_children() {
+    let fs = fs_with("other", "").await;
+    let root = OsStr::new("/");
+    fs.mkdir(req(), root, OsStr::new("d"), 0o755, 0)
+        .await
+        .unwrap();
+    assert!(fs.op.exists("d/").await.unwrap());
+    fs.op.write("d/f", "child").await.unwrap();
+    let full = fs.rmdir(req(), root, OsStr::new("d")).await;
+    assert_eq!(full.unwrap_err(), Errno::from(libc::ENOTEMPTY));
+    assert_eq!(fs.op.read("d/f").await.unwrap().to_vec(), b"child");
+    fs.op.delete("d/f").await.unwrap();
+    fs.rmdir(req(), root, OsStr::new("d")).await.unwrap();
+    assert!(!fs.op.exists("d/").await.unwrap());
+}

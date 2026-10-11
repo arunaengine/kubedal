@@ -276,3 +276,36 @@ async fn fuse_reader_does_not_see_a_replaced_object() {
     assert_eq!(err, fuse3::Errno::from(libc::ESTALE));
     op.delete_with("").recursive(true).await.unwrap();
 }
+
+#[tokio::test]
+async fn fuse_rmdir_removes_the_folder_marker() {
+    use fuse3::path::prelude::*;
+    use kubedal::util::fuse_fs::Filesystem;
+    use std::ffi::OsStr;
+    let Some(cfg) = s3_config() else {
+        eprintln!("KUBEDAL_TEST_S3_ENDPOINT is not set, skipping");
+        return;
+    };
+    check_bucket(&cfg).await;
+    let op = build_operator(&Backend::S3, cfg, "").unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fs = Filesystem::new(op.clone(), 0, 0, dir.path().join("spool"));
+    let req = || Request {
+        unique: 1,
+        uid: 0,
+        gid: 0,
+        pid: 0,
+    };
+    let root = OsStr::new("/");
+    fs.mkdir(req(), root, OsStr::new("d"), 0o755, 0)
+        .await
+        .unwrap();
+    assert!(op.exists("d/").await.unwrap());
+    op.write("d/f", "child").await.unwrap();
+    let full = fs.rmdir(req(), root, OsStr::new("d")).await;
+    assert_eq!(full.unwrap_err(), libc::ENOTEMPTY.into());
+    op.delete("d/f").await.unwrap();
+    fs.rmdir(req(), root, OsStr::new("d")).await.unwrap();
+    assert!(!op.exists("d/").await.unwrap());
+    assert!(op.list("d/").await.unwrap().is_empty());
+}

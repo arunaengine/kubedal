@@ -176,7 +176,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .unwrap_or(DEFAULT_CONTENT_CACHE_BYTES);
         let manager = VolumeManager::new(&data_dir, cluster, mounter)?
             .with_content_cache_limit(cache_size)
-            .with_spool_budget(spool_budget);
+            .with_spool_budget(spool_budget)?;
         tracing::info!("Data directory: {}", data_dir.display());
         // Clean up what a previous run of the plugin left behind.
         let report = manager.reconcile().await?;

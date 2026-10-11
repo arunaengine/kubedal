@@ -255,7 +255,8 @@ async fn spool_files_on_disk_are_charged_at_startup() {
         env.mounter.clone(),
     )
     .unwrap()
-    .with_spool_budget(budget.clone());
+    .with_spool_budget(budget.clone())
+    .unwrap();
     assert_eq!(budget.used(), 3);
     // The replay on unpublish gives the space back.
     env.manager.unpublish("vol-1", &target).await.unwrap();

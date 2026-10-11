@@ -59,6 +59,7 @@ spec:
             - --driver-name={{ .Values.driverName }}
             - --node-id=controller
             - --storage-class={{ .Values.storageClass.name }}
+            - --sync-image={{ include "kubedal.image" . }}
           env:
             - name: RUST_LOG
               value: {{ .Values.logLevel | quote }}

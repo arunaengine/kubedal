@@ -1,0 +1,153 @@
+//! The `kubedal replicate` command, run in the sync pod of a DataReplicaSet.
+//!
+//! The controller mounts the source PVC and the replica PVCs into the sync pod
+//! and sets these environment variables:
+//!
+//! - `source`: folder of the source mount
+//! - `replicas`: folders of the replica mounts, separated by `;`
+//! - `sleep_duration`: seconds to wait between two passes
+//!
+//! Each pass copies new and changed files from the source to every replica.
+//! Files deleted in the source are not deleted in the replicas.
+
+use std::collections::HashMap;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, SystemTime};
+
+/// What the source file looked like when it was last copied to a replica.
+type Copied = HashMap<PathBuf, (u64, Option<SystemTime>)>;
+
+/// Read the environment and copy the source to the replicas until the process
+/// is stopped.
+pub fn run_from_env() -> Result<(), String> {
+    let var = |name: &str| std::env::var(name).map_err(|e| format!("variable {name}: {e}"));
+    let source = PathBuf::from(var("source")?);
+    let replicas: Vec<PathBuf> = var("replicas")?
+        .split(';')
+        .filter(|p| !p.is_empty())
+        .map(PathBuf::from)
+        .collect();
+    let sleep = var("sleep_duration")?
+        .parse::<u64>()
+        .map_err(|e| format!("variable sleep_duration: {e}"))?;
+    tracing::info!("replicating {} to {replicas:?}", source.display());
+    let mut copied: Vec<Copied> = vec![Copied::new(); replicas.len()];
+    loop {
+        for (replica, copied) in replicas.iter().zip(copied.iter_mut()) {
+            sync_once(&source, replica, copied);
+        }
+        std::thread::sleep(Duration::from_secs(sleep));
+    }
+}
+
+/// Copy new and changed files from `source` to `replica` once. Errors are
+/// logged, and the file is tried again in the next pass.
+///
+/// A file is copied when it is missing in the replica, has another size there,
+/// or changed in the source since the last copy of this process.
+pub fn sync_once(source: &Path, replica: &Path, copied: &mut Copied) {
+    let mut folders = vec![PathBuf::new()];
+    while let Some(relative) = folders.pop() {
+        let entries = match std::fs::read_dir(source.join(&relative)) {
+            Ok(entries) => entries,
+            Err(err) => {
+                tracing::warn!("cannot list {}: {err}", source.join(&relative).display());
+                continue;
+            }
+        };
+        for entry in entries {
+            let entry = match entry {
+                Ok(entry) => entry,
+                Err(err) => {
+                    tracing::warn!("cannot list {}: {err}", source.join(&relative).display());
+                    continue;
+                }
+            };
+            let path = relative.join(entry.file_name());
+            if let Err(err) = sync_entry(source, replica, &path, copied, &mut folders) {
+                tracing::warn!("cannot copy {}: {err}", path.display());
+            }
+        }
+    }
+}
+
+fn sync_entry(
+    source: &Path,
+    replica: &Path,
+    path: &Path,
+    copied: &mut Copied,
+    folders: &mut Vec<PathBuf>,
+) -> std::io::Result<()> {
+    let meta = std::fs::metadata(source.join(path))?;
+    let target = replica.join(path);
+    if meta.is_dir() {
+        std::fs::create_dir_all(&target)?;
+        folders.push(path.to_path_buf());
+        return Ok(());
+    }
+    if !meta.is_file() {
+        return Ok(());
+    }
+    let seen = (meta.len(), meta.modified().ok());
+    let same_size = std::fs::metadata(&target).is_ok_and(|t| t.len() == meta.len());
+    // Without a record (first pass), a file of the same size counts as copied.
+    let changed = copied.get(path).is_some_and(|last| *last != seen);
+    if !same_size || changed {
+        tracing::info!("copy {}", path.display());
+        std::fs::copy(source.join(path), &target)?;
+    }
+    copied.insert(path.to_path_buf(), seen);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn new_and_changed_files_are_copied() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(source.join("a/b")).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(source.join("top.txt"), "one").unwrap();
+        std::fs::write(source.join("a/b/deep.txt"), "deep").unwrap();
+        let mut copied = Copied::new();
+
+        sync_once(&source, &replica, &mut copied);
+        assert_eq!(std::fs::read(replica.join("top.txt")).unwrap(), b"one");
+        assert_eq!(
+            std::fs::read(replica.join("a/b/deep.txt")).unwrap(),
+            b"deep"
+        );
+
+        // Same size, but a new modification time: copied again.
+        std::fs::write(source.join("top.txt"), "two").unwrap();
+        let later = SystemTime::now() + Duration::from_secs(10);
+        std::fs::File::options()
+            .write(true)
+            .open(source.join("top.txt"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+        sync_once(&source, &replica, &mut copied);
+        assert_eq!(std::fs::read(replica.join("top.txt")).unwrap(), b"two");
+
+        // Files deleted in the source stay in the replica.
+        std::fs::remove_file(source.join("a/b/deep.txt")).unwrap();
+        sync_once(&source, &replica, &mut copied);
+        assert!(replica.join("a/b/deep.txt").exists());
+    }
+
+    #[test]
+    fn a_file_of_another_size_is_replaced_on_the_first_pass() {
+        let dir = tempfile::tempdir().unwrap();
+        let (source, replica) = (dir.path().join("source"), dir.path().join("replica"));
+        std::fs::create_dir_all(&source).unwrap();
+        std::fs::create_dir_all(&replica).unwrap();
+        std::fs::write(source.join("f"), "new content").unwrap();
+        std::fs::write(replica.join("f"), "old").unwrap();
+        sync_once(&source, &replica, &mut Copied::new());
+        assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"new content");
+    }
+}

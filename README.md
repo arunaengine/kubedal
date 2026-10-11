@@ -363,7 +363,10 @@ the cache. The least recently used files are removed when the cache grows over
   compatible backends do.
 - The DataNode `limit` applies per volume. It is not checked for FUSE volumes.
 - The HTTP backend cannot list, so it only works for paths to single files.
-- `DataReplicaSet` is experimental. It starts its own sync pods with a fixed image.
+- `DataReplicaSet` is experimental. Its sync pod runs `kubedal replicate` from the
+  kubedal image (the controller flag `--sync-image`, set by the chart). Every
+  second it copies new and changed files from the source to the replicas. Files
+  deleted in the source stay in the replicas.
 
 ## Development
 

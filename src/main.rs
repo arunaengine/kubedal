@@ -87,7 +87,25 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                 .default_value("kubedal")
                 .value_parser(clap::value_parser!(String)),
         )
+        .arg(
+            Arg::new("sync-image")
+                .long("sync-image")
+                .help("Image of the DataReplicaSet sync pods")
+                .default_value(concat!(
+                    "ghcr.io/arunaengine/kubedal:",
+                    env!("CARGO_PKG_VERSION")
+                ))
+                .value_parser(clap::value_parser!(String)),
+        )
+        .subcommand(
+            Command::new("replicate")
+                .about("Copy a DataReplicaSet source to its replicas (runs in the sync pod)"),
+        )
         .get_matches();
+
+    if matches.subcommand_matches("replicate").is_some() {
+        return kubedal::replicate::run_from_env().map_err(Into::into);
+    }
 
     // Both arguments have default values, so they are always present.
     let endpoint = matches
@@ -155,7 +173,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .get_one::<String>("storage-class")
             .cloned()
             .unwrap_or_default();
-        let controller_service = ControllerService::new(client.clone(), storage_class).await;
+        let sync_image = matches
+            .get_one::<String>("sync-image")
+            .cloned()
+            .unwrap_or_default();
+        let controller_service =
+            ControllerService::new(client.clone(), storage_class, sync_image).await;
         builder.add_service(ControllerServer::new(controller_service))
     } else {
         // Is a csi driver noder

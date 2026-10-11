@@ -168,8 +168,13 @@ impl DataReplicaSet {
         }
         // The replacements count as synced once the sync pod runs with exactly
         // the current replicas.
+        // The image is part of the hash, so a new image replaces the sync pod.
         let members = members_hash(
-            &member_id(&source_data_pod, &pvc_name(self, &source_data_pod)),
+            &format!(
+                "{}|{}",
+                ctx.sync_image,
+                member_id(&source_data_pod, &pvc_name(self, &source_data_pod))
+            ),
             replicas.iter().map(|dp| member_id(dp, &pvc_name(self, dp))),
         );
         let synced = pod_api
@@ -233,7 +238,11 @@ impl DataReplicaSet {
         // Make sure the sync pod exists and mounts exactly the current PVCs.
         //TODO: Interval poll source mount for changes and sync to replica mounts
         let members = members_hash(
-            &member_id(&source_data_pod, &source_pvc.name_any()),
+            &format!(
+                "{}|{}",
+                ctx.sync_image,
+                member_id(&source_data_pod, &source_pvc.name_any())
+            ),
             replica_resources
                 .iter()
                 .map(|(dp, pvc)| member_id(dp, &pvc.name_any())),
@@ -252,7 +261,7 @@ impl DataReplicaSet {
             None => {
                 let pod = create_replica_pod(
                     self,
-                    &source_data_pod,
+                    &ctx.sync_image,
                     &source_pvc,
                     replica_resources,
                     &members,
@@ -443,7 +452,7 @@ async fn ensure_replica_pvc(
 
 async fn create_replica_pod(
     data_replica_set: &DataReplicaSet,
-    source_data_pod: &DataPod,
+    image: &str,
     source_pvc: &PersistentVolumeClaim,
     replica_resources: Vec<(DataPod, PersistentVolumeClaim)>,
     members: &str,
@@ -456,14 +465,9 @@ async fn create_replica_pod(
         ))
     })?;
 
-    let source_pod_path = source_data_pod.spec.path.clone().ok_or_else(|| {
-        Error::ReconcilerError(format!(
-            "Source DataPod {} is missing path.",
-            source_data_pod.name_any()
-        ))
-    })?;
-
-    // Add source volume
+    // Fixed mount paths: a DataPod path like `/` or `/usr` must not hide the
+    // files of the sync image.
+    let source_mount = "/sync/source".to_string();
     let src_pvcsc = PersistentVolumeClaimVolumeSource {
         claim_name: source_pvc.name_any(),
         read_only: Some(true),
@@ -475,19 +479,13 @@ async fn create_replica_pod(
     }];
     let mut volume_mounts: Vec<VolumeMount> = vec![VolumeMount {
         name: "source".to_string(),
-        mount_path: source_pod_path.clone(),
+        mount_path: source_mount.clone(),
         ..Default::default()
     }];
 
     let mut replica_paths = vec![];
-    for (i, (replica_pod, replica_pvc)) in replica_resources.iter().enumerate() {
-        let replica_path = replica_pod.spec.path.clone().ok_or_else(|| {
-            Error::ReconcilerError(format!(
-                "Replica DataPod {} is missing path.",
-                source_data_pod.name_any()
-            ))
-        })?;
-
+    for (i, (_, replica_pvc)) in replica_resources.iter().enumerate() {
+        let replica_path = format!("/sync/replica-{i}");
         let replica_pvcsc = PersistentVolumeClaimVolumeSource {
             claim_name: replica_pvc.name_any(),
             read_only: Some(false),
@@ -506,14 +504,16 @@ async fn create_replica_pod(
         replica_paths.push(replica_path);
     }
 
+    // The kubedal image itself copies the data (`kubedal replicate`).
     let container = Container {
         name: "sync-replica".to_string(),
-        image: Some("harbor.computational.bio.uni-giessen.de/aruna/kd-replicator".to_string()),
-        image_pull_policy: Some("Always".to_string()),
+        image: Some(image.to_string()),
+        image_pull_policy: Some("IfNotPresent".to_string()),
+        args: Some(vec!["replicate".to_string()]),
         env: Some(vec![
             EnvVar {
                 name: "source".to_string(),
-                value: Some(source_pod_path),
+                value: Some(source_mount),
                 value_from: None,
             },
             EnvVar {
@@ -612,7 +612,7 @@ fn sync_pod_is_running(pod: &Pod, members: &str) -> bool {
     phase == Some("Running") && sync_pod_is_current(pod, members)
 }
 
-/// Annotation on the sync pod with a hash of the PVCs it mounts.
+/// Annotation on the sync pod with a hash of its image and the PVCs it mounts.
 const MEMBERS_ANNOTATION: &str = "kubedal.arunaengine.org/replica-members";
 
 /// Hash of the source PVC and the sorted replica PVC names.
@@ -1043,9 +1043,10 @@ mod tests {
     /// The chart passes its StorageClass name, so DataReplicaSet PVCs use the
     /// class the chart created.
     #[test]
-    fn the_chart_passes_its_storage_class_to_the_controller() {
+    fn the_chart_passes_its_storage_class_and_sync_image_to_the_controller() {
         let controller = include_str!("../../charts/kubedal/templates/controller.yaml");
         assert!(controller.contains("- --storage-class={{ .Values.storageClass.name }}"));
+        assert!(controller.contains("- --sync-image={{ include \"kubedal.image\" . }}"));
     }
 
     #[test]

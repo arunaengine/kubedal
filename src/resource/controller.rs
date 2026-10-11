@@ -20,6 +20,8 @@ pub struct Context {
     pub recorder: Recorder,
     /// StorageClass of the PVCs that DataReplicaSets create
     pub storage_class: String,
+    /// Image of the DataReplicaSet sync pods
+    pub sync_image: String,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -44,7 +46,7 @@ pub enum Error {
 }
 
 /// Initialize the controller and shared state (given the crd is installed)
-pub async fn run(client: Client, storage_class: String) {
+pub async fn run(client: Client, storage_class: String, sync_image: String) {
     let data_node_api = Api::<DataNode>::all(client.clone());
     if let Err(e) = data_node_api.list(&ListParams::default().limit(1)).await {
         error!("CRD DataNode is not queryable; {e:?}. Is the CRD installed?");
@@ -70,6 +72,7 @@ pub async fn run(client: Client, storage_class: String) {
         client: client.clone(),
         recorder: Recorder::new(client.clone(), "kubedal.arunaengine.org".into()),
         storage_class,
+        sync_image,
     });
 
     let data_node_controller = Controller::new(data_node_api, Config::default().any_semantic())

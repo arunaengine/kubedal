@@ -131,6 +131,17 @@ pub const MAX_PATH_BYTES: usize = 4096;
 /// Most parts (folders and file name) in a manifest path.
 pub const MAX_PATH_PARTS: usize = 256;
 
+/// A file source is a storage key: it must reach exactly the object it names.
+fn check_source(value: &str) -> Result<String, Status> {
+    let source = check_path("file source", value)?;
+    if !crate::util::opendal::is_exact_key(&source) {
+        return Err(invalid(format!(
+            "file source {source:?} would read another object (white space at the ends)"
+        )));
+    }
+    Ok(source)
+}
+
 fn check_path(what: &str, value: &str) -> Result<String, Status> {
     if value.len() > MAX_PATH_BYTES {
         return Err(invalid(format!(
@@ -222,7 +233,7 @@ pub fn plan(manifest: Manifest) -> Result<FilePlan, Status> {
     for file in manifest.files {
         files.push(PlannedFile {
             path: check_path("file path", &file.path)?,
-            source: check_path("file source", file.source.trim_start_matches('/'))?,
+            source: check_source(file.source.trim_start_matches('/'))?,
             sha256: file.sha256.as_deref().map(check_digest).transpose()?,
             size: file.size,
             executable: file.executable,
@@ -303,6 +314,23 @@ mod tests {
 
     fn parse_str(s: &str) -> Result<FilePlan, Status> {
         parse(s.as_bytes())
+    }
+
+    #[test]
+    fn sources_that_storage_would_change_are_refused() {
+        for source in ["x ", "dir/x\u{2003}"] {
+            let manifest =
+                serde_json::json!({"version": 1, "files": [{"path": "x", "source": source}]});
+            let err = parse_str(&manifest.to_string()).unwrap_err();
+            assert!(
+                err.message().contains("another object"),
+                "{source:?}: {err:?}"
+            );
+        }
+        // A local name with inner white space is fine.
+        let manifest =
+            serde_json::json!({"version": 1, "files": [{"path": "a b", "source": "a b"}]});
+        assert!(parse_str(&manifest.to_string()).is_ok());
     }
 
     #[test]

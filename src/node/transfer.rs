@@ -101,6 +101,14 @@ fn path_status(err: PathError, key: &str) -> Status {
 pub async fn list_tree(op: &Operator, prefix: &str) -> Result<RemoteTree, Status> {
     let prefix = paths::normalize_prefix(prefix)
         .map_err(|e| Status::invalid_argument(format!("invalid path {prefix:?}: {e}")))?;
+    // The path is also read as a single object key; it must reach exactly
+    // that object.
+    let key = prefix.strip_suffix('/').unwrap_or_default();
+    if !crate::util::opendal::is_exact_key(key) {
+        return Err(Status::invalid_argument(format!(
+            "invalid path {key:?}: storage would read another object"
+        )));
+    }
 
     if let Some(key) = prefix.strip_suffix('/') {
         match op.stat(key).await {
@@ -235,6 +243,13 @@ pub async fn download_file(
     budget: &ByteBudget,
     hash: bool,
 ) -> Result<Downloaded, Status> {
+    // A key that storage changes (like "x " read as "x") would give the content
+    // of another object.
+    if !crate::util::opendal::is_exact_key(key) {
+        return Err(Status::invalid_argument(format!(
+            "object {key:?} cannot be read under its own name"
+        )));
+    }
     let mut stream = op
         .reader(key)
         .await
@@ -395,6 +410,25 @@ mod tests {
         // cut off: nothing is still writing into the folder.
         let size = std::fs::metadata(dir.path().join("big")).map(|m| m.len());
         assert_eq!(size.unwrap(), big.len() as u64);
+    }
+
+    #[tokio::test]
+    async fn keys_that_storage_would_change_are_not_read() {
+        let op = memory_with(&[("x", "content of x")]).await;
+        let dir = tempfile::tempdir().unwrap();
+        let err = list_tree(&op, "x ").await.unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        let err = download_file(
+            &op,
+            "x ",
+            &dir.path().join("x "),
+            &ByteBudget::default(),
+            false,
+        )
+        .await
+        .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::InvalidArgument);
+        assert!(!dir.path().join("x ").exists());
     }
 
     #[tokio::test]

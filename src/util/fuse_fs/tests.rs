@@ -1464,3 +1464,17 @@ async fn read_only_handles_keep_their_file_after_unlink_and_rename() {
     .await;
     assert_eq!((data.as_slice(), nlink), (&b"original"[..], 0));
 }
+
+#[tokio::test]
+async fn a_failed_preservation_keeps_the_reader_for_a_retry() {
+    let fs = fs_with("f", "original").await;
+    let fh = open(&fs, "/f", libc::O_RDONLY).await;
+    let root = OsStr::new("/");
+    fs.states.pause.fail_once("preserve_fails");
+    let failed = fs.unlink(req(), root, OsStr::new("f")).await;
+    assert_eq!(failed.unwrap_err(), Errno::from(libc::ENOSPC));
+    assert!(fs.op.exists("f").await.unwrap());
+    // the retry still finds the reader and gives it a copy
+    fs.unlink(req(), root, OsStr::new("f")).await.unwrap();
+    assert_eq!(read_all(&fs, "/f", fh).await, b"original");
+}

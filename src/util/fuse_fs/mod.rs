@@ -248,13 +248,18 @@ impl Filesystem {
     /// it keeps reading the content it opened. With `name_removed`, those
     /// handles have no links left (unlink, or replaced by a rename).
     async fn preserve_readers(&self, key: &str, name_removed: bool) -> Result<()> {
-        let Some(files) = self.readers().remove(key) else {
+        // The handles stay tracked until the copy is attached: after a failure
+        // a retry must find them again.
+        let Some(files) = self.readers().get(key).cloned() else {
             return Ok(());
         };
         let current = match self.op.stat(key).await {
             Ok(meta) => meta.etag().map(str::to_string),
             // Nothing left to copy; such handles fail as before.
-            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) if err.kind() == ErrorKind::NotFound => {
+                self.readers().remove(key);
+                return Ok(());
+            }
             Err(err) => return Err(opendal_error2errno(err)),
         };
         // A handle that saw another version gets ESTALE anyway.
@@ -267,13 +272,18 @@ impl Filesystem {
             })
             .collect();
         if files.is_empty() {
+            self.readers().remove(key);
             return Ok(());
+        }
+        if self.states.pause.should_fail("preserve_fails") {
+            return Err(Errno::from(libc::ENOSPC));
         }
         let copy = self
             .states
             .snapshot(&self.op, key)
             .await
             .map_err(status_errno)?;
+        self.readers().remove(key);
         for file in files {
             if let Some(handle) = self.opened_files.get(file) {
                 let _ = handle.snapshot.set(copy.clone());

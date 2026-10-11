@@ -595,7 +595,12 @@ fn broken_status() -> Status {
 
 /// Remove a spool data file and give its space back.
 fn remove_and_refund(path: &Path, budget: &SpoolBudget) -> std::io::Result<()> {
-    let size = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+    // A failed stat must not refund 0 and keep the space charged forever.
+    let size = match std::fs::metadata(path) {
+        Ok(meta) => meta.len(),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err),
+    };
     match std::fs::remove_file(path) {
         Ok(()) => {
             budget.release(size);

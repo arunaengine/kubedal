@@ -843,6 +843,50 @@ impl States {
         self.create(op, key, keep).await
     }
 
+    /// A private copy of the object `key` for read-only handles whose name is
+    /// about to be removed or replaced in storage. The copy is never mapped and
+    /// counts as unlinked, so it never journals or uploads. Its spool file is
+    /// removed from the folder at once: the open file keeps the content, and the
+    /// space goes back to the budget when the last handle drops the copy.
+    pub async fn snapshot(&self, op: &Operator, key: &str) -> Result<Arc<FileState>, Status> {
+        std::fs::create_dir_all(&self.dir).map_err(|e| io_status(e, "create spool folder"))?;
+        let name = uuid::Uuid::new_v4().simple().to_string();
+        let data_path = self.dir.join(format!("{name}.data"));
+        let file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&data_path)
+            .map_err(|e| io_status(e, "create spool file"))?;
+        let removed = std::fs::remove_file(&data_path);
+        let state = Arc::new(FileState {
+            id: self.next_id.fetch_add(1, Ordering::Relaxed),
+            unlinked: AtomicBool::new(true),
+            data: Mutex::new(StateData {
+                key: key.to_string(),
+                file,
+                meta_path: data_path.with_extension("json"),
+                data_path,
+                len: 0,
+                dirty: false,
+                handles: 0,
+                closed: false,
+                complete: false,
+                charged: 0,
+                data_removed: true,
+                #[cfg(test)]
+                fail_after: None,
+                budget: self.budget.clone(),
+                generations: self.generations.clone(),
+                broken: self.broken.clone(),
+                hooks: self.pause.clone(),
+            }),
+        });
+        removed.map_err(|e| io_status(e, "remove snapshot spool file"))?;
+        state.data.lock().await.fill_from(op).await?;
+        Ok(state)
+    }
+
     async fn create(&self, op: &Operator, key: &str, keep: bool) -> Result<Arc<FileState>, Status> {
         std::fs::create_dir_all(&self.dir).map_err(|e| io_status(e, "create spool folder"))?;
         let id = self.next_id.fetch_add(1, Ordering::Relaxed);
@@ -2287,6 +2331,23 @@ mod tests {
             result
         })
         .await;
+    }
+
+    #[tokio::test]
+    async fn a_snapshot_is_charged_until_its_last_holder_drops_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let op = Operator::new(Memory::default()).unwrap();
+        op.write("f", "content").await.unwrap();
+        let budget = Arc::new(SpoolBudget::new(u64::MAX));
+        let states = States::new(dir.path().to_path_buf(), budget.clone());
+        let copy = states.snapshot(&op, "f").await.unwrap();
+        assert_eq!(budget.used(), 7);
+        // nothing is left in the spool folder for a replay
+        assert_eq!(spool_files(dir.path()), 0);
+        assert_eq!(copy.lock().await.read_at(0, 100).unwrap(), b"content");
+        assert!(states.get("f").is_none());
+        drop(copy);
+        assert_eq!(budget.used(), 0);
     }
 
     #[tokio::test]

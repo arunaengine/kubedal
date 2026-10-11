@@ -70,11 +70,12 @@ impl PathFilesystem for Filesystem {
         // a rename or unlink of the name.
         let reader_attr = fh.and_then(|fh| {
             let f = self.opened_files.get(FileKey::try_from(fh).ok()?.0)?;
+            let removed = f.name_removed.load(std::sync::atomic::Ordering::SeqCst);
             (f.write.is_none() && f.read_state.is_none())
-                .then_some(f.size.map(|size| (size, f.mtime)))
+                .then_some(f.size.map(|size| (size, f.mtime, removed)))
                 .flatten()
         });
-        if let Some((size, mtime)) = reader_attr {
+        if let Some((size, mtime, removed)) = reader_attr {
             let now = SystemTime::now();
             let attr = dummy_file_attr(FileType::RegularFile, now, self.uid, self.gid);
             let mtime = mtime.unwrap_or(now);
@@ -84,6 +85,8 @@ impl PathFilesystem for Filesystem {
                     size,
                     mtime,
                     ctime: mtime,
+                    // a handle whose name was removed has no links left
+                    nlink: if removed { 0 } else { attr.nlink },
                     ..attr
                 },
             });
@@ -194,6 +197,9 @@ impl PathFilesystem for Filesystem {
         tracing::debug!("unlink(parent={parent:?}, name={name:?})");
 
         let path = PathBuf::from(parent).join(name);
+        // Read-only handles that read the object keep a copy of it.
+        self.preserve_readers(&key_of(path.as_os_str())?, true)
+            .await?;
         // Open handles keep their content, but it must never be uploaded again.
         self.unlink_state(path.as_os_str()).await?;
         Ok(())
@@ -249,6 +255,12 @@ impl PathFilesystem for Filesystem {
         // The namespace lock is held for the whole rename, also during storage
         // calls, so no other name change can come in between.
         let ns = self.states.lock_namespace().await;
+        // Read-only handles that read the source or the replaced target object
+        // keep a copy of what they opened.
+        if from != to {
+            self.preserve_readers(&from, false).await?;
+            self.preserve_readers(&to, true).await?;
+        }
         // A file with a spool holds its whole content, so the rename only moves
         // the spool to the new key and removes the old object.
         if self
@@ -318,7 +330,8 @@ impl PathFilesystem for Filesystem {
             None => self.live_state(path).await?,
             Some(_) => None,
         };
-        let (size, etag, mtime) = if write.is_none() && read_state.is_none() {
+        let stateless = write.is_none() && read_state.is_none();
+        let (size, etag, mtime) = if stateless {
             let meta = self
                 .op
                 .stat(&key_of(path)?)
@@ -344,8 +357,13 @@ impl PathFilesystem for Filesystem {
                 size,
                 etag,
                 mtime,
+                snapshot: Default::default(),
+                name_removed: Default::default(),
             })
             .ok_or(Errno::from(libc::EBUSY))?;
+        if stateless {
+            self.track_reader(&key_of(path)?, key);
+        }
 
         // Reply flags are FOPEN_* bits, not the O_* flags of the request (O_EXCL
         // would read as FOPEN_PASSTHROUGH, which the kernel refuses).
@@ -373,7 +391,10 @@ impl PathFilesystem for Filesystem {
             (
                 key_of(file.path.as_os_str())?,
                 file.size,
-                file.write.clone().or_else(|| file.read_state.clone()),
+                file.write
+                    .clone()
+                    .or_else(|| file.read_state.clone())
+                    .or_else(|| file.snapshot.get().cloned()),
                 file.etag.clone(),
             )
         };
@@ -472,10 +493,12 @@ impl PathFilesystem for Filesystem {
             "release(path={path:?}, fh={fh}, flags=0x{flags:x}, lock_owner={lock_owner}, flush={flush})"
         );
 
+        let file_key = FileKey::try_from(fh)?.0;
         let file = self
             .opened_files
-            .take(FileKey::try_from(fh)?.0)
+            .take(file_key)
             .ok_or(Errno::from(libc::EBADF))?;
+        self.untrack_reader(file_key);
 
         // Release comes once, after the last file descriptor is closed. Its result
         // does not reach the program, so this upload is only a last attempt.
@@ -571,6 +594,8 @@ impl PathFilesystem for Filesystem {
                 size: None,
                 etag: None,
                 mtime: None,
+                snapshot: Default::default(),
+                name_removed: Default::default(),
             })
             .ok_or(Errno::from(libc::EBUSY))?;
 

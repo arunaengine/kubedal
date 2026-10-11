@@ -44,6 +44,12 @@ pub struct OpenedFile {
     /// Size of the file when it was opened for reading. Reads are limited to it,
     /// because some backends fail when a range reaches past the end.
     pub size: Option<u64>,
+    /// Private copy of the content for a read-only handle without a state,
+    /// taken before its name was removed or replaced in storage.
+    pub snapshot: std::sync::OnceLock<Arc<FileState>>,
+    /// The name of a read-only handle without a state was removed (unlink, or
+    /// replaced by a rename): it has no links left.
+    pub name_removed: std::sync::atomic::AtomicBool,
 }
 
 /// File key is the key of opened file.

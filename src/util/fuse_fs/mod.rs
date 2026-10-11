@@ -23,6 +23,7 @@ pub mod states;
 #[cfg(test)]
 mod tests;
 
+use std::collections::HashMap;
 use std::ffi::OsStr;
 use std::num::NonZeroU32;
 use std::path::PathBuf;
@@ -114,6 +115,9 @@ pub struct Filesystem {
     workers: Arc<Workers>,
 
     opened_files: Slab<OpenedFile>,
+    /// Read-only handles without a state, by the key they opened. They read the
+    /// object in storage, so they need a copy before that name goes away.
+    readers: std::sync::Mutex<HashMap<String, Vec<usize>>>,
 }
 
 impl Filesystem {
@@ -215,7 +219,72 @@ impl Filesystem {
             spool_dir: spool_dir.clone(),
             states,
             opened_files: Slab::new(),
+            readers: Default::default(),
         }
+    }
+
+    fn readers(&self) -> std::sync::MutexGuard<'_, HashMap<String, Vec<usize>>> {
+        self.readers.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// Remember a read-only handle without a state that opened `key`.
+    fn track_reader(&self, key: &str, file: usize) {
+        self.readers()
+            .entry(key.to_string())
+            .or_default()
+            .push(file);
+    }
+
+    /// Forget a handle when it is released.
+    fn untrack_reader(&self, file: usize) {
+        self.readers().retain(|_, files| {
+            files.retain(|f| *f != file);
+            !files.is_empty()
+        });
+    }
+
+    /// Before the object `key` is removed or replaced in storage, give every
+    /// read-only handle without a state that still sees it a private copy, so
+    /// it keeps reading the content it opened. With `name_removed`, those
+    /// handles have no links left (unlink, or replaced by a rename).
+    async fn preserve_readers(&self, key: &str, name_removed: bool) -> Result<()> {
+        let Some(files) = self.readers().remove(key) else {
+            return Ok(());
+        };
+        let current = match self.op.stat(key).await {
+            Ok(meta) => meta.etag().map(str::to_string),
+            // Nothing left to copy; such handles fail as before.
+            Err(err) if err.kind() == ErrorKind::NotFound => return Ok(()),
+            Err(err) => return Err(opendal_error2errno(err)),
+        };
+        // A handle that saw another version gets ESTALE anyway.
+        let files: Vec<usize> = files
+            .into_iter()
+            .filter(|file| {
+                self.opened_files
+                    .get(*file)
+                    .is_some_and(|h| h.etag.is_none() || h.etag == current)
+            })
+            .collect();
+        if files.is_empty() {
+            return Ok(());
+        }
+        let copy = self
+            .states
+            .snapshot(&self.op, key)
+            .await
+            .map_err(status_errno)?;
+        for file in files {
+            if let Some(handle) = self.opened_files.get(file) {
+                let _ = handle.snapshot.set(copy.clone());
+                if name_removed {
+                    handle
+                        .name_removed
+                        .store(true, std::sync::atomic::Ordering::SeqCst);
+                }
+            }
+        }
+        Ok(())
     }
 
     /// Size of the spool content of `path`, if the file is being written.

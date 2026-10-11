@@ -1420,3 +1420,47 @@ async fn readdirplus_reports_the_live_size_like_getattr() {
     fs.setattr(req(), p, Some(fh), zero).await.unwrap();
     assert_eq!(listed_size().await, 0);
 }
+
+/// Open `f` read-only, run `change` on the file system, then read through the
+/// handle.
+async fn read_after(change: impl AsyncFnOnce(&Filesystem)) -> (Vec<u8>, u32) {
+    let fs = fs_with("f", "original").await;
+    fs.op.write("g", "other file").await.unwrap();
+    let fh = open(&fs, "/f", libc::O_RDONLY).await;
+    change(&fs).await;
+    let data = read_all(&fs, "/f", fh).await;
+    let nlink = fs
+        .getattr(req(), None, Some(fh), 0)
+        .await
+        .unwrap()
+        .attr
+        .nlink;
+    fs.release(req(), None, fh, 0, 0, false).await.unwrap();
+    (data, nlink)
+}
+
+#[tokio::test]
+async fn read_only_handles_keep_their_file_after_unlink_and_rename() {
+    let root = OsStr::new("/");
+    let (data, nlink) = read_after(async |fs| {
+        fs.unlink(req(), root, OsStr::new("f")).await.unwrap();
+    })
+    .await;
+    assert_eq!((data.as_slice(), nlink), (&b"original"[..], 0));
+
+    let (data, nlink) = read_after(async |fs| {
+        fs.rename(req(), root, OsStr::new("f"), root, OsStr::new("moved"))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!((data.as_slice(), nlink), (&b"original"[..], 1));
+
+    let (data, nlink) = read_after(async |fs| {
+        fs.rename(req(), root, OsStr::new("g"), root, OsStr::new("f"))
+            .await
+            .unwrap();
+    })
+    .await;
+    assert_eq!((data.as_slice(), nlink), (&b"original"[..], 0));
+}

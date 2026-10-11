@@ -98,10 +98,30 @@ fn sync_entry(
     };
     if !same_size || changed {
         tracing::info!("copy {}", path.display());
-        std::fs::copy(source.join(path), &target)?;
+        copy_file(&source.join(path), &target)?;
     }
     copied.insert(path.to_path_buf(), seen);
     Ok(())
+}
+
+/// Copy `from` to a temporary file next to `to`, then rename it over `to`.
+/// A copy that fails midway never replaces a good file; the temporary file is
+/// removed.
+fn copy_file(from: &Path, to: &Path) -> std::io::Result<()> {
+    let name = to.file_name().unwrap_or_default().to_string_lossy();
+    let temp = to.with_file_name(format!(".{name}.kubedal-copy"));
+    let result = (|| {
+        let mut input = std::fs::File::open(from)?;
+        let mut output = std::fs::File::create(&temp)?;
+        std::io::copy(&mut input, &mut output)?;
+        output.sync_all()?;
+        drop(output);
+        std::fs::rename(&temp, to)
+    })();
+    if result.is_err() {
+        let _ = std::fs::remove_file(&temp);
+    }
+    result
 }
 
 /// True if both files have the same bytes.
@@ -179,6 +199,18 @@ mod tests {
         sync_once(&source, &replica, &mut copied);
         assert_eq!(std::fs::read(replica.join("f")).unwrap(), b"two");
         assert!(copied.contains_key(Path::new("same")));
+    }
+
+    #[test]
+    fn a_copy_that_fails_midway_keeps_the_old_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("f");
+        std::fs::write(&target, "good").unwrap();
+        // Opening a folder works, but reading it fails.
+        assert!(copy_file(dir.path(), &target).is_err());
+        assert_eq!(std::fs::read(&target).unwrap(), b"good");
+        let names: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
+        assert_eq!(names.len(), 1);
     }
 
     #[test]

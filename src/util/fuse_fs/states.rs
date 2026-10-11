@@ -1460,7 +1460,9 @@ pub async fn upload_pending(
         .iter()
         .filter(|p| p.extension().is_some_and(|e| e == "data"))
     {
-        if !data_path.with_extension("json").exists() {
+        // Use the listing, not a new stat: a failed stat must not look like
+        // a missing journal and delete the only copy of pending data.
+        if !paths.contains(&data_path.with_extension("json")) {
             remove_and_refund(data_path, budget).map_err(cleanup)?;
         }
     }

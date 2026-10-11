@@ -350,7 +350,8 @@ kubedal builds fuse3 from the fork <https://github.com/arunaengine/fuse3> (set i
 `[patch.crates-io]` in `Cargo.toml`). fuse3 0.9.0 gives an inode number to a new
 file while an unlinked file with that number is still open, so the kernel mixes
 the two files (attributes and cached pages). The fork keeps a number until the
-kernel forgets the inode. The change is planned for upstream fuse3; once it is
+kernel forgets the inode. The change is proposed upstream in
+<https://github.com/Sherlock-Holo/fuse3/pull/139>; once it is
 released there, the patch entry goes away.
 
 After changing the CRD types, run `cargo run --bin crdgen` to regenerate

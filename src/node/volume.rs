@@ -478,13 +478,20 @@ impl VolumeManager {
     }
 
     async fn discard(&self, id: &str, target: &Path) -> Result<(), Status> {
-        // Never delete FUSE content that still waits for its upload.
-        if has_pending_spool(&self.spool_dir(id)) {
-            return Err(Status::failed_precondition(
-                "the volume has FUSE content that is not uploaded yet; it is kept",
-            ));
-        }
+        // Never delete FUSE content that still waits for its upload. A FUSE
+        // file system can still write a journal until it is unmounted, so the
+        // spool is checked again after the unmount.
+        let pending = || {
+            if has_pending_spool(&self.spool_dir(id))? {
+                return Err(Status::failed_precondition(
+                    "the volume has FUSE content that is not uploaded yet; it is kept",
+                ));
+            }
+            Ok(())
+        };
+        pending()?;
         self.mounter.unmount(target).await?;
+        pending()?;
         remove_dir_all(&self.volume_dir(id)).await?;
         self.state
             .remove(id)
@@ -620,13 +627,26 @@ fn existing_spool_bytes(volumes: &Path) -> u64 {
         .sum()
 }
 
-/// True if a spool folder holds content that may still need an upload.
-fn has_pending_spool(dir: &Path) -> bool {
-    std::fs::read_dir(dir).is_ok_and(|entries| {
-        entries
-            .filter_map(Result::ok)
-            .any(|e| e.path().extension().is_some_and(|x| x == "json"))
-    })
+/// True if a spool folder holds content that may still need an upload. A
+/// folder that cannot be read is an error, never "empty".
+fn has_pending_spool(dir: &Path) -> Result<bool, Status> {
+    let scan_error = |e: std::io::Error| io_status(e, &format!("scan {}", dir.display()));
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+        Err(err) => return Err(scan_error(err)),
+    };
+    for entry in entries {
+        if entry
+            .map_err(scan_error)?
+            .path()
+            .extension()
+            .is_some_and(|x| x == "json")
+        {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 async fn remove_dir_all(path: &Path) -> Result<(), Status> {
@@ -647,5 +667,44 @@ async fn remove_target_dir(path: &Path) -> Result<(), Status> {
             Ok(())
         }
         Err(err) => Err(io_status(err, "remove target path")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::node::testing::{FakeCluster, FakeMounter};
+
+    #[test]
+    fn an_unreadable_spool_is_an_error_not_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let spool = dir.path().join("spool");
+        assert!(!has_pending_spool(&spool).unwrap());
+        // a file where the folder should be cannot be scanned
+        std::fs::write(&spool, "").unwrap();
+        assert!(has_pending_spool(&spool).is_err());
+    }
+
+    #[tokio::test]
+    async fn discard_keeps_a_journal_written_until_the_unmount() {
+        let dir = tempfile::tempdir().unwrap();
+        let mounter = Arc::new(FakeMounter::default());
+        let manager = VolumeManager::new(
+            dir.path(),
+            Arc::new(FakeCluster::default()),
+            mounter.clone(),
+        )
+        .unwrap();
+        let spool = manager.spool_dir("vol");
+        std::fs::create_dir_all(&spool).unwrap();
+        let journal = spool.join("late.json");
+        mounter.on_next_unmount(move || std::fs::write(journal, "{}").unwrap());
+
+        let err = manager
+            .discard("vol", &dir.path().join("target"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), tonic::Code::FailedPrecondition);
+        assert!(spool.join("late.json").exists());
     }
 }

@@ -190,6 +190,9 @@ pub struct FakeMounter {
     mounts: Mutex<HashMap<PathBuf, FakeMount>>,
     /// Targets whose FUSE process "died", for example by a restart.
     dead_fuse: Mutex<Vec<PathBuf>>,
+    /// Runs once at the next unmount, like a FUSE process that still works
+    /// until it is unmounted.
+    unmount_hook: Mutex<Option<Box<dyn FnOnce() + Send>>>,
 }
 
 impl FakeMounter {
@@ -213,6 +216,11 @@ impl FakeMounter {
                 dead.push(target);
             }
         }
+    }
+
+    /// Run `hook` at the next unmount.
+    pub fn on_next_unmount(&self, hook: impl FnOnce() + Send + 'static) {
+        *self.unmount_hook.lock().unwrap_or_else(|p| p.into_inner()) = Some(Box::new(hook));
     }
 
     /// Forget all mounts, like after a node reboot.
@@ -264,6 +272,14 @@ impl Mounter for FakeMounter {
     }
 
     async fn unmount(&self, target: &Path) -> Result<(), Status> {
+        let hook = self
+            .unmount_hook
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .take();
+        if let Some(hook) = hook {
+            hook();
+        }
         self.mounts
             .lock()
             .unwrap_or_else(|p| p.into_inner())

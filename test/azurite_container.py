@@ -46,8 +46,8 @@ for attempt in range(30):
             print(f"container {container} exists")
             sys.exit(0)
         sys.exit(f"cannot create container {container}: {err.code} {err.read().decode()}")
-    except urllib.error.URLError as err:
+    except (urllib.error.URLError, ConnectionError) as err:
         # Azurite is not up yet.
-        print(f"waiting for Azurite: {err.reason}")
+        print(f"waiting for Azurite: {getattr(err, 'reason', err)}")
         time.sleep(2)
 sys.exit("Azurite did not start")

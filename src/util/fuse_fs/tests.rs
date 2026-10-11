@@ -1596,3 +1596,44 @@ async fn a_live_file_hides_a_stored_folder_with_the_same_name() {
     let names: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
     assert_eq!(names.iter().filter(|n| *n == "x").count(), 1);
 }
+
+#[tokio::test]
+async fn a_listing_goes_on_correctly_after_a_writer_is_closed() {
+    use futures::StreamExt;
+    let fs = fs_with("a", "1").await;
+    fs.op.write("b", "2").await.unwrap();
+    fs.op.write("c", "3").await.unwrap();
+    let root = OsStr::new("/");
+    let fh = open(&fs, "/a", libc::O_RDWR).await;
+    fs.write(req(), Some(OsStr::new("/a")), fh, 0, b"x", 0, 0)
+        .await
+        .unwrap();
+    let names = |entries: Vec<std::ffi::OsString>| -> Vec<String> {
+        entries
+            .into_iter()
+            .map(|n| n.into_string().unwrap())
+            .collect()
+    };
+    // The first page ends after "a" (offset 3) while "a" is live.
+    let reply = fs.readdir(req(), root, 0, 0).await.unwrap();
+    let first: Vec<_> = reply.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first.last().unwrap().offset, 3);
+    assert_eq!(first.last().unwrap().name, "a");
+    let plus = fs.readdirplus(req(), root, 0, 0, 0).await.unwrap();
+    let first_plus: Vec<_> = plus.entries.take(3).map(|e| e.unwrap()).collect().await;
+    assert_eq!(first_plus.last().unwrap().offset, 3);
+    assert_eq!(
+        names(first.into_iter().map(|e| e.name).collect()),
+        names(first_plus.into_iter().map(|e| e.name).collect())
+    );
+
+    fs.release(req(), Some(OsStr::new("/a")), fh, 0, 0, false)
+        .await
+        .unwrap();
+    let reply = fs.readdir(req(), root, 0, 3).await.unwrap();
+    let rest: Vec<_> = reply.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+    let plus = fs.readdirplus(req(), root, 0, 3, 0).await.unwrap();
+    let rest: Vec<_> = plus.entries.map(|e| e.unwrap().name).collect().await;
+    assert_eq!(names(rest), ["b", "c"]);
+}

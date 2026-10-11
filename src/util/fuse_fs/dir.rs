@@ -30,43 +30,32 @@ impl Filesystem {
 
         let path = dir_key_of(path)?;
         // Files that are written but not uploaded yet are listed too, once.
-        let live = Arc::new(self.states.live_children(live_prefix(&path)).await);
-        let live_names = live.clone();
-        let children = self
-            .op
-            .lister(&path)
-            .await
-            .map_err(opendal_error2errno)?
-            .filter_map(move |entry| {
-                let dir = normalize_path(path.as_str());
-                let live = live_names.clone();
-                async move {
-                    match entry {
-                        Ok(e) if e.path() == dir => None,
-                        Ok(e) if has_live_name(&live, &e) => None,
-                        _ => Some(entry),
-                    }
-                }
+        let live = self.states.live_children(live_prefix(&path)).await;
+        let dir = normalize_path(path.as_str());
+        let mut entries = Vec::new();
+        let mut lister = self.op.lister(&path).await.map_err(opendal_error2errno)?;
+        while let Some(entry) = lister.next().await {
+            let e = entry.map_err(opendal_error2errno)?;
+            if e.path() == dir || has_live_name(&live, &e) {
+                continue;
+            }
+            let name = e.name().trim_matches('/').to_string();
+            entries.push((name, entry_mode2file_type(e.metadata().mode())));
+        }
+        entries.extend(
+            live.into_iter()
+                .map(|(name, _)| (name, FileType::RegularFile)),
+        );
+        // Sorted by name, the offset of an entry does not depend on whether it
+        // is live or stored, so a listing can go on after a file is closed.
+        entries.sort_by(|a, b| a.0.cmp(&b.0));
+        let children = stream::iter(entries.into_iter().enumerate().map(|(i, (name, kind))| {
+            Ok(DirectoryEntry {
+                kind,
+                name: name.into(),
+                offset: (i + 3) as i64,
             })
-            .map(|entry| {
-                entry
-                    .map(|e| {
-                        let name = e.name().trim_matches('/').into();
-                        (entry_mode2file_type(e.metadata().mode()), name)
-                    })
-                    .map_err(opendal_error2errno)
-            })
-            .chain(stream::iter((0..live.len()).map(move |i| {
-                Ok((FileType::RegularFile, live[i].0.clone().into()))
-            })))
-            .enumerate()
-            .map(|(i, entry)| {
-                entry.map(|(kind, name)| DirectoryEntry {
-                    kind,
-                    name,
-                    offset: (i + 3) as i64,
-                })
-            });
+        }));
 
         let relative_paths = stream::iter([
             Result::Ok(DirectoryEntry {
@@ -105,69 +94,59 @@ impl Filesystem {
         let path = dir_key_of(parent)?;
         // Files that are written but not uploaded yet are listed too, once,
         // with their live size.
-        let live = Arc::new(self.states.live_children(live_prefix(&path)).await);
-        let live_names = live.clone();
-        let live_entries = stream::iter((0..live.len()).map(move |i| {
-            let (name, size) = &live[i];
-            Ok(DirectoryEntryPlus {
-                kind: FileType::RegularFile,
-                name: name.clone().into(),
-                offset: 0,
-                attr: FileAttr {
-                    size: *size,
-                    ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
-                },
-                entry_ttl: TTL,
-                attr_ttl: TTL,
-            })
-        }));
-        let children = self
+        let live = self.states.live_children(live_prefix(&path)).await;
+        let dir = normalize_path(path.as_str());
+        let mut entries = Vec::new();
+        let mut lister = self
             .op
             .lister_with(&path)
             .await
-            .map_err(opendal_error2errno)?
-            .filter_map(move |entry| {
-                let dir = normalize_path(path.as_str());
-                let live = live_names.clone();
-                async move {
-                    match entry {
-                        Ok(e) if e.path() == dir => None,
-                        Ok(e) if has_live_name(&live, &e) => None,
-                        _ => Some(entry),
-                    }
-                }
-            })
-            .then(move |entry| async move {
-                let e = entry.map_err(opendal_error2errno)?;
-                let metadata = e.metadata();
-                let mut attr = metadata2file_attr(metadata, now, uid, gid);
-                // Like getattr: a file that is being written has its local size.
-                // The kernel applies these attributes to its cached inode.
-                if !metadata.is_dir()
-                    && let Some(size) = self.states.size(e.path()).await
-                {
-                    attr = FileAttr {
-                        size,
-                        ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
-                    };
-                }
-                Ok(DirectoryEntryPlus {
-                    kind: entry_mode2file_type(metadata.mode()),
-                    name: e.name().trim_matches('/').into(),
-                    offset: 0,
-                    attr,
-                    entry_ttl: TTL,
-                    attr_ttl: TTL,
-                })
-            })
-            .chain(live_entries)
-            .enumerate()
-            .map(|(i, entry)| {
-                entry.map(|e| DirectoryEntryPlus {
-                    offset: (i + 3) as i64,
-                    ..e
-                })
+            .map_err(opendal_error2errno)?;
+        while let Some(entry) = lister.next().await {
+            let e = entry.map_err(opendal_error2errno)?;
+            if e.path() == dir || has_live_name(&live, &e) {
+                continue;
+            }
+            let metadata = e.metadata();
+            let mut attr = metadata2file_attr(metadata, now, uid, gid);
+            // Like getattr: a file that is being written has its local size.
+            // The kernel applies these attributes to its cached inode.
+            if !metadata.is_dir()
+                && let Some(size) = self.states.size(e.path()).await
+            {
+                attr = FileAttr {
+                    size,
+                    ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
+                };
+            }
+            entries.push(DirectoryEntryPlus {
+                kind: entry_mode2file_type(metadata.mode()),
+                name: e.name().trim_matches('/').into(),
+                offset: 0,
+                attr,
+                entry_ttl: TTL,
+                attr_ttl: TTL,
             });
+        }
+        entries.extend(live.into_iter().map(|(name, size)| DirectoryEntryPlus {
+            kind: FileType::RegularFile,
+            name: name.into(),
+            offset: 0,
+            attr: FileAttr {
+                size,
+                ..dummy_file_attr(FileType::RegularFile, now, uid, gid)
+            },
+            entry_ttl: TTL,
+            attr_ttl: TTL,
+        }));
+        // Sorted by name, like readdir, so offsets depend only on the names.
+        entries.sort_by(|a, b| a.name.cmp(&b.name));
+        let children = stream::iter(entries.into_iter().enumerate().map(|(i, e)| {
+            Ok(DirectoryEntryPlus {
+                offset: (i + 3) as i64,
+                ..e
+            })
+        }));
 
         let relative_path_attr = dummy_file_attr(FileType::Directory, now, uid, gid);
         let relative_paths = stream::iter([
